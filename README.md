@@ -263,27 +263,41 @@ Async FastAPI server with a bounded job queue (semaphore, `MAX_CONCURRENT_JOBS`)
 | `OUTPUT_ROOT` | `output` | Where job outputs are written. |
 | `COMPOSE_PROJECT_NAME` | `autoclipper` | Keeps Docker container names stable. |
 
+## Railway Deployment
+
+AutoClipper is ready to deploy to Railway with zero hassle. See [RAILWAY_DEPLOY.md](RAILWAY_DEPLOY.md) for full instructions:
+- **Option A (Recommended — Single Service):** 1-Click fullstack deploy (FastAPI serves both API and React dashboard on a single port, zero CORS issues, low memory).
+- **Option B (Separate Services):** Deploy `backend/` and `frontend/` as two independent Railway services.
+
 ## Project Structure
 
 ```
-autoclipper/
-  config.py            # env / settings (keys, models, content types, clip bounds)
-  utils.py             # logging, ffmpeg/ffprobe helpers
-  ingest.py            # yt-dlp download / local file
-  audio.py             # audio extraction + chunking
-  transcribe.py        # Groq Whisper transcription (cloud, chunked)
-  analyze.py           # Gemini viral moment detection (content-type aware)
-  clip.py              # FFmpeg clip cutting (CRF 18, medium preset)
-  reframe.py           # vertical 9:16 reframing (face/subject tracking)
-  subtitles.py         # SRT generation + burned-in caption rendering
-  hooks.py             # hook text overlay rendering
-  trending_youtube.py  # real YouTube trending (mostPopular + category filter)
-  youtube_uploader.py  # YouTube OAuth upload
-  facebook_uploader.py # Facebook Pages upload via Graph API (OAuth + direct upload)
-  voiceover.py         # Voice-over engines (Kokoro, Edge TTS, Gemini TTS)
-  pipeline.py          # orchestration (incremental clip generation)
-  app.py               # FastAPI server + job queue + all endpoints
-dashboard/
+backend/
+  app.py               # FastAPI server + job queue + endpoints
+  main.py              # CLI entry point
+  requirements.txt     # Python dependencies
+  Dockerfile           # Backend container definition
+  autoclipper/
+    config.py          # env / settings (keys, models, content types, clip bounds)
+    utils.py           # logging, ffmpeg/ffprobe helpers
+    ingest.py          # yt-dlp download / local file
+    audio.py           # audio extraction + chunking
+    transcribe.py      # Groq Whisper transcription (cloud, chunked)
+    analyze.py         # Gemini viral moment detection (content-type aware)
+    clip.py            # FFmpeg clip cutting (CRF 18, medium preset)
+    reframe.py         # Optimized 9:16 vertical AI reframing (face/speaker tracking)
+    subtitles.py       # SRT generation + burned-in caption rendering
+    hooks.py           # hook text overlay rendering
+    trending_youtube.py# real YouTube trending (mostPopular + category filter)
+    youtube_uploader.py# YouTube OAuth upload
+    facebook_uploader.py# Facebook Pages upload via Graph API
+    voiceover.py       # Voice-over engines (Kokoro, Edge TTS, Gemini TTS)
+    pipeline.py        # orchestration (incremental clip generation)
+frontend/              # React dashboard (Vite + Tailwind)
+  package.json
+  vite.config.js
+  Dockerfile           # Frontend Nginx container definition
+  nginx.conf           # SPA fallback + backend reverse proxy
   src/
     App.jsx
     api.js
@@ -291,13 +305,20 @@ dashboard/
                        # HookModal, TranslateModal, YouTubeSettings,
                        # FacebookSettings, YouTubeUploadModal,
                        # FacebookUploadModal, UploadTimeSuggestion, SettingsPage, ...
+Dockerfile             # Fullstack all-in-one Railway container
+docker-compose.yml     # Local orchestration for backend + frontend
+railway.json           # Railway deployment configuration
+RAILWAY_DEPLOY.md      # Step-by-step Railway deployment guide
 ```
 
 ## Roadmap
 
-- [x] Vertical 9:16 reframing with face/subject tracking
+- [x] Optimized vertical 9:16 reframing with cinematic AI face/speaker tracking
 - [x] Burned-in subtitles from word timestamps
 - [x] FastAPI backend + async job queue
+- [x] React dashboard (modular frontend/ directory)
+- [x] 1-Click Railway deployment & multi-service Railway configs
+- [x] Real YouTube trending (region + content type) with Gemini enrichment
 - [x] React dashboard
 - [x] Real YouTube trending (region + content type) with Gemini enrichment
 - [x] Hook overlay, YouTube OAuth upload

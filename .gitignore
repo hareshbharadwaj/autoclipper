@@ -12,3 +12,6 @@ uploads/
 cookies.txt
 .venv/
 venv/
+node_modules/
+dist/
+

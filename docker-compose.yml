@@ -1,13 +1,13 @@
 services:
   backend:
-    build: .
+    build: ./backend
     container_name: autoclipper-backend
     ports:
       - "8000:8000"
     volumes:
       - ./output:/app/output
-      - ./app.py:/app/app.py
-      - ./autoclipper:/app/autoclipper
+      - ./backend/app.py:/app/app.py
+      - ./backend/autoclipper:/app/autoclipper
       - yt_config:/app/yt_config
       - autoclipper_data:/app/data
       - kokoro_cache:/app/models/kokoro
@@ -25,7 +25,7 @@ services:
     restart: unless-stopped
 
   frontend:
-    build: ./dashboard
+    build: ./frontend
     container_name: autoclipper-frontend
     ports:
       - "5173:80"
