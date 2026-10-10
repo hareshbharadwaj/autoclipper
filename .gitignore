@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.env
+client_secret.json
+autoclipper.db
+output/
+uploads/
+*.mp4
+*.mp3
+*.wav
+*.m4a
+cookies.txt
+.venv/
+venv/
+node_modules/
+dist/
+

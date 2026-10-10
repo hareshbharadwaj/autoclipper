@@ -1,0 +1,2 @@
+# AutoClipper root requirements — references backend/requirements.txt
+-r backend/requirements.txt
