@@ -357,13 +357,14 @@ export async function registerBurn({ name, sourceFile, resultFile }) {
   return res.json()
 }
 
-export async function saveToLibrary({ jobId, filename, title, clipTitle, description, hook }) {
+export async function saveToLibrary({ jobId, filename, srt, title, clipTitle, description, hook }) {
   const res = await fetch(`${API_URL}/api/library/save`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       job_id: jobId,
       filename,
+      srt: srt || undefined,
       title: title || undefined,
       clip_title: clipTitle || undefined,
       description: description || undefined,
@@ -759,7 +760,9 @@ export async function getYoutubeTrending({ region, category, maxResults, windowD
   if (!res.ok) {
     let detail = ''
     try { detail = (await res.json()).detail || '' } catch { /* ignore */ }
-    throw new Error(detail || `YouTube trending failed (${res.status})`)
+    const error = new Error(detail || `YouTube Explore failed (${res.status})`)
+    error.status = res.status
+    throw error
   }
   return res.json()
 }

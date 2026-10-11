@@ -1,5 +1,6 @@
 """Viral moment detection using Google Gemini."""
 import json
+import math
 import re
 
 from . import config
@@ -40,6 +41,9 @@ natural Indonesian. Do not translate to English unless the transcript itself is 
 English.
 
 Rules:
+- Generate up to {count} plausible candidates, ordered by likely short-form value; do not pad with weak or duplicate moments.
+- Give every candidate a numeric "score" from 0 to 100 based on hook strength, narrative completeness, specificity, and standalone clarity.
+- Include "evidence_quote": a short exact quote copied from the supplied transcript that supports the moment. Never invent or paraphrase this quote.
 - Each clip must be between {min_s:.0f} and {max_s:.0f} seconds long.
 - Prefer a duration close to {target_s:.0f} seconds when a target is supplied; target duration is a preference, not permission to cut a sentence or remove the payoff.
 - Clips must start and end on natural sentence/thought boundaries (no mid-sentence cuts). Preserve the question/setup and the answer/payoff when they belong together.
@@ -72,7 +76,9 @@ pick a different moment.
         "description": "engaging social caption with 3-5 relevant hashtags (max 200 chars)",
         "hook": "one-line on-screen hook text",
         "reason": "why this moment is compelling",
-        "story_arc": "one line: hook -> body -> conclusion"
+        "story_arc": "one line: hook -> body -> conclusion",
+        "score": 0,
+        "evidence_quote": "an exact short quote from the transcript"
       }}
     ]
   }}
@@ -87,21 +93,30 @@ given the FULL timestamped transcript of a video (duration: {duration:.0f} secon
 source resolution: {resolution}).
 
 The transcript language is: {language}.
-IMPORTANT: Write every field in the SAME language as the transcript. If the \
-transcript is Indonesian, write natural Indonesian — do NOT translate to English.
+IMPORTANT: Write every natural-language field in the SAME language as the transcript. \
+Keep "content_type" as one of the exact lowercase enum tokens below. If the transcript \
+is Indonesian, write natural Indonesian — do NOT translate to English.
 
 Your job is NOT to touch the video yet. You are producing an analysis report that a \
 human will read before deciding what clip to make.
 
-Step 1 — Understand the whole video, from the first second to the last.
-Step 2 — Write "summary": exactly 2-3 sentences describing what this video is about, \
+Step 1 — Understand the whole video, from the first second to the last. Use both \
+the transcript and sampled visual frames when available.
+Step 2 — Classify the OVERALL video format as exactly one of: "general", "podcast", \
+"gaming", "tutorial", or "irl". Classify what the source mainly is, not a topic \
+mentioned in passing. Use "general" when the evidence is ambiguous. Do not assume a \
+format from the title alone.
+Step 3 — Write "content_type_reason": one short sentence explaining the evidence for \
+the format choice. Let this classification inform which moments are strongest for \
+short clips, without forcing a type-specific angle when the video does not support it.
+Step 4 — Write "summary": exactly 2-3 sentences describing what this video is about, \
 who it is for, and what the viewer walks away with. No timestamps in the summary.
-Step 3 — Write "chapters": 3-8 timestamped sections covering the ENTIRE video in \
+Step 5 — Write "chapters": 3-8 timestamped sections covering the ENTIRE video in \
 order. Every chapter needs a start, an end, and a short label. Use "start" and "end" \
 as seconds (numbers). Chapter ranges must be continuous and cover the whole duration.
-Step 4 — Write "key_topics": 3-5 short topic tags that are SPECIFIC to this video \
+Step 6 — Write "key_topics": 3-5 short topic tags that are SPECIFIC to this video \
 (e.g. "Tunnel cutting grip" not "cooking").
-Step 5 — Write "suggested_angles": {angle_count} distinct, video-specific clip ideas. \
+Step 7 — Write "suggested_angles": {angle_count} distinct, video-specific clip ideas. \
 These are NOT generic categories — each one must come from something that actually \
 happens in THIS video. For each angle give:
   - "title": a punchy angle name (max 60 chars)
@@ -122,6 +137,8 @@ Rules:
 
   Return ONLY valid JSON in exactly this shape, with no markdown fences:
   {{
+    "content_type": "tutorial",
+    "content_type_reason": "brief evidence-based explanation",
     "summary": "2-3 sentence overview of the whole video",
     "chapters": [
       {{"start": 0.0, "end": 75.0, "label": "Cold open & setup"}}
@@ -158,6 +175,14 @@ def _truncate_transcript(text: str, max_chars: int = 180000) -> str:
     )
 
 
+def _format_visual_timestamp(seconds):
+    """Render a sampled frame time in an unambiguous prompt-friendly format."""
+    total = max(0, int(float(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def analyze_video_summary_and_angles(
     transcript: dict,
     api_key: str = None,
@@ -165,10 +190,13 @@ def analyze_video_summary_and_angles(
     video_info: dict = None,
     angle_count: int = 4,
     content_type: str = None,
+    visual_samples: list = None,
+    visual_sampling_warning: str = None,
 ) -> dict:
     """Produce a whole-video understanding report before any clip is cut.
 
-    Returns a dict with: summary, chapters, key_topics, suggested_angles.
+    Returns a dict with: content_type, content_type_reason, summary, chapters,
+    key_topics, and suggested_angles.
     """
     from google import genai
 
@@ -202,9 +230,69 @@ def analyze_video_summary_and_angles(
             + ctype["focus"]
         )
 
+    samples = [
+        sample for sample in (visual_samples or [])
+        if isinstance(sample, dict) and isinstance(sample.get("data"), bytes) and sample["data"]
+    ]
+    visual_context = {
+        "status": "used" if samples and not visual_sampling_warning else (
+            "partial" if samples else ("transcript_only" if visual_sampling_warning else "not_requested")
+        ),
+        "frame_count": len(samples),
+        "timestamps": [round(float(sample.get("timestamp") or 0.0), 3) for sample in samples],
+        "warning": visual_sampling_warning or None,
+    }
+    analysis_warnings = [visual_sampling_warning] if visual_sampling_warning else []
+
     logger.info("Building whole-video analysis with Gemini model '%s'...", model)
     client = genai.Client(api_key=api_key)
-    response = config.gemini_generate(client, model, prompt)
+    contents = prompt
+    if samples:
+        prompt += (
+            "\\n\\nVISUAL EVIDENCE: The following timestamp-labeled still frames are "
+            "sparse samples from this source video. Use them only to describe visible "
+            "context; do not infer speech, actions between frames, identities, or "
+            "events that the frames do not establish. Treat the transcript as the "
+            "authority for spoken content and timestamps."
+        )
+        contents = [prompt]
+        try:
+            for sample in samples:
+                timestamp = float(sample.get("timestamp") or 0.0)
+                mime_type = sample.get("mime_type") or "image/jpeg"
+                part = genai.types.Part.from_bytes(data=sample["data"], mime_type=mime_type)
+                contents.extend([
+                    f"Visual frame sampled at {timestamp:.3f}s ({_format_visual_timestamp(timestamp)}).",
+                    part,
+                ])
+        except Exception as exc:  # malformed images / SDK mismatch: use transcript only
+            logger.warning("Could not prepare Gemini visual frames (%s); using transcript only.", type(exc).__name__)
+            contents = prompt.removesuffix(
+                "\\n\\nVISUAL EVIDENCE: The following timestamp-labeled still frames are "
+                "sparse samples from this source video. Use them only to describe visible "
+                "context; do not infer speech, actions between frames, identities, or "
+                "events that the frames do not establish. Treat the transcript as the "
+                "authority for spoken content and timestamps."
+            )
+            visual_context["status"] = "transcript_only"
+            visual_context["frame_count"] = 0
+            visual_context["timestamps"] = []
+            visual_context["warning"] = "Visual frames could not be prepared; analysis used transcript evidence only."
+            analysis_warnings.append(visual_context["warning"])
+
+    try:
+        response = config.gemini_generate(client, model, contents)
+    except Exception as exc:
+        if not samples or visual_context["status"] == "transcript_only":
+            raise
+        logger.warning(
+            "Gemini visual-context analysis failed (%s); retrying with transcript only.",
+            type(exc).__name__,
+        )
+        response = config.gemini_generate(client, model, prompt.rsplit("\\n\\nVISUAL EVIDENCE:", 1)[0])
+        visual_context["status"] = "transcript_only"
+        visual_context["warning"] = "Gemini could not analyze the sampled frames; this report uses transcript evidence only."
+        analysis_warnings.append(visual_context["warning"])
     raw = (response.text or "").strip()
 
     # Whole-video reports are JSON objects, not {"clips": [...]} payloads.
@@ -217,7 +305,10 @@ def analyze_video_summary_and_angles(
     else:
         report = {}
 
-    return _validate_report(report, duration)
+    result = _validate_report(report, duration)
+    result["visual_context"] = visual_context
+    result["analysis_warnings"] = list(dict.fromkeys(analysis_warnings))
+    return result
 
 
 def _validate_report(report: dict, duration: float) -> dict:
@@ -225,6 +316,13 @@ def _validate_report(report: dict, duration: float) -> dict:
     summary = (report.get("summary") or "").strip()
     if not summary:
         summary = "No summary could be generated for this video."
+
+    raw_content_type = report.get("content_type")
+    content_type = raw_content_type.strip().lower() if isinstance(raw_content_type, str) else "general"
+    if content_type not in config.CONTENT_TYPES:
+        content_type = "general"
+    raw_type_reason = report.get("content_type_reason")
+    content_type_reason = raw_type_reason.strip()[:240] if isinstance(raw_type_reason, str) else ""
 
     chapters = []
     for ch in report.get("chapters") or []:
@@ -299,6 +397,8 @@ def _validate_report(report: dict, duration: float) -> dict:
             angle["end_hint"] = None
 
     return {
+        "content_type": content_type,
+        "content_type_reason": content_type_reason,
         "summary": summary,
         "chapters": chapters,
         "key_topics": topics,
@@ -462,6 +562,12 @@ def _validate_clips(clips: list, total_duration: float,
         upper = min(upper, config.HARD_MAX_CLIP_SECONDS + 3)
         if length < max(3.0, lower) or length > upper:
             continue
+        try:
+            candidate_score = float(c.get("score", 50))
+            if not math.isfinite(candidate_score):
+                candidate_score = 50.0
+        except (TypeError, ValueError):
+            candidate_score = 50.0
         valid.append(
             {
                 "start": round(start, 2),
@@ -469,9 +575,299 @@ def _validate_clips(clips: list, total_duration: float,
                 "title": (c.get("title") or "Untitled Clip").strip()[:80],
                 "description": (c.get("description") or "").strip()[:220],
                 "hook": (c.get("hook") or "").strip()[:120],
-                "reason": (c.get("reason") or "").strip(),
+                "reason": (c.get("reason") or "").strip()[:500],
                 "story_arc": (c.get("story_arc") or "").strip()[:300],
+                "candidate_score": round(max(0.0, min(100.0, candidate_score)), 2),
+                "evidence_quote": (c.get("evidence_quote") or "").strip()[:320],
             }
         )
     valid.sort(key=lambda x: x["start"])
     return valid
+
+
+def _normalize_quote(text):
+    """Normalize whitespace/case only so evidence still has to be verbatim."""
+    return re.sub(r"\s+", " ", str(text or "").casefold()).strip()
+
+
+def _candidate_transcript_excerpt(transcript, candidate, context_seconds=4.0, max_chars=1800):
+    """Build a compact, timestamped transcript excerpt around a candidate."""
+    try:
+        start = float(candidate["start"])
+        end = float(candidate["end"])
+    except (KeyError, TypeError, ValueError):
+        return ""
+    lines = []
+    for segment in transcript.get("segments", []) or []:
+        if not isinstance(segment, dict):
+            continue
+        try:
+            seg_start, seg_end = float(segment["start"]), float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = (segment.get("text") or "").strip()
+        if text and seg_end >= start - context_seconds and seg_start <= end + context_seconds:
+            lines.append(f"[{seg_start:.2f} - {seg_end:.2f}] {text}")
+    return "\n".join(lines)[:max_chars]
+
+
+def _match_quote_segment(transcript, quote):
+    """Return an actual transcript segment containing the exact review quote."""
+    normalized_quote = _normalize_quote(quote)
+    if not normalized_quote:
+        return None
+    for segment in transcript.get("segments", []) or []:
+        if not isinstance(segment, dict):
+            continue
+        if normalized_quote in _normalize_quote(segment.get("text")):
+            return segment
+    return None
+
+
+def _review_frame_contents(genai, prompt, visual_samples):
+    contents = [prompt]
+    for sample in visual_samples or []:
+        if not isinstance(sample, dict) or not isinstance(sample.get("data"), bytes):
+            continue
+        timestamp = float(sample.get("timestamp") or 0.0)
+        candidate_index = int(sample.get("candidate_index", -1))
+        part = genai.types.Part.from_bytes(
+            data=sample["data"], mime_type=sample.get("mime_type") or "image/jpeg"
+        )
+        contents.extend([
+            f"Candidate {candidate_index} visual frame at {timestamp:.3f}s ({_format_visual_timestamp(timestamp)}).",
+            part,
+        ])
+    return contents
+
+
+def review_clip_candidates(
+    transcript,
+    candidates,
+    *,
+    api_key=None,
+    model=None,
+    visual_samples=None,
+    total_duration=None,
+    min_clip=None,
+    max_clip=None,
+    max_timestamp_shift=8.0,
+):
+    """Independently review candidates and accept only transcript-grounded edits.
+
+    The reviewer can accept/reject candidates and suggest boundary evidence, but
+    its numeric timestamps are never trusted. A moved boundary is derived from
+    the real start/end of a transcript segment containing the reviewer's exact
+    quoted words, then checked against duration limits.
+    """
+    candidates = list(candidates or [])
+    if not candidates:
+        return {"candidates": [], "rejected_count": 0, "reviewed_count": 0}
+
+    from google import genai
+
+    api_key = config.require(api_key or config.GEMINI_API_KEY, "GEMINI_API_KEY")
+    model = model or config.GEMINI_MODEL
+    compact_candidates = []
+    for index, candidate in enumerate(candidates):
+        excerpt = _candidate_transcript_excerpt(transcript, candidate)
+        if not excerpt:
+            raise ValueError(f"Candidate {index} has no transcript excerpt to review.")
+        compact_candidates.append({
+            "candidate_index": index,
+            "start": candidate.get("start"),
+            "end": candidate.get("end"),
+            "title": candidate.get("title", ""),
+            "hook": candidate.get("hook", ""),
+            "description": candidate.get("description", ""),
+            "story_arc": candidate.get("story_arc", ""),
+            "transcript_excerpt": excerpt,
+            "user_selected": bool(candidate.get("_user_selected")),
+        })
+
+    prompt = (
+        "You are an independent quality reviewer for short-video clip candidates. "
+        "Review each candidate separately against only its timestamped transcript excerpt "
+        "and any timestamped still frames. Assess whether it starts/ends coherently, has "
+        "a complete hook-to-payoff arc, is supported by the transcript, and whether its "
+        "visual claim (if any) is visible in the supplied stills. Do not infer unseen "
+        "events or speech. Return ONLY JSON with a 'reviews' array. Each review must have "
+        "candidate_index, decision ('accept' or 'reject'), score (0-100), reason, "
+        "transcript_evidence (an exact short quote copied from the excerpt), "
+        "visual_evidence (what is directly visible, or 'not verifiable from sampled frames'), "
+        "start_quote and end_quote (exact quotes from individual transcript segments only "
+        "if a boundary should move; otherwise empty strings). Do not provide proposed "
+        "timestamps: accepted boundary changes will be derived from the quoted segment times.\n\n"
+        + json.dumps({"candidates": compact_candidates}, ensure_ascii=False)
+    )
+    client = genai.Client(api_key=api_key)
+    contents = _review_frame_contents(genai, prompt, visual_samples)
+    response = config.gemini_generate(client, model, contents)
+    data = _load_json((response.text or "").strip())
+    rows = data.get("reviews") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("Independent candidate review returned no reviews array.")
+
+    by_index = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            index = int(row.get("candidate_index"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= index < len(candidates) and index not in by_index:
+            by_index[index] = row
+    if len(by_index) != len(candidates):
+        raise ValueError("Independent candidate review was incomplete; original timestamps were retained.")
+
+    accepted = []
+    rejected_count = 0
+    for index, candidate in enumerate(candidates):
+        row = by_index[index]
+        decision = (row.get("decision") or "").strip().lower()
+        if decision not in {"accept", "accepted", "keep", "approve", "approved", "reject", "rejected"}:
+            raise ValueError(f"Independent candidate review returned an invalid decision for candidate {index}.")
+        evidence = (row.get("transcript_evidence") or "").strip()
+        excerpt = _candidate_transcript_excerpt(transcript, candidate)
+        if not evidence or _normalize_quote(evidence) not in _normalize_quote(excerpt):
+            raise ValueError(f"Candidate {index} review did not provide a verifiable transcript quote.")
+        try:
+            score = float(row.get("score"))
+        except (TypeError, ValueError):
+            raise ValueError(f"Candidate {index} review score was invalid.")
+        if not math.isfinite(score):
+            raise ValueError(f"Candidate {index} review score was invalid.")
+        score = max(0.0, min(100.0, score))
+
+        is_rejected = decision in {"reject", "rejected"}
+        if is_rejected and not candidate.get("_user_selected"):
+            rejected_count += 1
+            continue
+
+        reviewed = {
+            **candidate,
+            "review_status": "flagged_user_selected" if is_rejected else "accepted",
+            "review_score": round(score, 2),
+            "review_reason": (row.get("reason") or "").strip()[:500],
+            "review_evidence": evidence[:320],
+            "visual_evidence": (row.get("visual_evidence") or "").strip()[:320],
+        }
+        if is_rejected:
+            reviewed["review_warning"] = "The independent reviewer flagged this user-selected moment; it was retained for user review."
+
+        # The reviewer never controls numeric boundaries. If it supplies exact
+        # segment quotes, derive each endpoint from that segment and apply strict
+        # bounds; otherwise retain the original interval unchanged.
+        start_quote = (row.get("start_quote") or "").strip()
+        end_quote = (row.get("end_quote") or "").strip()
+        start_segment = _match_quote_segment(transcript, start_quote) if start_quote else None
+        end_segment = _match_quote_segment(transcript, end_quote) if end_quote else None
+        if start_segment is not None and end_segment is not None:
+            try:
+                revised_start = float(start_segment["start"])
+                revised_end = float(end_segment["end"])
+                old_start, old_end = float(candidate["start"]), float(candidate["end"])
+                lower_bound = float(min_clip) if min_clip is not None else 3.0
+                upper_bound = min(
+                    float(max_clip) if max_clip is not None else float(config.HARD_MAX_CLIP_SECONDS),
+                    float(config.HARD_MAX_CLIP_SECONDS),
+                )
+                duration_ok = lower_bound <= revised_end - revised_start <= upper_bound
+                video_ok = not total_duration or (
+                    0 <= revised_start < revised_end <= float(total_duration)
+                )
+                local_ok = (
+                    abs(revised_start - old_start) <= float(max_timestamp_shift)
+                    and abs(revised_end - old_end) <= float(max_timestamp_shift)
+                )
+                if duration_ok and video_ok and local_ok:
+                    if revised_start != old_start or revised_end != old_end:
+                        reviewed["timestamp_revision"] = {
+                            "from": {"start": round(old_start, 2), "end": round(old_end, 2)},
+                            "to": {"start": round(revised_start, 2), "end": round(revised_end, 2)},
+                            "evidence": "Exact start/end quotes matched transcript segments; endpoints use their timestamps.",
+                        }
+                    reviewed["start"] = round(revised_start, 2)
+                    reviewed["end"] = round(revised_end, 2)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                # Keep the original candidate untouched if segment timing is bad.
+                pass
+        accepted.append(reviewed)
+
+    return {
+        "candidates": accepted,
+        "rejected_count": rejected_count,
+        "reviewed_count": len(by_index),
+    }
+
+
+def _candidate_text_similarity(left, right):
+    left_words = set(re.findall(r"[\w']+", " ".join(str(left.get(key, "")) for key in ("title", "hook", "description")).casefold()))
+    right_words = set(re.findall(r"[\w']+", " ".join(str(right.get(key, "")) for key in ("title", "hook", "description")).casefold()))
+    if not left_words or not right_words:
+        return 0.0
+    return len(left_words & right_words) / len(left_words | right_words)
+
+
+def _candidate_intervals_duplicate(left, right, overlap_threshold=0.35):
+    try:
+        left_start, left_end = float(left["start"]), float(left["end"])
+        right_start, right_end = float(right["start"]), float(right["end"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    overlap = max(0.0, min(left_end, right_end) - max(left_start, right_start))
+    shorter = min(left_end - left_start, right_end - right_start)
+    return shorter > 0 and overlap / shorter >= overlap_threshold
+
+
+def rank_and_diversify_candidates(candidates, target_count):
+    """Rank reviewed candidates and suppress temporal/textual near-duplicates."""
+    try:
+        limit = max(0, int(target_count))
+    except (TypeError, ValueError):
+        limit = 0
+    if not limit:
+        return []
+
+    ranked = []
+    for candidate in candidates or []:
+        try:
+            base_score = float(candidate.get("candidate_score", 50.0))
+            if not math.isfinite(base_score):
+                base_score = 50.0
+        except (TypeError, ValueError):
+            base_score = 50.0
+        try:
+            review_score = float(candidate.get("review_score", base_score))
+            if not math.isfinite(review_score):
+                review_score = base_score
+        except (TypeError, ValueError):
+            review_score = base_score
+        score = (0.35 * max(0.0, min(100.0, base_score))) + (
+            0.65 * max(0.0, min(100.0, review_score))
+        )
+        ranked.append({**candidate, "quality_score": round(score, 2)})
+
+    ranked.sort(
+        key=lambda item: (
+            not bool(item.get("_user_selected")),
+            -float(item.get("quality_score", 0)),
+            float(item.get("start", 0)),
+        )
+    )
+    selected = []
+    for candidate in ranked:
+        if any(
+            _candidate_intervals_duplicate(candidate, prior)
+            or _candidate_text_similarity(candidate, prior) >= 0.78
+            for prior in selected
+        ):
+            continue
+        candidate = {**candidate, "candidate_rank": len(selected) + 1}
+        candidate.pop("_user_selected", None)
+        selected.append(candidate)
+        if len(selected) >= limit:
+            break
+    selected.sort(key=lambda item: float(item.get("start", 0)))
+    return selected

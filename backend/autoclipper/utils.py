@@ -306,7 +306,17 @@ def save_to_library(output_root: str, title: str, job_id: str, clips: list) -> s
             continue
         try:
             shutil.copy2(src, dest)
-            saved.append({"index": idx, "file": f"clip{idx}.mp4"})
+            saved_entry = {"index": idx, "file": f"clip{idx}.mp4"}
+            source_srt = clip.get("srt") or (os.path.splitext(os.path.basename(clip.get("file", "")))[0] + ".srt")
+            srt_src = os.path.join(output_root, job_id, os.path.basename(source_srt))
+            srt_dest = os.path.splitext(dest)[0] + ".srt"
+            if os.path.isfile(srt_src):
+                try:
+                    shutil.copy2(srt_src, srt_dest)
+                    saved_entry["srt"] = os.path.basename(srt_dest)
+                except OSError as e:
+                    logger.warning("Failed to save subtitles for clip %s: %s", idx, e)
+            saved.append(saved_entry)
         except OSError as e:
             logger.warning("Failed to save clip %s to library: %s", idx, e)
 

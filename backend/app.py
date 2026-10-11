@@ -19,6 +19,7 @@ import shutil
 import threading
 import time
 import uuid
+import urllib.error
 
 # Ensure backend root is on sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -67,7 +68,9 @@ from autoclipper.auth import (
     create_access_token,
     public_user,
 )
-from autoclipper.utils import ensure_ffmpeg, logger as ac_logger, sanitize_filename, write_json
+from autoclipper.utils import (
+    ensure_ffmpeg, logger as ac_logger, probe_video_info, sanitize_filename, write_json,
+)
 
 app = FastAPI(title="AutoClipper API", version="0.1.0")
 
@@ -214,9 +217,11 @@ class SubtitleRequest(BaseModel):
 
 
 # --- Job runner -----------------------------------------------------------
-def _run_pipeline_sync(job_id: str, source: str, output_dir: str, opts: dict, on_clip=None):
+def _run_pipeline_sync(job_id: str, source: str, output_dir: str, opts: dict, on_clip=None, on_progress=None):
     _current_job_id.set(job_id)
-    return pipeline.run(source, output_dir=output_dir, on_clip=on_clip, **opts)
+    return pipeline.run(
+        source, output_dir=output_dir, on_clip=on_clip, on_progress=on_progress, **opts
+    )
 
 
 async def _run_job(job_id: str, source: str, opts: dict):
@@ -232,25 +237,54 @@ async def _run_job(job_id: str, source: str, opts: dict):
         "duration": None,
         "clips": [],
         "elapsed_seconds": 0,
+        "progress": job.get("progress"),
     }
     lock = threading.Lock()
 
     def on_clip_ready(clip, index, total):
         with lock:
-            job["result"]["clips"].append({**clip, "index": index})
+            job["result"]["clips"].append({
+                **clip,
+                "index": index,
+                "render_status": "rendered",
+                "qa_status": clip.get("qa_status") or "pending",
+            })
             job["result"]["title"] = job["result"].get("title")  # will be set later
+
+    def on_progress_update(event):
+        with lock:
+            job["progress"] = dict(event)
+            if job.get("result") is not None:
+                job["result"]["progress"] = dict(event)
 
     try:
         async with _semaphore:
             job["status"] = "processing"
             result = await asyncio.to_thread(
-                _run_pipeline_sync, job_id, source, output_dir, opts, on_clip=on_clip_ready
+                _run_pipeline_sync,
+                job_id,
+                source,
+                output_dir,
+                opts,
+                on_clip=on_clip_ready,
+                on_progress=on_progress_update,
             )
         job["result"] = result
         job["status"] = "completed"
+        job["progress"] = {
+            "stage": "completed",
+            "message": "Clip generation, QA, and metadata saving are complete.",
+            "updated_at": time.time(),
+            "qa_status": (result.get("quality_assurance") or {}).get("status", "unknown"),
+        }
     except Exception as e:  # noqa: BLE001
         job["status"] = "failed"
         job["error"] = str(e)
+        job["progress"] = {
+            "stage": "failed",
+            "message": "Processing stopped. Review the job error and logs.",
+            "updated_at": time.time(),
+        }
     finally:
         job["finished_at"] = time.time()
 
@@ -375,6 +409,10 @@ async def process(
     content_type: str = Form("general"),
     current: User = Depends(get_current_user),
 ):
+    try:
+        clip_count = pipeline._normalize_clip_count(clip_count)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     ensure_ffmpeg()
 
     # Per-user keys take precedence; fall back to the server's .env keys.
@@ -457,6 +495,11 @@ async def process(
         "logs": [],
         "result": None,
         "error": None,
+        "progress": {
+            "stage": "queued",
+            "message": "Waiting for a processing slot.",
+            "updated_at": time.time(),
+        },
     }
     opts = {
         "whisper_model": whisper_model,
@@ -537,7 +580,7 @@ async def analyze_video(
     youtube_cookies: str = Form(None),
     groq_key: str = Form(None),
     gemini_key: str = Form(None),
-    content_type: str = Form("general"),
+    content_type: str = Form(None),
     angle_count: int = Form(4),
     current: User = Depends(get_current_user),
 ):
@@ -607,7 +650,8 @@ async def analyze_video(
         "cookies_text": youtube_cookies,
         "groq_key": groq_key,
         "gemini_key": gemini_key,
-        "content_type": content_type or "general",
+        # An omitted type means the analysis model should detect it from the video.
+        "content_type": content_type or None,
         "angle_count": angle_count or 4,
     }
     # Share the render/analysis concurrency budget and run work off the loop.
@@ -676,6 +720,17 @@ def _run_analysis(analysis_id: str, source: str, opts: dict):
         write_json(transcript_path, transcript)
         entry["transcript_path"] = transcript_path
 
+        entry["status"] = "sampling_visuals"
+        log("Sampling a bounded set of timestamped visual frames…")
+        from autoclipper.visual_context import sample_video_frames
+
+        visual_sampling = sample_video_frames(local_source, video_info.get("duration"))
+        visual_samples = visual_sampling.get("frames") or []
+        if visual_samples:
+            log("Sampled %d visual frame(s) for multimodal context.", len(visual_samples))
+        if visual_sampling.get("warning"):
+            log(visual_sampling["warning"])
+
         entry["status"] = "analyzing"
         log("Reading the whole video with Gemini…")
         report = analyze_video_summary_and_angles(
@@ -685,6 +740,8 @@ def _run_analysis(analysis_id: str, source: str, opts: dict):
             video_info=video_info,
             angle_count=opts.get("angle_count", 4),
             content_type=opts.get("content_type"),
+            visual_samples=visual_samples,
+            visual_sampling_warning=visual_sampling.get("warning"),
         )
 
         report.update(
@@ -817,6 +874,7 @@ async def status(job_id: str):
         "logs": job["logs"],
         "result": job["result"],
         "error": job["error"],
+        "progress": job.get("progress"),
     }
 
 
@@ -844,13 +902,12 @@ async def get_file(job_id: str, filename: str):
 
 @app.get("/api/trending")
 async def trending(niche: str = "general", count: int = 10,
-                   gemini_key: str = None, gemini_model: str = None,
+                   gemini_model: str = None,
                    current: User = Depends(get_current_user)):
     """Return AI-generated trending short-video ideas for a niche."""
     from autoclipper.db import decrypt_value
 
-    if not gemini_key:
-        gemini_key = decrypt_value(current.gemini_key) or config.GEMINI_API_KEY
+    gemini_key = decrypt_value(current.gemini_key) or config.GEMINI_API_KEY
     if not gemini_model and current.gemini_model:
         gemini_model = current.gemini_model
     try:
@@ -868,8 +925,6 @@ async def trending_youtube(
     category: str = "general",
     max_results: int = 12,
     window_days: int = 3,
-    youtube_key: str = None,
-    gemini_key: str = None,
     gemini_model: str = None,
     enrich: bool = True,
     current: User = Depends(get_current_user),
@@ -885,16 +940,30 @@ async def trending_youtube(
     """
     from autoclipper.db import decrypt_value
 
-    if not youtube_key:
-        youtube_key = decrypt_value(current.youtube_api_key) or config.YOUTUBE_API_KEY
-    if not gemini_key:
-        gemini_key = decrypt_value(current.gemini_key) or config.GEMINI_API_KEY
+    # Provider keys are resolved only from encrypted account settings or server
+    # configuration; do not accept API secrets in a URL query string.
+    account_youtube_key = decrypt_value(current.youtube_api_key)
+    youtube_key = account_youtube_key or config.YOUTUBE_API_KEY
+    gemini_key = decrypt_value(current.gemini_key) or config.GEMINI_API_KEY
     if not gemini_model and current.gemini_model:
         gemini_model = current.gemini_model
-    api_key = youtube_key or config.YOUTUBE_API_KEY
+    if not youtube_key:
+        if current.youtube_api_key:
+            detail = (
+                "A YouTube Data API key is stored for this account but cannot be decrypted; "
+                "the backend encryption key may have changed. Re-save it in Settings, and keep "
+                "AUTOCLIPPER_SECRET stable across production backend restarts."
+            )
+        else:
+            detail = (
+                "No YouTube Data API key is saved for this account. Click Save in Settings, "
+                "or configure YOUTUBE_API_KEY on the server."
+            )
+        raise HTTPException(status_code=503, detail=detail)
+
     try:
         videos = fetch_trending(
-            api_key=api_key, region=region, category=category,
+            api_key=youtube_key, region=region, category=category,
             max_results=max(1, min(max_results or 12, 25)),
             window_days=max(1, min(window_days or 3, 7)),
         )
@@ -904,13 +973,37 @@ async def trending_youtube(
         category_filtered = True
         if not videos and category != "general":
             videos = fetch_trending(
-                api_key=api_key, region=region, category="general",
+                api_key=youtube_key, region=region, category="general",
                 max_results=max(1, min(max_results or 12, 25)),
                 window_days=max(1, min(window_days or 3, 7)),
             )
             category_filtered = False
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=str(e))
+    except urllib.error.HTTPError as exc:
+        logger.warning("YouTube Data API returned HTTP %s for Explore.", exc.code)
+        if exc.code == 403:
+            detail = (
+                "YouTube Data API rejected the request. Check that the API is enabled, "
+                "the key restrictions are correct, and quota is available."
+            )
+        elif exc.code in {400, 401}:
+            detail = "YouTube Data API rejected the request. Check the key and Explore region settings."
+        else:
+            detail = "YouTube Data API is temporarily unavailable. Please try again later."
+        raise HTTPException(status_code=502, detail=detail) from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        logger.warning("Could not reach YouTube Data API for Explore (%s).", type(exc).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach YouTube Data API. Check your connection and try again.",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        # Do not echo provider exceptions: they can contain request URLs or
+        # implementation details that should not be returned to the browser.
+        logger.warning("YouTube Explore request failed (%s).", type(exc).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail="YouTube Explore could not be loaded. Check the API key and server logs, then try again.",
+        ) from exc
 
     insights = {}
     if enrich:
@@ -951,8 +1044,16 @@ async def subtitle(req: SubtitleRequest):
     out_name = f"{base}_edited.mp4"
     out_path = os.path.join(output_dir, out_name)
 
+    video_info = probe_video_info(video)
     with open(ass_path, "w", encoding="utf-8") as f:
-        f.write(build_ass(req.cues, req.style))
+        f.write(
+            build_ass(
+                req.cues,
+                req.style,
+                video_width=video_info.get("width") or 1080,
+                video_height=video_info.get("height") or 1920,
+            )
+        )
 
     try:
         burn_ass(video, ass_path, out_path)
@@ -2027,6 +2128,7 @@ async def facebook_logout(current: User = Depends(get_current_user)):
 class SaveLibraryRequest(BaseModel):
     job_id: str
     filename: str
+    srt: str = None
     title: str = None
     clip_title: str = None
     description: str = None
@@ -2060,7 +2162,8 @@ async def save_to_library_endpoint(req: SaveLibraryRequest):
         raise HTTPException(status_code=500, detail=f"Copy failed: {e}")
 
     # Copy the accompanying SRT (if present) so subtitles can be re-burned later.
-    srt_src = os.path.splitext(src)[0] + ".srt"
+    srt_name = os.path.basename(req.srt) if req.srt else os.path.splitext(req.filename)[0] + ".srt"
+    srt_src = os.path.join(config.OUTPUT_ROOT, req.job_id, srt_name)
     if os.path.isfile(srt_src):
         try:
             shutil.copy2(srt_src, os.path.splitext(dest)[0] + ".srt")

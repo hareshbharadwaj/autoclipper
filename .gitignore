@@ -3,6 +3,7 @@ __pycache__/
 .env
 client_secret.json
 autoclipper.db
+autoclipper.db.fernet-key
 output/
 uploads/
 *.mp4

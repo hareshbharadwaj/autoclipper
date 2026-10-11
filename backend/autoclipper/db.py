@@ -2,9 +2,9 @@
 
 Each user owns their own API keys (Groq, Gemini, YouTube) and pipeline
 preferences. Keys are encrypted with Fernet before being written to the
-database; the Fernet key comes from AUTOCLIPPER_SECRET (env). If that secret
-is not set we derive a per-process key and warn (keys are still obfuscated,
-but not securely persisted across restarts).
+database. Configure AUTOCLIPPER_SECRET to a stable value in production and
+share it across restarts/replicas. Local development falls back to a private,
+persistent key file next to the SQLite database (or AUTOCLIPPER_SECRET_FILE).
 """
 import base64
 import os
@@ -17,14 +17,63 @@ from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 from . import config
 
+# Keep the default database/key sidecar beside this module's SQLite database.
+DB_PATH = os.environ.get(
+    "AUTOCLIPPER_DB",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "autoclipper.db")),
+)
+
+
 # --- Encryption ----------------------------------------------------------
+def _persistent_fernet_key(path: str) -> bytes:
+    """Read or atomically create a private Fernet key file for local development."""
+    path = os.path.abspath(path)
+    directory = os.path.dirname(path)
+    try:
+        os.makedirs(directory, exist_ok=True)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            with open(path, "rb") as handle:
+                key = handle.read().strip()
+            Fernet(key)  # fail closed if the key file is corrupt
+            if os.name == "posix":
+                os.chmod(path, 0o600)
+            return key
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError(
+                "The persistent AutoClipper encryption key file is unreadable or invalid. "
+                "Restore it or configure AUTOCLIPPER_SECRET."
+            ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            "Cannot create a persistent AutoClipper encryption key file. "
+            "Configure AUTOCLIPPER_SECRET or AUTOCLIPPER_SECRET_FILE."
+        ) from exc
+
+    key = Fernet.generate_key()
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(key)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise RuntimeError("Could not persist the AutoClipper encryption key.") from exc
+    return key
+
+
 def _fernet_key() -> bytes:
-    """Derive a Fernet key from AUTOCLIPPER_SECRET (or generate an ephemeral one)."""
+    """Use a stable environment secret, or a persistent private key file locally."""
     secret = os.environ.get("AUTOCLIPPER_SECRET")
     if secret:
         digest = hashlib.sha256(secret.encode("utf-8")).digest()
         return base64.urlsafe_b64encode(digest)
-    return Fernet.generate_key()
+    key_path = os.environ.get("AUTOCLIPPER_SECRET_FILE") or f"{DB_PATH}.fernet-key"
+    return _persistent_fernet_key(key_path)
 
 
 _fernet = Fernet(_fernet_key())
@@ -46,10 +95,6 @@ def decrypt_value(value: Optional[str]) -> Optional[str]:
 
 
 # --- Engine --------------------------------------------------------------
-DB_PATH = os.environ.get(
-    "AUTOCLIPPER_DB",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "autoclipper.db")),
-)
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 
 

@@ -1,6 +1,10 @@
 """Video ingest: download from a URL (yt-dlp) or use a local file."""
 import os
 import shutil
+import socket
+import ssl
+import time
+import urllib.error
 
 from . import config
 from .utils import logger, sanitize_filename
@@ -8,6 +12,43 @@ from .utils import logger, sanitize_filename
 
 def _is_url(source: str) -> bool:
     return source.startswith("http://") or source.startswith("https://")
+
+
+_TRANSIENT_NETWORK_MARKERS = (
+    "tls/ssl connection has been closed",
+    "unexpected eof while reading",
+    "ssleoferror",
+    "ssl_error_syscall",
+    "ssl_connect:",
+    "curl: (35)",
+    "connection closed abruptly",
+    "connection reset by peer",
+    "remote end closed connection",
+    "timed out",
+    "temporary failure in name resolution",
+    "network is unreachable",
+)
+
+
+def _is_transient_network_error(error: Exception) -> bool:
+    """Recognize retryable connection failures wrapped by yt-dlp errors."""
+    message = str(error).lower()
+    if any(marker in message for marker in _TRANSIENT_NETWORK_MARKERS):
+        return True
+
+    current = error
+    seen = set()
+    for _ in range(5):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        if isinstance(current, urllib.error.HTTPError):
+            return False
+        if isinstance(current, (socket.timeout, TimeoutError, ConnectionError, ssl.SSLError)):
+            return True
+        reason = getattr(current, "reason", None)
+        current = reason or getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+    return False
 
 
 def _write_cookies(output_dir: str, cookies_text: str = None):
@@ -27,24 +68,12 @@ def _write_cookies(output_dir: str, cookies_text: str = None):
         return None
 
 
-def _build_youtube_opts(cookies_path, force_hd, use_cookies):
-    """Build yt-dlp options.
-
-    - With cookies: try `mweb` first (supports cookies, not subject to SABR like
-      `web`). If that still fails the caller falls back to anonymous below.
-    - Without cookies: let yt-dlp use its DEFAULT client chain. On this build the
-      default resolves to `android_vr` which yields up to 1080p (whereas forcing
-      tv_simply/web only gives 360p). We therefore do NOT pin player_client here.
-    """
-    if use_cookies and cookies_path:
-        extractor_args = {"player_client": ["mweb", "web", "tv", "ios", "android_vr", "android"]}
-    else:
-        # `android`/`android_vr` do not require a PO token and reliably return
-        # formats. List several fallbacks so yt-dlp can retry on HTTP 403 / rate
-        # limits from YouTube's anti-bot.
-        extractor_args = {"player_client": ["android_vr", "android", "tv", "web_safari", "ios"]}
-    return _finalize_opts(extractor_args, force_hd, cookies_path if use_cookies else None)
-def _finalize_opts(extractor_args, force_hd, cookiefile):
+def _finalize_opts(
+    force_hd: bool = False,
+    cookiefile: str = None,
+    extractor_args: dict = None,
+    impersonate=None,
+):
     if force_hd:
         fmt = (
             "bestvideo[height>=720]+bestaudio/"
@@ -76,22 +105,29 @@ def _finalize_opts(extractor_args, force_hd, cookiefile):
         "cookiefile": cookiefile,
         "socket_timeout": 30,
         "retries": 10,
+        "extractor_retries": 5,
         "fragment_retries": 10,
-        "nocheckcertificate": True,
         "cachedir": False,
         "format": fmt,
         "merge_output_format": "mp4",
         "progress_hooks": [_progress],
-        "extractor_args": {"youtube": extractor_args},
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        },
     }
+    if extractor_args:
+        opts["extractor_args"] = {"youtube": extractor_args}
+    if impersonate is not None:
+        opts["impersonate"] = impersonate
     return opts
+
+
+def _chrome_impersonation_target():
+    """Return a Chrome TLS target when yt-dlp's curl-cffi extra is installed."""
+    try:
+        import curl_cffi  # noqa: F401
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+
+        return ImpersonateTarget(client="chrome")
+    except (ImportError, OSError):
+        return None
 
 
 def _download_youtube(url: str, output_dir: str, force_hd: bool = False, cookies_text: str = None, max_height: int = None):
@@ -100,56 +136,105 @@ def _download_youtube(url: str, output_dir: str, force_hd: bool = False, cookies
     cookies_path = _write_cookies(output_dir, cookies_text)
     has_cookies = bool(cookies_path)
 
-    # Try anonymous first: on this build the default client chain (android_vr)
-    # yields up to 1080p without needing a PO token. Cookies are used only as a
-    # fallback, since logged-in clients (web/mweb) are subject to SABR/PO-token
-    # enforcement and often fail in headless environments.
-    attempts = [(False, "without cookies (anonymous)")]
+    # Sequence of client configurations to try:
+    # 1. Default (let yt-dlp auto-select best client like visionos/default; avoids 403)
+    # 2. Android/mweb fallback without cookies
+    # 3. With cookies (if provided)
+    attempts = [
+        (None, None, "default client chain (anonymous)", None),
+        ({"player_client": ["android", "mweb", "web"]}, None, "android/mweb client chain", None),
+    ]
     if has_cookies:
-        attempts.append((True, "with cookies"))
+        attempts.append(({"player_client": ["mweb", "web", "ios"]}, cookies_path, "with cookies", None))
+
+    # If normal requests hit TLS EOFs, retry once with curl-cffi's browser-like
+    # TLS handshake. This is only attempted after a transient network failure.
+    chrome_target = _chrome_impersonation_target()
+    if chrome_target is not None:
+        attempts.append((None, cookies_path if has_cookies else None, "Chrome TLS fallback", chrome_target))
 
     last_err = None
-    for use_cookies, label in attempts:
-        opts = _build_youtube_opts(cookies_path, force_hd, use_cookies)
+    for extractor_args, cookiefile, label, impersonate in attempts:
+        if impersonate is not None and not _is_transient_network_error(last_err):
+            continue
+
+        opts = _finalize_opts(
+            force_hd=force_hd,
+            cookiefile=cookiefile,
+            extractor_args=extractor_args,
+            impersonate=impersonate,
+        )
         if max_height:
             opts["format"] = (
                 f"bestvideo[height<={max_height}]+bestaudio/"
                 f"best[height<={max_height}]/best"
             )
+
+        out_template = os.path.join(output_dir, "%(title).90B.%(ext)s")
+        opts["outtmpl"] = out_template
+        opts["overwrites"] = True
+
         try:
-            logger.info("YouTube download attempt %s", label)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-            title = sanitize_filename(info.get("title", "youtube_video"))
-            out_template = os.path.join(output_dir, f"{title}.%(ext)s")
-            final_path = os.path.join(output_dir, f"{title}.mp4")
-            if os.path.exists(final_path):
-                os.remove(final_path)
+            info = None
+            ydl = None
+            for retry_number in range(3):
+                try:
+                    logger.info("YouTube download attempt: %s", label)
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
+                    if retry_number >= 2 or not _is_transient_network_error(e):
+                        raise
+                    delay = 2 ** retry_number
+                    logger.warning(
+                        "Transient YouTube TLS/network failure (%s); retry %d/2 in %ds.",
+                        type(e).__name__, retry_number + 1, delay,
+                    )
+                    time.sleep(delay)
 
-            download_opts = {**opts, "outtmpl": out_template, "overwrites": True}
-            logger.info("Downloading video from YouTube (%s)...", label)
-            with yt_dlp.YoutubeDL(download_opts) as ydl:
-                ydl.download([url])
+            raw_title = (info.get("title") if isinstance(info, dict) else None) or "youtube_video"
+            title = sanitize_filename(raw_title)
 
-            if not os.path.exists(final_path):
-                for f in os.listdir(output_dir):
-                    if f.startswith(title) and f.endswith(".mp4"):
-                        final_path = os.path.join(output_dir, f)
+            # Locate the downloaded file.
+            final_path = None
+            if info:
+                prepared = ydl.prepare_filename(info)
+                base, _ = os.path.splitext(prepared)
+                candidate_mp4 = f"{base}.mp4"
+                if os.path.exists(candidate_mp4):
+                    final_path = candidate_mp4
+                elif os.path.exists(prepared):
+                    final_path = prepared
+
+            if not final_path or not os.path.exists(final_path):
+                for filename in os.listdir(output_dir):
+                    if filename.endswith(".mp4"):
+                        final_path = os.path.join(output_dir, filename)
                         break
-            if not os.path.exists(final_path):
+
+            if not final_path or not os.path.exists(final_path):
                 raise RuntimeError("yt-dlp finished but no output file was found.")
-            logger.info("Downloaded: %s", final_path)
+
+            logger.info("Downloaded successfully: %s", final_path)
             return final_path, title
         except Exception as e:  # noqa: BLE001
-            import traceback
-
             last_err = e
-            logger.warning("YouTube attempt %s failed: %s", label, e)
-            logger.warning("Traceback: %s", traceback.format_exc())
-            if not has_cookies:
-                break
+            logger.warning("YouTube attempt %s failed (%s).", label, type(e).__name__)
 
-    raise RuntimeError(f"YouTube download failed: {last_err}")
+    try:
+        yt_dlp_version = yt_dlp.version.__version__
+    except AttributeError:
+        yt_dlp_version = "unknown"
+    if _is_transient_network_error(last_err):
+        raise RuntimeError(
+            "YouTube download hit a transient TLS/network error after retries "
+            f"(yt-dlp {yt_dlp_version}). Retry the job; if it keeps failing, "
+            "rebuild the backend with the current requirements and check outbound "
+            f"TLS access to YouTube. Last error: {last_err}"
+        ) from last_err
+    raise RuntimeError(f"YouTube download failed: {last_err}") from last_err
 
 
 def ingest(source: str, output_dir: str, force_hd: bool = False, cookies_text: str = None, max_height: int = None):

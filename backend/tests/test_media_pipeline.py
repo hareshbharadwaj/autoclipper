@@ -6,7 +6,8 @@ import pytest
 from autoclipper.audio_mix import mix_audio_layers
 from autoclipper.montage import stitch_montage
 from autoclipper.pipeline import (
-    _fit_montage_candidates, _load_cached_transcript, _normalize_target_duration,
+    _fit_montage_candidates, _load_cached_transcript, _montage_duration_tolerance,
+    _normalize_target_duration,
 )
 from autoclipper.reframe import plan_aspect_dims
 from autoclipper.utils import classify_aspect, probe_duration, probe_video_info
@@ -105,6 +106,35 @@ def test_music_only_mix_preserves_clip_duration(tmp_path):
     assert 1.8 <= probe_duration(str(output)) <= 2.2
 
 
+@pytest.mark.parametrize("voice_seconds", [1.25, 3])
+def test_voiceover_only_mix_keeps_video_duration_when_narration_is_short_or_long(tmp_path, voice_seconds):
+    video = _make_video(tmp_path, "base.mp4", "black", seconds=2)
+    voice = _make_tone(tmp_path, f"voice_{voice_seconds}.wav", frequency=700, seconds=voice_seconds)
+    output = tmp_path / "voice_only.mp4"
+    mix_audio_layers(str(video), str(output), voiceover_path=str(voice))
+    info = probe_video_info(str(output))
+    assert info["has_audio"] is True
+    assert 1.8 <= probe_duration(str(output)) <= 2.2
+
+
+def test_mix_resamples_mono_voice_and_stereo_music(tmp_path):
+    video = _make_video(tmp_path, "base.mp4", "black", seconds=2)
+    voice = tmp_path / "voice_22k_mono.wav"
+    music = tmp_path / "music_48k_stereo.wav"
+    _run([FFMPEG, "-y", "-f", "lavfi", "-i", "sine=frequency=720:duration=1.5",
+          "-ar", "22050", "-ac", "1", str(voice)])
+    _run([FFMPEG, "-y", "-f", "lavfi", "-i", "sine=frequency=190:duration=3",
+          "-ar", "48000", "-ac", "2", str(music)])
+    output = tmp_path / "resampled_mix.mp4"
+    mix_audio_layers(
+        str(video), str(output), voiceover_path=str(voice),
+        music_path=str(music), music_volume=0.18,
+    )
+    info = probe_video_info(str(output))
+    assert info["has_audio"] is True
+    assert 1.8 <= probe_duration(str(output)) <= 2.2
+
+
 def test_montage_candidate_picker_uses_transcript_boundaries_and_avoids_overlap():
     transcript = {
         "segments": [
@@ -123,6 +153,53 @@ def test_montage_candidate_picker_uses_transcript_boundaries_and_avoids_overlap(
     assert clips[1]["end"] <= clips[2]["start"]
     assert all(clip["start"] in {float(t) for t in range(0, 60, 2)} for clip in clips)
     assert all(8 <= clip["end"] - clip["start"] <= 16 for clip in clips)
+
+
+def test_montage_picker_accounts_for_crossfades_and_uses_nearest_full_boundaries():
+    transcript = {
+        "segments": [
+            {"start": float(t), "end": float(t + 2), "text": f"sentence {t}"}
+            for t in range(0, 120, 2)
+        ]
+    }
+    angles = [
+        {"title": "One", "start_hint": 0, "end_hint": 18},
+        {"title": "Two", "start_hint": 40, "end_hint": 58},
+        {"title": "Three", "start_hint": 80, "end_hint": 98},
+    ]
+    clips = _fit_montage_candidates(angles, transcript, target_duration=60, total_duration=120)
+    assert len(clips) == 3
+    assert [(clip["start"], clip["end"]) for clip in clips] == [(0, 20), (40, 60), (80, 100)]
+    actual = sum(clip["end"] - clip["start"] for clip in clips) - 0.5
+    assert actual == pytest.approx(59.5)
+
+
+def test_montage_duration_tolerance_is_bounded_and_actual_mismatch_is_visible():
+    assert _montage_duration_tolerance(60) == pytest.approx(4.8)
+    assert _montage_duration_tolerance(120) == 8
+    # Complete 17-second transcript blocks must remain whole even when their
+    # combined montage lands more than the target tolerance below 60 seconds.
+    transcript = {
+        "segments": [
+            {"start": 0, "end": 17, "text": "first sentence"},
+            {"start": 17, "end": 34, "text": "second sentence"},
+            {"start": 34, "end": 51, "text": "third sentence"},
+            {"start": 51, "end": 68, "text": "fourth sentence"},
+            {"start": 68, "end": 85, "text": "fifth sentence"},
+            {"start": 85, "end": 102, "text": "sixth sentence"},
+        ]
+    }
+    clips = _fit_montage_candidates(
+        [
+            {"title": "One", "start_hint": 0, "end_hint": 17},
+            {"title": "Two", "start_hint": 34, "end_hint": 51},
+            {"title": "Three", "start_hint": 68, "end_hint": 85},
+        ],
+        transcript,
+        target_duration=60,
+        total_duration=102,
+    )
+    assert [(clip["start"], clip["end"]) for clip in clips] == [(0, 17), (34, 51), (68, 85)]
 
 
 def test_aspect_dimensions_match_requested_publish_formats():

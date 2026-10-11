@@ -5,6 +5,7 @@ import {
 } from 'lucide-react'
 import GamingLayoutModal from './GamingLayoutModal.jsx'
 import { uploadFile, prepareGaming, getStatus, analyzeVideo, getAnalysis } from '../api.js'
+import { normalizeAnalysisClipCount } from '../utils/clipCount.js'
 
 const CONTENT_TYPES = [
   { id: 'general', label: 'General / Other' },
@@ -41,6 +42,9 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
   const [maxClip, setMaxClip] = useState(settings?.maxClip ?? 60)
 
   // Step 2 (analysis-first) controls
+  const [analysisClipCount, setAnalysisClipCount] = useState(() =>
+    normalizeAnalysisClipCount(settings?.analysisClipCount ?? 3)
+  )
   const [targetDuration, setTargetDuration] = useState(40)
   const [customPrompt, setCustomPrompt] = useState('')
   const [aspectRatio, setAspectRatio] = useState('9:16')
@@ -76,6 +80,7 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
     setSelectedAngle(null)
     setSelectedAngles([])
     setCustomPrompt('')
+    setContentType('general')
   }
 
   function handleFiles(files) {
@@ -99,9 +104,12 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
     setAnalysisError('')
     setAnalyzing(true)
     setAnalysis(null)
+    setContentType('general')
     setAnalysisStatus('Uploading…')
     try {
-      const payload = { content_type: contentType, angle_count: 4, force_hd: Boolean(settings?.forceHd) }
+      // Content type is intentionally omitted here: the analysis model detects
+      // the source format from its transcript and sampled frames.
+      const payload = { angle_count: 4, force_hd: Boolean(settings?.forceHd) }
       // Gaming preparation produces a server-side composed source. Prefer it
       // even when the original upload file remains selected in the form.
       const preparedSource = gamingReady?.source
@@ -118,7 +126,11 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
         const st = await getAnalysis(analysisId)
         setAnalysisStatus(st.status || 'working')
         if (st.status === 'done') {
-          setAnalysis(st.result || {})
+          const result = st.result || {}
+          setAnalysis(result)
+          setContentType(CONTENT_TYPES.some((item) => item.id === result.content_type)
+            ? result.content_type
+            : 'general')
           // Pre-fill the creative controls from the strongest angle.
           const angles = st.result?.suggested_angles || []
           if (angles.length) applyAngle(angles[0], 0)
@@ -218,7 +230,7 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
         source: analysis.source,
         analysisId: analysis.analysis_id,
         selectedClip,
-        clipCount: montageMode ? selectedClips.length : 1,
+        clipCount: montageMode ? selectedClips.length : analysisClipCount,
         targetDuration: Math.min(120, Math.max(10, Number(targetDuration) || 40)),
         customPrompt: customPrompt.trim() || undefined,
         selectedClips,
@@ -229,6 +241,7 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
         musicVolume: musicVolume / 100,
         aspectRatio,
         addHook: addHook || undefined,
+        splitScreen: splitScreen || undefined,
         contentType,
         analyzed: true,
       })
@@ -247,16 +260,16 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
       // selector belongs only to analysis-first mode.
       addHook: addHook || undefined,
     }
-    if (contentType === 'gaming' && gamingReady) {
-      onSubmit({ source: gamingReady.source, ...clipOpts, contentType })
+    if (gamingReady) {
+      onSubmit({ source: gamingReady.source, ...clipOpts, contentType: 'general' })
       return
     }
     if (mode === 'upload') {
       setUploading(true)
       setUploadProgress(0)
-      onSubmit({ file, ...clipOpts, contentType }, (p) => setUploadProgress(p), () => setUploading(false))
+      onSubmit({ file, ...clipOpts, contentType: 'general' }, (p) => setUploadProgress(p), () => setUploading(false))
     } else {
-      onSubmit({ source: urlText.trim(), ...clipOpts, contentType })
+      onSubmit({ source: urlText.trim(), ...clipOpts, contentType: 'general' })
     }
   }
 
@@ -271,7 +284,8 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
     downloading: 'Fetching video…',
     probing: 'Probing resolution & duration…',
     transcribing: 'Transcribing the full audio (Groq Whisper)…',
-    analyzing: 'Reading the whole video (Gemini)…',
+    sampling_visuals: 'Sampling timestamped frames…',
+    analyzing: 'Reading transcript + visual context (Gemini)…',
     done: 'Done',
   }
 
@@ -370,74 +384,58 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
           <p className="mt-3 text-xs text-red-300">{uploadError || analysisError}</p>
         )}
 
-        {/* ---------- Content type ---------- */}
-        <div className="mt-5 border-t border-border pt-4">
-          <div className="flex items-center gap-2 mb-3">
-            <Sparkles size={15} className="text-zinc-400" />
-            <span className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">Content Type</span>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {CONTENT_TYPES.map((ct) => (
-              <button
-                key={ct.id}
-                type="button"
-                onClick={() => setContentType(ct.id)}
-                className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
-                  contentType === ct.id
-                    ? 'bg-primary/20 border-primary text-primary'
-                    : 'border-zinc-700 text-zinc-400 hover:text-white hover:border-zinc-500'
-                }`}
-              >
-                {ct.label}
-              </button>
-            ))}
-          </div>
-
-          {contentType === 'gaming' && (
-            <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5">
-              {gamingReady ? (
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs text-amber-200">✓ Gaming video ready ({gamingReady.layout})</span>
-                  <button
-                    type="button"
-                    onClick={() => setShowGaming(true)}
-                    className="text-xs text-amber-300 hover:text-amber-100 underline"
-                  >
-                    Edit layout
-                  </button>
+        {/* ---------- Optional layouts (independent of content type) ---------- */}
+        <details className="mt-5 border-t border-border pt-4">
+            <summary className="cursor-pointer text-xs font-semibold text-zinc-300 uppercase tracking-wider">
+              Special layouts <span className="font-normal normal-case text-zinc-500">(optional)</span>
+            </summary>
+            <div className="mt-3 space-y-3">
+              <p className="text-[11px] text-zinc-500">
+                Use these only when the source needs a camera/gameplay composite or a two-person split screen.
+              </p>
+              {!analysis && (
+                <div className="rounded-lg border border-border bg-white/5 px-3 py-2.5">
+                  {gamingReady ? (
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs text-zinc-200">Camera + gameplay layout ready ({gamingReady.layout})</span>
+                      <button
+                        type="button"
+                        onClick={() => setShowGaming(true)}
+                        className="text-xs text-primary hover:text-white underline"
+                      >
+                        Edit layout
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setShowGaming(true)}
+                      disabled={!file && !(mode === 'url' && urlText.trim())}
+                      className="w-full flex items-center justify-center gap-2 text-xs font-medium text-zinc-200
+                                 disabled:opacity-40 hover:text-white transition-colors"
+                    >
+                      <LayoutGrid size={14} />
+                      {file || (mode === 'url' && urlText.trim())
+                        ? 'Prepare camera + gameplay layout'
+                        : 'Upload or paste a URL first'}
+                    </button>
+                  )}
                 </div>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => setShowGaming(true)}
-                  disabled={!file && mode !== 'url'}
-                  className="w-full flex items-center justify-center gap-2 text-xs font-bold text-amber-200
-                             disabled:opacity-40 hover:text-amber-100 transition-colors"
-                >
-                  <LayoutGrid size={14} />
-                  {file || (mode === 'url' && urlText.trim())
-                    ? 'Setup Cam & Gameplay'
-                    : 'Upload or paste a URL first'}
-                </button>
               )}
-            </div>
-          )}
-
-          {contentType === 'podcast' && (
-            <div className="mt-3 flex items-center gap-2">
-              <input
-                id="splitScreen"
-                type="checkbox"
-                checked={splitScreen}
-                onChange={(e) => setSplitScreen(e.target.checked)}
-                className="accent-cyan-400"
-              />
-              <label htmlFor="splitScreen" className="text-xs text-zinc-300 cursor-pointer select-none">
-                Split Screen <span className="text-zinc-500">(2 orang, atas/bawah)</span>
+              <label className="flex items-start gap-2 cursor-pointer select-none">
+                <input
+                  id="splitScreen"
+                  type="checkbox"
+                  checked={splitScreen}
+                  onChange={(e) => setSplitScreen(e.target.checked)}
+                  className="accent-cyan-400 mt-0.5"
+                />
+                <span className="text-xs text-zinc-300">
+                  Two-person split screen <span className="text-zinc-500">(stacked top/bottom)</span>
+                </span>
               </label>
             </div>
-          )}
-        </div>
+        </details>
 
         {/* ---------- STEP 1: analyze CTA ---------- */}
         {!analysis && (
@@ -485,7 +483,7 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
               )}
             </button>
             <p className="mt-2 text-center text-[11px] text-zinc-500">
-              Transcribes the whole video and returns a summary, timestamped chapters and clip angles unique to it.
+              Transcribes the whole video, samples a small set of timestamped frames, and returns a summary, chapters and video-specific clip angles. If frame analysis is unavailable, transcript analysis continues with a note.
             </p>
           </>
         )}
@@ -512,6 +510,46 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
               </div>
               <p className="text-sm text-zinc-200 leading-relaxed">{analysis.summary}</p>
 
+              <div className="mt-4 rounded-lg border border-primary/25 bg-primary/5 p-3">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                  <div>
+                    <label htmlFor="analysisContentType" className="block text-xs font-semibold text-zinc-200">
+                      Content type
+                    </label>
+                    <p className="mt-1 text-[11px] text-zinc-400">
+                      Suggested after analysis: {CONTENT_TYPES.find((item) => item.id === analysis.content_type)?.label || 'General / Other'}.
+                      {' '}Review or change it if the suggestion is off.
+                    </p>
+                  </div>
+                  <select
+                    id="analysisContentType"
+                    value={contentType}
+                    onChange={(e) => setContentType(e.target.value)}
+                    className="w-full sm:w-52 rounded-lg bg-background border border-border px-3 py-2 text-sm text-white"
+                  >
+                    {CONTENT_TYPES.map((item) => (
+                      <option key={item.id} value={item.id}>{item.label}</option>
+                    ))}
+                  </select>
+                </div>
+                {analysis.content_type_reason && (
+                  <p className="mt-2 text-[11px] text-zinc-400">
+                    Why this suggestion: {analysis.content_type_reason}
+                  </p>
+                )}
+              </div>
+
+              {analysis.analysis_warnings?.length > 0 && (
+                <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+                  <div className="font-semibold mb-1">Analysis notes</div>
+                  <ul className="list-disc pl-4 space-y-1">
+                    {analysis.analysis_warnings.map((warning, i) => (
+                      <li key={`${i}-${warning}`}>{warning}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               {topics.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 mt-3">
                   {topics.map((t) => (
@@ -536,6 +574,30 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
                 </span>
                 {analysis.language ? <span>lang: {analysis.language}</span> : null}
               </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-xl border border-border bg-white/5 p-3">
+              <div>
+                <label htmlFor="analysisClipCount" className="block text-xs font-semibold text-zinc-200">
+                  Individual clips to generate
+                </label>
+                <p className="mt-1 text-[11px] text-zinc-500">
+                  {montageMode
+                    ? 'Montage mode uses the 2–3 selected moments and also creates a separate stitched montage.'
+                    : 'Generate this many separate clips; the selected angle is included when its timestamps are valid.'}
+                </p>
+              </div>
+              <select
+                id="analysisClipCount"
+                value={montageMode ? Math.max(2, selectedAngles.length) : analysisClipCount}
+                disabled={montageMode}
+                onChange={(e) => setAnalysisClipCount(normalizeAnalysisClipCount(e.target.value))}
+                className="w-full sm:w-28 rounded-lg bg-background border border-border px-3 py-2 text-sm text-white disabled:opacity-50"
+              >
+                {Array.from({ length: 10 }, (_, i) => i + 1).map((count) => (
+                  <option key={count} value={count}>{count}</option>
+                ))}
+              </select>
             </div>
 
             {/* Chapters */}
