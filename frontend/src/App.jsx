@@ -109,6 +109,14 @@ export default function App() {
     if (payload.targetDuration) opts.target_duration = payload.targetDuration
     if (payload.customPrompt) opts.custom_prompt = payload.customPrompt
     if (payload.selectedClip) opts.selected_clip = JSON.stringify(payload.selectedClip)
+    if (payload.selectedClips) opts.selected_clips = JSON.stringify(payload.selectedClips)
+    if (payload.analysisId) opts.analysis_id = payload.analysisId
+    if (payload.montage) opts.montage = true
+    if (payload.voiceoverText) opts.voiceover_text = payload.voiceoverText
+    if (payload.voiceoverEngine) opts.voiceover_engine = payload.voiceoverEngine
+    if (payload.voiceoverVoice) opts.voiceover_voice = payload.voiceoverVoice
+    if (payload.backgroundMusicFile) opts.background_music_file = payload.backgroundMusicFile
+    if (payload.musicVolume != null) opts.music_volume = payload.musicVolume
     if (payload.contentType) opts.content_type = payload.contentType
     if (payload.splitScreen) opts.split_screen = true
     if (payload.aspectRatio) opts.aspect_ratio = payload.aspectRatio
@@ -118,6 +126,9 @@ export default function App() {
     if (payload.analyzed) {
       delete opts.min_clip
       delete opts.max_clip
+      // The analysis-first UI promises burned-in captions; don't let a legacy
+      // preference silently contradict that guarantee.
+      opts.subtitles = true
     }
 
     const file = payload.file || null
@@ -238,6 +249,16 @@ export default function App() {
                   {failed && job.error && (
                     <div className="mb-3 rounded-lg border border-red-500/40 bg-red-500/10 text-red-300 px-4 py-3 text-sm whitespace-pre-wrap">
                       {job.error}
+                    </div>
+                  )}
+                  {job?.result?.processing_warnings?.length > 0 && (
+                    <div className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-200 px-4 py-3 text-sm">
+                      <div className="font-semibold mb-1">Processing warnings</div>
+                      <ul className="list-disc pl-5 space-y-1">
+                        {job.result.processing_warnings.map((warning, i) => (
+                          <li key={`${i}-${warning}`}>{warning}</li>
+                        ))}
+                      </ul>
                     </div>
                   )}
                   <LogConsole logs={job.logs || []} />

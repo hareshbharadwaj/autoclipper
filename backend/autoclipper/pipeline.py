@@ -1,9 +1,13 @@
 """End-to-end orchestration: ingest -> transcribe -> analyze -> cut."""
+import json
 import os
 import time
 
 from . import config
-from .analyze import find_viral_clips
+from .analyze import (
+    find_viral_clips, _filter_clips_to_bounds,
+    _resolve_clip_bounds, _validate_clips,
+)
 from .clip import cut_all
 from .ingest import ingest
 from .reframe import VERTICAL_ASPECT, reframe_clip
@@ -14,10 +18,104 @@ from .utils import (
     ensure_ffmpeg,
     logger,
     probe_video_info,
+    probe_duration,
     sanitize_filename,
     write_json,
     save_to_library,
 )
+
+
+
+
+
+def _load_cached_transcript(path):
+    """Load a prior analysis transcript and reject malformed cache files."""
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError("The analyzed transcript cache is missing; analyze the video again.")
+    with open(path, "r", encoding="utf-8") as handle:
+        transcript = json.load(handle)
+    if not isinstance(transcript, dict) or not isinstance(transcript.get("segments"), list):
+        raise ValueError("The cached transcript is malformed; analyze the video again.")
+    return transcript
+
+
+def _normalize_target_duration(target_duration):
+    """Clamp oversized requests to the hard ceiling; reject malformed values."""
+    if target_duration is None:
+        return None
+    try:
+        value = float(target_duration)
+    except (TypeError, ValueError):
+        raise ValueError("target_duration must be a number between 5 and 120 seconds.")
+    return min(value, 120.0)
+
+
+def _fit_montage_candidates(candidates, transcript, target_duration, total_duration):
+    """Turn 2-3 selected analysis angles into transcript-aligned montage shots.
+
+    Segment boundaries come from Whisper timestamps. We preserve whole transcript
+    segments rather than arbitrarily cutting a word to hit the duration exactly.
+    """
+    segments = []
+    for segment in transcript.get("segments", []) or []:
+        try:
+            start, end = float(segment["start"]), float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end > start and (segment.get("text") or "").strip():
+            segments.append({"start": start, "end": end})
+    segments.sort(key=lambda item: item["start"])
+    if not segments:
+        raise ValueError("Montage needs word/sentence timestamps from the transcript.")
+
+    shot_count = max(1, len(candidates))
+    per_shot = max(3.0, float(target_duration) / shot_count)
+    # Leave a little room for sentence-boundary rounding, but never exceed the
+    # 120-second total ceiling when the requested target is already at the cap.
+    max_shot = per_shot + min(0.75, max(0.0, (120.0 - float(target_duration)) / shot_count))
+    chosen = []
+    for angle in candidates:
+        try:
+            hint_start = float(angle.get("start", angle.get("start_hint")))
+            hint_end = float(angle.get("end", angle.get("end_hint")))
+        except (TypeError, ValueError):
+            continue
+        if hint_end <= hint_start:
+            continue
+        desired_start = max(0.0, min(hint_start, max(0.0, total_duration - 0.1)))
+        start_idx = min(range(len(segments)), key=lambda i: abs(segments[i]["start"] - desired_start))
+        end_idx = start_idx
+        while end_idx + 1 < len(segments) and segments[end_idx]["end"] - segments[start_idx]["start"] < per_shot - 1.0:
+            end_idx += 1
+        shot_start = segments[start_idx]["start"]
+        shot_end = segments[end_idx]["end"]
+        if shot_end - shot_start > max_shot:
+            possible = [seg for seg in segments[start_idx:end_idx + 1]
+                        if seg["end"] - shot_start <= max_shot]
+            if not possible:
+                continue
+            shot_end = possible[-1]["end"]
+        if total_duration:
+            shot_start = max(0.0, min(shot_start, total_duration))
+            shot_end = max(0.0, min(shot_end, total_duration))
+        if shot_end <= shot_start:
+            continue
+        if any(shot_start < item["end"] and shot_end > item["start"] for item in chosen):
+            # Avoid duplicate/overlapping moments; leave a clear error if all angles overlap.
+            continue
+        chosen.append({
+            "start": round(shot_start, 2),
+            "end": round(shot_end, 2),
+            "title": (angle.get("title") or "Montage moment")[:80],
+            "description": (angle.get("description") or "")[:220],
+            "hook": (angle.get("hook") or "")[:120],
+            "reason": angle.get("reason") or "Selected from whole-video analysis",
+            "story_arc": "Selected angle; transcript-aligned montage segment",
+        })
+    chosen.sort(key=lambda item: item["start"])
+    if not 2 <= len(chosen) <= 3:
+        raise ValueError("Could not find 2-3 distinct, non-overlapping transcript moments for this montage.")
+    return chosen
 
 
 def _enforce_clip_constraints(clips, min_clip, max_clip, clip_count, video_dur, trim_long=True, pad_short=True):
@@ -83,6 +181,14 @@ def run(
     selected_clip: dict = None,
     aspect_ratio: str = None,
     add_hook: bool = False,
+    montage: bool = False,
+    selected_clips: list = None,
+    voiceover_text: str = None,
+    voiceover_engine: str = "auto",
+    voiceover_voice: str = None,
+    background_music_path: str = None,
+    music_volume: float = 0.18,
+    cached_transcript_path: str = None,
     on_clip=None,
 ) -> dict:
     """Run the full auto-clip pipeline and return a result summary dict.
@@ -91,26 +197,32 @@ def run(
     after each clip is fully processed (cut + reframe + subtitle), enabling the
     caller to stream partial results to the frontend.
     """
-    ensure_ffmpeg()
-    start_time = time.time()
-
-    # Hard ceiling: a single clip is never longer than 2 minutes.
-    if target_duration is not None:
-        try:
-            target_duration = min(float(target_duration), float(config.HARD_MAX_CLIP_SECONDS))
-        except (TypeError, ValueError):
-            target_duration = None
+    # Clamp oversized requests before resolving target bounds.
+    target_duration = _normalize_target_duration(target_duration)
     if max_clip is not None:
         try:
             max_clip = min(float(max_clip), float(config.HARD_MAX_CLIP_SECONDS))
         except (TypeError, ValueError):
             max_clip = None
+    if montage:
+        if not selected_clips or not 2 <= len(selected_clips) <= 3:
+            raise ValueError("Montage mode requires 2 or 3 selected video moments.")
+        effective_min_clip, effective_max_clip = 3.0, float(config.HARD_MAX_CLIP_SECONDS)
+    else:
+        effective_min_clip, effective_max_clip = _resolve_clip_bounds(
+            min_clip, max_clip, target_duration
+        )
+    ensure_ffmpeg()
+    start_time = time.time()
 
     os.makedirs(output_dir, exist_ok=True)
 
     # 1. Ingest
     video_path, title = ingest(source, output_dir, force_hd=force_hd, cookies_text=cookies_text)
     base_name = sanitize_filename(title)
+    video_info = probe_video_info(video_path)
+    if not video_info.get("duration"):
+        video_info["duration"] = 0.0
 
     # 1b. Resolve the output aspect ratio (9:16 portrait / 1:1 square / 16:9).
     #     `vertical` is kept for backwards compatibility with older clients.
@@ -129,20 +241,37 @@ def run(
     else:
         logger.info("Keeping original 16:9 framing (no crop).")
 
-    # 2. Transcribe (Groq Whisper)
-    transcript = transcribe(
-        video_path, output_dir, api_key=groq_key, model=whisper_model
-    )
+    # 2. Reuse the whole-video transcript when analysis-first already paid for it.
+    if cached_transcript_path:
+        transcript = _load_cached_transcript(cached_transcript_path)
+        logger.info("Reusing cached whole-video transcript; skipping a second Groq call.")
+    else:
+        transcript = transcribe(
+            video_path, output_dir, api_key=groq_key, model=whisper_model
+        )
 
     # 3. Analyze (Gemini) — language is auto-read from the transcript so that
     # titles / descriptions / hooks are written in the video's own language.
-    if selected_clip:
-        # Reuse the candidate selected during an analysis-first workflow.
-        clip_candidates = [dict(selected_clip)]
+    if montage:
+        clip_candidates = _fit_montage_candidates(
+            selected_clips, transcript,
+            target_duration=float(target_duration or 40),
+            total_duration=video_info.get("duration") or transcript.get("duration", 0.0),
+        )
+    elif selected_clip:
+        # Reuse the selected candidate only after validating its source timestamps.
+        clip_candidates = _validate_clips(
+            [selected_clip],
+            total_duration=video_info.get("duration") or transcript.get("duration", 0.0),
+            min_clip=effective_min_clip,
+            max_clip=effective_max_clip,
+        )
     else:
         clip_candidates = find_viral_clips(
             transcript, api_key=gemini_key, model=gemini_model,
-            clip_count=clip_count, min_clip=min_clip, max_clip=max_clip,
+            clip_count=clip_count,
+            min_clip=effective_min_clip if target_duration is not None else min_clip,
+            max_clip=effective_max_clip if target_duration is not None else max_clip,
             content_type=content_type, target_duration=target_duration,
             custom_prompt=custom_prompt,
         )
@@ -153,16 +282,21 @@ def run(
 
     # Apply hard duration bounds without blindly padding with unrelated footage or
     # truncating a sentence/payoff. Candidate selection should respect the bounds.
-    video_dur = transcript.get("duration") or 0.0
-    if min_clip or max_clip or clip_count:
+    video_dur = video_info.get("duration") or transcript.get("duration") or 0.0
+    if effective_min_clip is not None or effective_max_clip is not None or clip_count:
         clip_candidates = _enforce_clip_constraints(
-            clip_candidates, min_clip, max_clip, 1 if selected_clip else clip_count,
-            video_dur, trim_long=False, pad_short=False,
+            clip_candidates, effective_min_clip, effective_max_clip,
+            1 if selected_clip else clip_count, video_dur,
+            trim_long=False, pad_short=False,
         )
-        if min_clip is not None:
-            clip_candidates = [c for c in clip_candidates if c["end"] - c["start"] >= min_clip - 2]
-        if max_clip is not None:
-            clip_candidates = [c for c in clip_candidates if c["end"] - c["start"] <= max_clip + 3]
+        if not montage:
+            clip_candidates = _filter_clips_to_bounds(
+                clip_candidates,
+                min_clip=effective_min_clip,
+                max_clip=effective_max_clip,
+                min_tolerance=0.0 if target_duration is not None else 2.0,
+                max_tolerance=0.0 if target_duration is not None else 3.0,
+            )
         logger.info("After enforcement: %d clip(s)", len(clip_candidates))
     if not clip_candidates:
         logger.warning("No viral clips detected.")
@@ -238,6 +372,92 @@ def run(
             except Exception:
                 pass
 
+    processing_warnings = []
+
+    # Plan B: stitch the selected, independently captioned moments into one montage.
+    if montage:
+        try:
+            from .montage import stitch_montage
+            montage_name = f"{base_name}_montage.mp4"
+            montage_path = os.path.join(output_dir, montage_name)
+            stitch_montage(
+                [os.path.join(output_dir, item["file"]) for item in processed],
+                montage_path,
+            )
+            montage_duration = probe_duration(montage_path)
+            if montage_duration > float(config.HARD_MAX_CLIP_SECONDS) + 0.25:
+                raise RuntimeError(
+                    f"Montage duration {montage_duration:.1f}s exceeds the hard "
+                    f"{config.HARD_MAX_CLIP_SECONDS:.0f}s limit; choose fewer/shorter moments."
+                )
+            if target_duration and abs(montage_duration - float(target_duration)) > 3.0:
+                processing_warnings.append(
+                    f"Montage is {montage_duration:.1f}s versus the {float(target_duration):.0f}s target; "
+                    "whole transcript boundaries were prioritized."
+                )
+            processed.append({
+                "index": len(processed) + 1,
+                "file": montage_name,
+                "title": f"{title} — Montage",
+                "start": 0.0,
+                "end": round(montage_duration, 2),
+                "duration": round(montage_duration, 2),
+                "is_montage": True,
+                "reason": "Stitched from selected complementary moments with video/audio crossfades.",
+            })
+        except Exception as exc:
+            processing_warnings.append(f"Montage stitching failed: {exc}")
+            logger.exception("Montage stitching failed")
+
+    # Plan C: optional narration and/or background music. For multiple normal clips,
+    # apply the same requested audio treatment to the first clip only and say so.
+    audio_target = None
+    if montage:
+        if processed and processed[-1].get("is_montage"):
+            audio_target = processed[-1]
+        elif voiceover_text or background_music_path:
+            processing_warnings.append(
+                "Voiceover/music was skipped because montage stitching failed."
+            )
+    elif len(processed) == 1:
+        audio_target = processed[0]
+    elif voiceover_text or background_music_path:
+        audio_target = processed[0] if processed else None
+        if len(processed) > 1:
+            processing_warnings.append(
+                "Voiceover/music was applied to the first generated clip only; enable montage to mix one combined output."
+            )
+    if audio_target and (voiceover_text or background_music_path):
+        try:
+            from .audio_mix import mix_audio_layers
+            voiceover_path = None
+            if voiceover_text and voiceover_text.strip():
+                from .voiceover import generate_voiceover
+                voiceover_path = os.path.join(output_dir, f"{base_name}_voiceover.wav")
+                generate_voiceover(
+                    voiceover_text.strip()[:5000],
+                    voiceover_path,
+                    engine=voiceover_engine or "auto",
+                    voice=voiceover_voice,
+                    gemini_key=gemini_key,
+                )
+            src = os.path.join(output_dir, audio_target["file"])
+            mixed_name = audio_target["file"].rsplit(".", 1)[0] + "_audio.mp4"
+            mixed_path = os.path.join(output_dir, mixed_name)
+            mix_audio_layers(
+                src, mixed_path,
+                voiceover_path=voiceover_path,
+                music_path=background_music_path,
+                music_volume=music_volume,
+            )
+            if os.path.isfile(mixed_path) and os.path.getsize(mixed_path) > 0:
+                os.remove(src)
+                audio_target["file"] = mixed_name
+                audio_target["audio_mixed"] = True
+        except Exception as exc:
+            processing_warnings.append(f"Voiceover/music mixing failed: {exc}")
+            logger.exception("Voiceover/music mixing failed")
+
     # 7. Persist metadata
     try:
         video_info = probe_video_info(video_path)
@@ -253,6 +473,8 @@ def run(
         "video_info": video_info,
         "aspect_ratio": aspect_key or ("16:9" if target_aspect is None else "9:16"),
         "clips": processed,
+        "montage_file": next((item["file"] for item in processed if item.get("is_montage")), None),
+        "processing_warnings": processing_warnings,
         "elapsed_seconds": round(time.time() - start_time, 1),
     }
     metadata_path = os.path.join(output_dir, f"{base_name}_metadata.json")

@@ -165,9 +165,12 @@ export async function submitJob(payload, file, onProgress) {
   // always send FormData — with a 'file' for uploads or 'source' for URLs.
   if (!file) {
     const fd = new FormData()
+    const musicFile = payload.background_music_file
     for (const [k, v] of Object.entries(payload)) {
+      if (k === 'background_music_file') continue
       if (v !== undefined && v !== null) fd.append(k, String(v))
     }
+    if (musicFile) fd.append('background_music_file', musicFile)
     const res = await authFetch(`${API_URL}/api/process`, { method: 'POST', body: fd })
     if (!res.ok) {
       let detail = ''
@@ -185,9 +188,12 @@ export async function submitJob(payload, file, onProgress) {
   return new Promise((resolve, reject) => {
     const fd = new FormData()
     fd.append('file', file)
+    const musicFile = payload.background_music_file
     for (const [k, v] of Object.entries(payload)) {
+      if (k === 'background_music_file') continue
       if (v !== undefined && v !== null) fd.append(k, String(v))
     }
+    if (musicFile) fd.append('background_music_file', musicFile)
     const xhr = new XMLHttpRequest()
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100))

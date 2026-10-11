@@ -362,8 +362,16 @@ async def process(
     target_duration: float = Form(None),
     custom_prompt: str = Form(None),
     selected_clip: str = Form(None),
+    selected_clips: str = Form(None),
+    analysis_id: str = Form(None),
     aspect_ratio: str = Form(None),
     add_hook: bool = Form(False),
+    montage: bool = Form(False),
+    voiceover_text: str = Form(None),
+    voiceover_engine: str = Form("auto"),
+    voiceover_voice: str = Form(None),
+    background_music_file: UploadFile = File(None),
+    music_volume: float = Form(0.18),
     content_type: str = Form("general"),
     current: User = Depends(get_current_user),
 ):
@@ -396,10 +404,50 @@ async def process(
                 out.write(chunk)
         source = path
 
+    cached_transcript_path = None
+    if analysis_id:
+        analysis_entry = analyses.get(analysis_id)
+        if analysis_entry is None:
+            raise HTTPException(status_code=404, detail="Unknown analysis id.")
+        if analysis_entry.get("status") != "done":
+            raise HTTPException(status_code=409, detail="Video analysis is not complete yet.")
+        analysis_result = analysis_entry.get("result") or {}
+        analyzed_source = analysis_result.get("source")
+        transcript_path = analysis_entry.get("transcript_path")
+        analysis_root = os.path.abspath(os.path.join(config.OUTPUT_ROOT, "analysis"))
+        if not analyzed_source or not transcript_path or not os.path.isfile(transcript_path):
+            raise HTTPException(status_code=410, detail="The analysis cache expired; analyze the video again.")
+        if os.path.commonpath([analysis_root, os.path.abspath(transcript_path)]) != analysis_root:
+            raise HTTPException(status_code=400, detail="Invalid cached transcript path.")
+        source = analyzed_source
+        cached_transcript_path = transcript_path
+
     if not source or not source.strip():
         raise HTTPException(status_code=400, detail="Provide a 'source' URL/path or upload a 'file'.")
 
+    try:
+        selected_clips_data = json.loads(selected_clips) if selected_clips else None
+        if selected_clips_data is not None and not isinstance(selected_clips_data, list):
+            raise ValueError("selected_clips must be a JSON array.")
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid selected_clips: {exc}")
+
+    if not 0.0 <= music_volume <= 1.0:
+        raise HTTPException(status_code=400, detail="music_volume must be between 0 and 1.")
+
     job_id = uuid.uuid4().hex[:12]
+    music_path = None
+    if background_music_file is not None:
+        allowed_audio_exts = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
+        ext = os.path.splitext(background_music_file.filename or "")[1].lower()
+        if ext not in allowed_audio_exts:
+            raise HTTPException(status_code=400, detail="Background music must be MP3, WAV, M4A, AAC, OGG, or FLAC.")
+        job_dir = os.path.join(config.OUTPUT_ROOT, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        music_path = os.path.join(job_dir, "background_music" + ext)
+        with open(music_path, "wb") as out:
+            while chunk := await background_music_file.read(1024 * 1024):
+                out.write(chunk)
     jobs[job_id] = {
         "job_id": job_id,
         "status": "queued",
@@ -427,8 +475,16 @@ async def process(
         "target_duration": target_duration,
         "custom_prompt": custom_prompt,
         "selected_clip": json.loads(selected_clip) if selected_clip else None,
+        "selected_clips": selected_clips_data,
+        "cached_transcript_path": cached_transcript_path,
         "aspect_ratio": aspect_ratio or None,
         "add_hook": bool(add_hook),
+        "montage": bool(montage),
+        "voiceover_text": voiceover_text,
+        "voiceover_engine": voiceover_engine or "auto",
+        "voiceover_voice": voiceover_voice or None,
+        "background_music_path": music_path,
+        "music_volume": max(0.0, min(float(music_volume), 1.0)),
         "content_type": content_type or "general",
     }
     if (
@@ -442,13 +498,12 @@ async def process(
 
 
 # --- Analysis-first workflow ------------------------------------------------
-# Step 1 of the 2-step studio: ingest + transcribe + understand the WHOLE video
-# and hand back a summary, timestamped chapters and video-specific clip angles.
-# No video is cut here. The returned `source` is a server-side path that the
-# client passes straight back to /api/process for step 2, so the video is only
-# downloaded / uploaded once.
+# Heavy analysis shares the render semaphore and admission is capped before
+# uploads are accepted, preventing repeated requests from exhausting resources.
 ANALYSIS_RETENTION_HOURS = float(os.environ.get("ANALYSIS_RETENTION_HOURS", "24"))
+MAX_PENDING_ANALYSES = max(1, int(os.environ.get("MAX_PENDING_ANALYSES", "4")))
 analyses: dict = {}
+pending_analysis_ids: set[str] = set()
 
 
 def _sweep_old_analyses() -> int:
@@ -502,32 +557,49 @@ async def analyze_video(
     if not youtube_cookies and current.youtube_cookies:
         youtube_cookies = decrypt_value(current.youtube_cookies)
 
-    if file is not None:
-        uploads = os.path.join(config.OUTPUT_ROOT, "uploads")
-        os.makedirs(uploads, exist_ok=True)
-        original = file.filename or "upload.mp4"
-        ext = os.path.splitext(original)[1] or ".mp4"
-        name = f"{uuid.uuid4().hex[:8]}_{sanitize_filename(os.path.splitext(original)[0])}{ext}"
-        path = os.path.join(uploads, name)
-        with open(path, "wb") as out:
-            while chunk := await file.read(1024 * 1024):
-                out.write(chunk)
-        source = path
-
-    if not source or not source.strip():
+    if file is None and not source.strip():
         raise HTTPException(status_code=400, detail="Provide a 'source' URL/path or upload a 'file'.")
 
+    # Reserve capacity before reading a potentially large upload. There is no
+    # await between checking and reserving, so simultaneous requests cannot all
+    # pass the admission limit.
+    if len(pending_analysis_ids) >= MAX_PENDING_ANALYSES:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Analysis queue is full ({MAX_PENDING_ANALYSES} pending/active). Try again shortly.",
+            headers={"Retry-After": "30"},
+        )
     analysis_id = uuid.uuid4().hex[:12]
-    analyses[analysis_id] = {
-        "analysis_id": analysis_id,
-        "status": "queued",
-        "source": source,
-        "created_at": time.time(),
-        "finished_at": None,
-        "logs": [],
-        "result": None,
-        "error": None,
-    }
+    pending_analysis_ids.add(analysis_id)
+    try:
+        if file is not None:
+            uploads = os.path.join(config.OUTPUT_ROOT, "uploads")
+            os.makedirs(uploads, exist_ok=True)
+            original = file.filename or "upload.mp4"
+            ext = os.path.splitext(original)[1] or ".mp4"
+            name = f"{uuid.uuid4().hex[:8]}_{sanitize_filename(os.path.splitext(original)[0])}{ext}"
+            path = os.path.join(uploads, name)
+            with open(path, "wb") as out:
+                while chunk := await file.read(1024 * 1024):
+                    out.write(chunk)
+            source = path
+
+        if not source or not source.strip():
+            raise HTTPException(status_code=400, detail="Provide a 'source' URL/path or upload a 'file'.")
+
+        analyses[analysis_id] = {
+            "analysis_id": analysis_id,
+            "status": "queued",
+            "source": source,
+            "created_at": time.time(),
+            "finished_at": None,
+            "logs": [],
+            "result": None,
+            "error": None,
+        }
+    except Exception:
+        pending_analysis_ids.discard(analysis_id)
+        raise
     opts = {
         "whisper_model": whisper_model,
         "gemini_model": gemini_model,
@@ -538,8 +610,8 @@ async def analyze_video(
         "content_type": content_type or "general",
         "angle_count": angle_count or 4,
     }
-    # Analysis is CPU/IO heavy (download + transcribe + LLM); run it off the loop.
-    asyncio.create_task(asyncio.to_thread(_run_analysis, analysis_id, source, opts))
+    # Share the render/analysis concurrency budget and run work off the loop.
+    asyncio.create_task(_run_analysis_bounded(analysis_id, source, opts))
     return {"analysis_id": analysis_id, "status": "queued"}
 
 
@@ -550,6 +622,16 @@ async def analyze_video_status(analysis_id: str):
     if entry is None:
         raise HTTPException(status_code=404, detail="Unknown analysis id.")
     return entry
+
+
+async def _run_analysis_bounded(analysis_id: str, source: str, opts: dict):
+    """Run expensive analysis under the same concurrency budget as rendering."""
+    try:
+        async with _semaphore:
+            await asyncio.to_thread(_run_analysis, analysis_id, source, opts)
+    finally:
+        # Release admission even if the task is cancelled before the worker starts.
+        pending_analysis_ids.discard(analysis_id)
 
 
 def _run_analysis(analysis_id: str, source: str, opts: dict):
@@ -576,7 +658,8 @@ def _run_analysis(analysis_id: str, source: str, opts: dict):
         log("Fetching video…")
         local_source, title = ingest_mod.ingest(
             source, out_dir, force_hd=opts.get("force_hd", False),
-            cookies_text=opts.get("cookies_text"), max_height=720,
+            cookies_text=opts.get("cookies_text"),
+            max_height=None if opts.get("force_hd", False) else 720,
         )
 
         entry["status"] = "probing"
@@ -589,6 +672,9 @@ def _run_analysis(analysis_id: str, source: str, opts: dict):
             local_source, out_dir,
             api_key=opts.get("groq_key"), model=opts.get("whisper_model"),
         )
+        transcript_path = os.path.join(out_dir, "transcript.json")
+        write_json(transcript_path, transcript)
+        entry["transcript_path"] = transcript_path
 
         entry["status"] = "analyzing"
         log("Reading the whole video with Gemini…")
@@ -626,6 +712,8 @@ def _run_analysis(analysis_id: str, source: str, opts: dict):
         entry["error"] = str(e)
         entry["finished_at"] = time.time()
         log(f"Error: {e}")
+    finally:
+        pending_analysis_ids.discard(analysis_id)
 
 
 class GamingPrepareRequest(BaseModel):
