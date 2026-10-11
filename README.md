@@ -194,7 +194,9 @@ Async FastAPI server with a bounded job queue (semaphore, `MAX_CONCURRENT_JOBS`)
 
 | Method | Route | Purpose |
 |--------|-------|---------|
-| POST | `/api/process` | Submit a video (`source` URL/path or uploaded `file`, `content_type`, clip options); returns `job_id`. |
+| POST | `/api/analyze-video` | **Step 1** of the analysis-first workflow — ingests + transcribes + understands the whole video and returns a summary, chapters and suggested angles. Returns `analysis_id`. |
+| GET | `/api/analyze-video/{analysis_id}` | Poll an in-flight analysis (`status`, `logs`, `result`, `error`). |
+| POST | `/api/process` | **Step 2** — submit a video (`source` URL/path or uploaded `file`, `content_type`, clip options); returns `job_id`. |
 | GET | `/api/status/{job_id}` | Poll status, live logs, and result. |
 | GET | `/api/jobs` | List recent jobs. |
 | GET | `/api/files/{job_id}/{filename}` | Download a generated clip / asset. |
@@ -220,9 +222,31 @@ Async FastAPI server with a bounded job queue (semaphore, `MAX_CONCURRENT_JOBS`)
 | POST | `/api/facebook/logout` | Disconnect Facebook account. |
 | POST | `/api/cleanup` | Manually trigger output cleanup (older than `JOB_RETENTION_HOURS`). |
 
+## Analysis-First Workflow
+
+The dashboard is a **2-step studio** so the AI never cuts a random slice of your video:
+
+**Step 1 — Analyze** (`POST /api/analyze-video`)
+- Downloads / uploads the video once and probes it with `ffprobe` (`probe_video_info()`: width, height, duration, audio, aspect ratio + a recommended output format).
+- Transcribes the **entire** audio with Groq Whisper (word-level timestamps).
+- Gemini reads the whole transcript (`analyze_video_summary_and_angles()`) and returns:
+  - `summary` — 2–3 sentences on what the video is about.
+  - `chapters` — 3–8 timestamped sections covering the whole timeline.
+  - `key_topics` — 3–5 topics **specific to this video** (not static categories).
+  - `suggested_angles` — 3–4 clip ideas found in the footage, each with a hook, description, its own `target_duration`, `start_hint`/`end_hint`, and a ready-to-use `custom_prompt`.
+- The response also carries a server-side `source` path, so **step 2 reuses the already-downloaded video** instead of fetching it again.
+
+**Step 2 — Curate & generate** (`POST /api/process`)
+- Click a suggested angle (it pre-fills the focus prompt and duration) **or** type your own creative direction.
+- Pick the output format: `9:16` (portrait, smart-tracked crop), `1:1` (square) or `16:9` (original, no crop) — pre-selected from the detected aspect.
+- Set an **exact target duration** (10–120s, hard-capped at 2 minutes).
+- Captions are always burned in (`burn=True`), word-level and synced to the speaker's real audio, so lip sync stays perfect. Optionally burn a 4-second hook banner.
+
+Every clip is selected under a strict **story arc**: a hook in the first 0–3s, a body that delivers on it, and a conclusion that lands on a finished sentence — never a mid-sentence cut.
+
 ## Dashboard Features
 
-- **Clip Generator** — paste a YouTube URL or upload a file, choose a **Content Type** (General, Podcast, Gaming, Tutorial, IRL/Live) that tailors the AI prompt, then watch live logs and preview/download the vertical clips.
+- **Clip Generator** — paste a YouTube URL or upload a file, choose a **Content Type** (General, Podcast, Gaming, Tutorial, IRL/Live) that tailors the AI prompt, then analyze the whole video, pick an angle and generate. Or skip analysis and let Gemini pick N moments.
 - **Trending** — pull real trending videos by region + content type, enriched by Gemini with clip ideas. Copy a link straight into the generator.
 - **Subtitle editor** — per-cue caption editing (text, colors, box, font size, word-highlight karaoke), then burn to a new clip.
 - **Hook overlay** — add styled viral hook text (top / center / bottom, scalable).
