@@ -106,6 +106,9 @@ export default function App() {
     if (payload.clipCount) opts.clip_count = payload.clipCount
     if (payload.minClip) opts.min_clip = payload.minClip
     if (payload.maxClip) opts.max_clip = payload.maxClip
+    if (payload.targetDuration) opts.target_duration = payload.targetDuration
+    if (payload.customPrompt) opts.custom_prompt = payload.customPrompt
+    if (payload.selectedClip) opts.selected_clip = JSON.stringify(payload.selectedClip)
     if (payload.contentType) opts.content_type = payload.contentType
     if (payload.splitScreen) opts.split_screen = true
 

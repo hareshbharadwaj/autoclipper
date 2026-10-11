@@ -41,7 +41,11 @@ English.
 
 Rules:
 - Each clip must be between {min_s:.0f} and {max_s:.0f} seconds long.
-- Clips must start and end on natural sentence boundaries (no mid-sentence cuts).
+- Prefer a duration close to {target_s:.0f} seconds when a target is supplied; target duration is a preference, not permission to cut a sentence or remove the payoff.
+- Clips must start and end on natural sentence/thought boundaries (no mid-sentence cuts). Preserve the question/setup and the answer/payoff when they belong together.
+- Prioritize coherent standalone stories over isolated shocking lines. Include enough context for a viewer who has not seen the source.
+- Keep the opening hook within the first 1–3 seconds of the selected moment. End immediately after the conclusion, punchline, or useful takeaway.
+- Do not invent speech or infer words not present in the transcript.
 - Content focus: {focus}
 - Do not overlap clips. Use timestamps that exist in the transcript.
 - "start" and "end" are in seconds (numbers).
@@ -67,7 +71,8 @@ TRANSCRIPT:
 
 def find_viral_clips(transcript: dict, api_key: str = None, model: str = None,
                       clip_count: int = None, min_clip: float = None,
-                      max_clip: float = None, content_type: str = None) -> list:
+                      max_clip: float = None, content_type: str = None,
+                      target_duration: float = None, custom_prompt: str = None) -> list:
     """Ask Gemini for a list of viral clip candidates. Returns a list of dicts."""
     from google import genai
 
@@ -80,6 +85,14 @@ def find_viral_clips(transcript: dict, api_key: str = None, model: str = None,
 
     ctype = config.CONTENT_TYPES.get(content_type, config.CONTENT_TYPES["general"])
     focus = ctype["focus"]
+    target_s = float(target_duration) if target_duration is not None else (min_s + max_s) / 2.0
+    if target_s <= 0:
+        raise ValueError("target_duration must be greater than zero.")
+    if target_duration is not None:
+        # Give the model a small editing window around the target, while preserving
+        # natural sentence boundaries. Hard validation still happens after generation.
+        min_s = max(5.0, target_s - 3.0)
+        max_s = min(120.0, target_s + 3.0)
 
     transcript_text = _build_transcript_text(transcript)
     if not transcript_text.strip():
@@ -90,10 +103,16 @@ def find_viral_clips(transcript: dict, api_key: str = None, model: str = None,
         count=count,
         min_s=min_s,
         max_s=max_s,
+        target_s=target_s,
         language=language,
         focus=focus,
         transcript=transcript_text,
     )
+    if custom_prompt and custom_prompt.strip():
+        prompt += (
+            "\n\nUSER EDITING DIRECTION (follow this while preserving transcript truth):\n"
+            + custom_prompt.strip()[:1200]
+        )
 
     logger.info("Analyzing transcript with Gemini model '%s'...", model)
     client = genai.Client(api_key=api_key)
@@ -101,7 +120,12 @@ def find_viral_clips(transcript: dict, api_key: str = None, model: str = None,
     raw = (response.text or "").strip()
 
     clips = _parse_clips(raw)
-    clips = _validate_clips(clips, total_duration=transcript.get("duration", 0.0))
+    clips = _validate_clips(
+        clips,
+        total_duration=transcript.get("duration", 0.0),
+        min_clip=min_s,
+        max_clip=max_s,
+    )
     logger.info("Found %d viral clip candidate(s)", len(clips))
     return clips
 
@@ -138,7 +162,8 @@ def _parse_clips(raw: str) -> list:
     return data.get("clips", []) if isinstance(data, dict) else []
 
 
-def _validate_clips(clips: list, total_duration: float) -> list:
+def _validate_clips(clips: list, total_duration: float,
+                    min_clip: float = None, max_clip: float = None) -> list:
     valid = []
     for c in clips:
         try:
@@ -151,7 +176,9 @@ def _validate_clips(clips: list, total_duration: float) -> list:
         if total_duration and end > total_duration + 1:
             end = total_duration
         length = end - start
-        if length < config.MIN_CLIP_SECONDS - 2 or length > config.MAX_CLIP_SECONDS + 5:
+        lower = (min_clip if min_clip is not None else config.MIN_CLIP_SECONDS) - 2
+        upper = (max_clip if max_clip is not None else config.MAX_CLIP_SECONDS) + 3
+        if length < max(3.0, lower) or length > upper:
             continue
         valid.append(
             {
