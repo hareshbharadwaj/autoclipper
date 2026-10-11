@@ -221,7 +221,7 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
             <RangeSlider
               label="Clip duration (sec)"
               min={5}
-              max={300}
+              max={120}
               step={1}
               low={minClip}
               high={maxClip}
