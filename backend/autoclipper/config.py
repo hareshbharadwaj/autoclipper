@@ -85,9 +85,10 @@ MIN_CLIP_SECONDS = float(os.environ.get("MIN_CLIP_SECONDS", "15"))
 MAX_CLIP_SECONDS = float(os.environ.get("MAX_CLIP_SECONDS", "60"))
 TARGET_CLIP_COUNT = int(os.environ.get("TARGET_CLIP_COUNT", "8"))
 
-# Hard ceiling: a single short-form clip is never longer than 2 minutes,
-# regardless of what the user or the environment asks for.
-HARD_MAX_CLIP_SECONDS = float(os.environ.get("HARD_MAX_CLIP_SECONDS", "120"))
+# Hard ceiling: a single short-form clip is never longer than 2 minutes.
+# Deliberately not configurable: API callers and deployment env vars must not
+# be able to raise this safety/product limit.
+HARD_MAX_CLIP_SECONDS = 120.0
 
 # --- Misc ---
 YOUTUBE_COOKIES = os.environ.get("YOUTUBE_COOKIES")

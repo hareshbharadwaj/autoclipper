@@ -46,6 +46,12 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
   const [aspectRatio, setAspectRatio] = useState('9:16')
   const [addHook, setAddHook] = useState(false)
   const [selectedAngle, setSelectedAngle] = useState(null)
+  const [montageMode, setMontageMode] = useState(false)
+  const [selectedAngles, setSelectedAngles] = useState([])
+  const [voiceoverText, setVoiceoverText] = useState('')
+  const [voiceoverEngine, setVoiceoverEngine] = useState('auto')
+  const [backgroundMusicFile, setBackgroundMusicFile] = useState(null)
+  const [musicVolume, setMusicVolume] = useState(18)
 
   // Analysis state
   const [analysis, setAnalysis] = useState(null)
@@ -68,6 +74,7 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
     setAnalysisError('')
     setAnalysisStatus('')
     setSelectedAngle(null)
+    setSelectedAngles([])
     setCustomPrompt('')
   }
 
@@ -94,10 +101,14 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
     setAnalysis(null)
     setAnalysisStatus('Uploading…')
     try {
-      const payload = { content_type: contentType, angle_count: 4 }
-      if (!file) payload.source = gamingReady ? gamingReady.source : urlText.trim()
+      const payload = { content_type: contentType, angle_count: 4, force_hd: Boolean(settings?.forceHd) }
+      // Gaming preparation produces a server-side composed source. Prefer it
+      // even when the original upload file remains selected in the form.
+      const preparedSource = gamingReady?.source
+      if (preparedSource) payload.source = preparedSource
+      else if (!file) payload.source = urlText.trim()
 
-      const started = await analyzeVideo(payload, file, (p) => setUploadProgress(p))
+      const started = await analyzeVideo(payload, preparedSource ? null : file, (p) => setUploadProgress(p))
       const analysisId = started?.analysis_id
       if (!analysisId) throw new Error('Backend did not return an analysis id.')
 
@@ -131,6 +142,7 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
 
   function applyAngle(angle, index) {
     setSelectedAngle(index)
+    setSelectedAngles([])
     if (angle?.custom_prompt) setCustomPrompt(angle.custom_prompt)
     else if (angle?.title) setCustomPrompt(`Focus on: ${angle.title}. ${angle.description || ''}`.trim())
     if (angle?.target_duration) {
@@ -187,13 +199,34 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
   function submit() {
     if (!canSubmit) return
 
-    // Directed generation (an angle was chosen / a focus prompt was typed).
+    // Directed generation (one angle, a montage of 2-3 angles, or a custom prompt).
     if (analysis) {
+      if (montageMode && (selectedAngles.length < 2 || selectedAngles.length > 3)) {
+        setAnalysisError('Choose 2 or 3 distinct angles to build a montage.')
+        return
+      }
+      const selectedClips = montageMode
+        ? selectedAngles.map((index) => {
+            const angle = angles[index]
+            return { ...angle, start: angle.start_hint, end: angle.end_hint }
+          })
+        : undefined
+      const selectedClip = !montageMode && selectedAngle != null
+        ? { ...angles[selectedAngle], start: angles[selectedAngle]?.start_hint, end: angles[selectedAngle]?.end_hint }
+        : undefined
       onSubmit({
         source: analysis.source,
-        clipCount: 1,
+        analysisId: analysis.analysis_id,
+        selectedClip,
+        clipCount: montageMode ? selectedClips.length : 1,
         targetDuration: Math.min(120, Math.max(10, Number(targetDuration) || 40)),
         customPrompt: customPrompt.trim() || undefined,
+        selectedClips,
+        montage: montageMode || undefined,
+        voiceoverText: voiceoverText.trim() || undefined,
+        voiceoverEngine,
+        backgroundMusicFile: backgroundMusicFile || undefined,
+        musicVolume: musicVolume / 100,
         aspectRatio,
         addHook: addHook || undefined,
         contentType,
@@ -210,7 +243,8 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
       targetDuration: targetDuration || undefined,
       customPrompt: customPrompt.trim() || undefined,
       splitScreen: splitScreen || undefined,
-      aspectRatio,
+      // Classic mode uses the saved vertical setting; the explicit aspect
+      // selector belongs only to analysis-first mode.
       addHook: addHook || undefined,
     }
     if (contentType === 'gaming' && gamingReady) {
@@ -534,18 +568,57 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
                   </span>
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <label className="flex items-start gap-2 mb-3 rounded-lg border border-zinc-700 bg-white/5 p-3 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={montageMode}
+                      onChange={(e) => {
+                        setMontageMode(e.target.checked)
+                        setSelectedAngles([])
+                        setSelectedAngle(null)
+                        setAnalysisError('')
+                      }}
+                      className="accent-cyan-400 mt-0.5"
+                    />
+                    <span className="text-xs text-zinc-300">
+                      Build a multi-shot montage
+                      <span className="block text-[11px] text-zinc-500">
+                        Select 2–3 complementary moments; they will be stitched with short video and audio crossfades.
+                      </span>
+                      {montageMode && (
+                        <span className="block text-[11px] text-cyan-300 mt-1">
+                          {selectedAngles.length}/3 angles selected (choose at least 2)
+                        </span>
+                      )}
+                    </span>
+                  </label>
                   {angles.map((a, i) => {
-                    const active = selectedAngle === i
+                    const active = montageMode ? selectedAngles.includes(i) : selectedAngle === i
                     return (
                       <button
                         key={`${a.title}-${i}`}
                         type="button"
-                        onClick={() => applyAngle(a, i)}
+                        disabled={montageMode && (a.start_hint == null || a.end_hint == null)}
+                        onClick={() => {
+                          if (montageMode && (a.start_hint == null || a.end_hint == null)) return
+                          if (!montageMode) {
+                            applyAngle(a, i)
+                            return
+                          }
+                          setSelectedAngles((prev) => {
+                            if (prev.includes(i)) return prev.filter((n) => n !== i)
+                            if (prev.length >= 3) return prev
+                            return [...prev, i]
+                          })
+                          setSelectedAngle(null)
+                          setCustomPrompt('Create a coherent montage from the selected moments. Keep the shots complementary, preserve their original order, and maintain a clear hook → body → payoff.')
+                          setAnalysisError('')
+                        }}
                         className={`text-left rounded-xl border p-3 transition-colors ${
                           active
                             ? 'border-primary bg-primary/10'
                             : 'border-zinc-700 hover:border-zinc-500 bg-white/5'
-                        }`}
+                        } ${montageMode && (a.start_hint == null || a.end_hint == null) ? 'opacity-40 cursor-not-allowed' : ''}`}
                       >
                         <div className="flex items-start justify-between gap-2">
                           <span className="text-sm font-semibold text-white leading-snug">{a.title}</span>
@@ -631,6 +704,66 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
                 <p className="mt-2 text-[11px] text-zinc-500">
                   Detected {aspectMeta.detected_label}. {aspectMeta.reason}
                 </p>
+              )}
+            </div>
+
+            {/* Optional Plan C audio layers */}
+            <div className="space-y-3 rounded-xl border border-zinc-700 bg-white/5 p-4">
+              <div>
+                <div className="text-xs font-semibold text-zinc-200 uppercase tracking-wider">Optional voiceover & background music</div>
+                <p className="mt-1 text-[11px] text-zinc-500">
+                  Voiceover is generated from your script. When music and narration are both enabled, music volume is automatically ducked under speech.
+                </p>
+              </div>
+              <div>
+                <label htmlFor="voiceoverText" className="block mb-1 text-xs text-zinc-300">Voiceover script (optional)</label>
+                <textarea
+                  id="voiceoverText"
+                  rows={2}
+                  maxLength={5000}
+                  value={voiceoverText}
+                  onChange={(e) => setVoiceoverText(e.target.value)}
+                  placeholder="Write narration for silent footage, B-roll, or an explanatory intro…"
+                  className="w-full resize-y rounded-lg bg-background border border-border px-3 py-2 text-sm text-white placeholder-zinc-600"
+                />
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label htmlFor="voiceoverEngine" className="block mb-1 text-xs text-zinc-300">Voice engine</label>
+                  <select
+                    id="voiceoverEngine"
+                    value={voiceoverEngine}
+                    onChange={(e) => setVoiceoverEngine(e.target.value)}
+                    className="w-full rounded-lg bg-background border border-border px-3 py-2 text-xs text-white"
+                  >
+                    <option value="auto">Automatic / fallback</option>
+                    <option value="kokoro">Kokoro (local)</option>
+                    <option value="edge">Edge TTS</option>
+                    <option value="gemini">Gemini TTS</option>
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="backgroundMusic" className="block mb-1 text-xs text-zinc-300">Background music (optional)</label>
+                  <input
+                    id="backgroundMusic"
+                    type="file"
+                    accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,audio/*"
+                    onChange={(e) => setBackgroundMusicFile(e.target.files?.[0] || null)}
+                    className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded-md file:border-0 file:bg-white/10 file:px-2 file:py-1.5 file:text-zinc-200"
+                  />
+                  {backgroundMusicFile && <p className="mt-1 text-[10px] text-zinc-500">{backgroundMusicFile.name}</p>}
+                </div>
+              </div>
+              {backgroundMusicFile && (
+                <SliderRow
+                  label="Music level"
+                  value={musicVolume}
+                  min={5}
+                  max={40}
+                  step={1}
+                  unit="%"
+                  onChange={setMusicVolume}
+                />
               )}
             </div>
 

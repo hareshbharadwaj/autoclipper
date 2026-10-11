@@ -12,17 +12,30 @@ from .utils import logger, run_command
 
 
 def build_srt(words, start, end, max_chars=20, max_duration=2.0):
-    """Return an SRT string for words within [start, end], times relative to start.
-    
-    Groups words by max_chars (character count) or max_duration (seconds from block
-    start) — whichever is hit first — matching OpenShorts' generate_srt() algorithm.
+    """Return an SRT string for words inside [start, end], relative to clip start.
+
+    Word timings are clipped to the requested output interval, preventing subtitle
+    cues from extending beyond the rendered clip's duration.
     """
-    selected = [
-        {"word": w.get("word", "").strip(), "start": w["start"], "end": w["end"]}
-        for w in (words or [])
-        if w.get("word", "").strip() and w.get("start") is not None and w.get("end") is not None
-           and w["end"] > start and w["start"] < end
-    ]
+    try:
+        clip_start = float(start)
+        clip_end = float(end)
+    except (TypeError, ValueError):
+        return ""
+    if clip_end <= clip_start:
+        return ""
+    clip_duration = clip_end - clip_start
+
+    selected = []
+    for word in words or []:
+        text = (word.get("word") or "").strip()
+        try:
+            word_start = float(word["start"])
+            word_end = float(word["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if text and word_end > word_start and word_end > clip_start and word_start < clip_end:
+            selected.append({"word": text, "start": word_start, "end": word_end})
     if not selected:
         return ""
 
@@ -30,42 +43,44 @@ def build_srt(words, start, end, max_chars=20, max_duration=2.0):
     block = []
     block_start = None
 
-    for w in selected:
-        s = max(0, w["start"] - start)
-        e = max(0, w["end"] - start)
-        w["start_rel"] = s
-        w["end_rel"] = e
+    for word in selected:
+        s = max(0.0, min(clip_duration, word["start"] - clip_start))
+        e = max(0.0, min(clip_duration, word["end"] - clip_start))
+        if e <= s:
+            continue
+        word["start_rel"] = s
+        word["end_rel"] = e
 
         if not block:
-            block = [w]
+            block = [word]
             block_start = s
         else:
-            current_text_len = sum(len(b["word"]) + 1 for b in block)
+            current_text_len = sum(len(item["word"]) + 1 for item in block)
             duration = e - block_start
-            if current_text_len + len(w["word"]) > max_chars or duration > max_duration:
+            if current_text_len + len(word["word"]) > max_chars or duration > max_duration:
                 block_end = block[-1]["end_rel"]
-                text = " ".join(b["word"] for b in block)
+                text = " ".join(item["word"] for item in block)
                 cues.append((block_start, block_end, text))
-                block = [w]
+                block = [word]
                 block_start = s
             else:
-                block.append(w)
+                block.append(word)
 
     if block:
         block_end = block[-1]["end_rel"]
-        text = " ".join(b["word"] for b in block)
+        text = " ".join(item["word"] for item in block)
         cues.append((block_start, block_end, text))
 
     def _fmt(t):
-        ms = int(round((t - int(t)) * 1000))
-        h = int(t // 3600)
-        m = int((t % 3600) // 60)
-        s = int(t % 60)
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+        total_ms = max(0, int(round(float(t) * 1000)))
+        h, rem = divmod(total_ms, 3_600_000)
+        m, rem = divmod(rem, 60_000)
+        sec, ms = divmod(rem, 1000)
+        return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
 
     lines = []
-    for idx, (cs, ce, text) in enumerate(cues, start=1):
-        lines.append(f"{idx}\n{_fmt(cs)} --> {_fmt(ce)}\n{text}\n")
+    for idx, (cue_start, cue_end, cue_text) in enumerate(cues, start=1):
+        lines.append(f"{idx}\n{_fmt(cue_start)} --> {_fmt(cue_end)}\n{cue_text}\n")
     return "\n".join(lines)
 
 
@@ -125,7 +140,9 @@ def add_subtitles(clips, transcript, output_dir, burn=True):
             continue
         srt = build_srt(words, cs, ce)
         if not srt:
-            logger.warning("No words for clip %s; skipping subtitles.", clip.get("index"))
+            warning = "No transcript words overlap this clip; captions were not generated."
+            clip["subtitle_warning"] = warning
+            logger.warning("%s Clip index: %s", warning, clip.get("index"))
             continue
 
         srt_name = clip["file"].rsplit(".", 1)[0] + ".srt"
@@ -139,16 +156,20 @@ def add_subtitles(clips, transcript, output_dir, burn=True):
 
         src = os.path.join(output_dir, clip["file"])
         if not os.path.exists(src):
+            clip["subtitle_warning"] = "Clip file was missing; subtitles could not be burned."
             continue
         sub_name = clip["file"].rsplit(".", 1)[0] + "_sub.mp4"
         sub_path = os.path.join(output_dir, sub_name)
         try:
             burn_subtitles(src, srt_path, sub_path)
+            if not os.path.isfile(sub_path) or os.path.getsize(sub_path) == 0:
+                raise RuntimeError("FFmpeg returned without creating a non-empty subtitled video.")
             clip["subtitled_file"] = sub_name
-            if os.path.exists(sub_path):
-                os.remove(src)
-                clip["file"] = sub_name
+            os.remove(src)
+            clip["file"] = sub_name
+            clip.pop("subtitle_warning", None)
         except RuntimeError as e:
+            clip["subtitle_warning"] = f"Captions were generated as SRT but could not be burned in: {e}"
             logger.error("Failed to burn subtitles for clip %s: %s", clip.get("index"), e)
     return clips
 

@@ -207,7 +207,9 @@ def analyze_video_summary_and_angles(
     response = config.gemini_generate(client, model, prompt)
     raw = (response.text or "").strip()
 
-    data = _parse_clips(raw)
+    # Whole-video reports are JSON objects, not {"clips": [...]} payloads.
+    # Parsing through _parse_clips would discard summary/chapters/angles.
+    data = _load_json(raw)
     if isinstance(data, dict):
         report = data
     elif isinstance(data, list):
@@ -237,10 +239,14 @@ def _validate_report(report: dict, duration: float) -> dict:
             continue
         if duration and start > duration:
             continue
+        start = max(0.0, start)
+        end = min(end, duration or end)
+        if end <= start:
+            continue
         chapters.append(
             {
-                "start": round(max(0.0, start), 2),
-                "end": round(min(end, duration or end), 2),
+                "start": round(start, 2),
+                "end": round(end, 2),
                 "label": (ch.get("label") or "Untitled section").strip()[:90],
             }
         )
@@ -286,6 +292,11 @@ def _validate_report(report: dict, duration: float) -> dict:
             }
         )
     angles = angles[:6]
+    for angle in angles:
+        start_hint, end_hint = angle.get("start_hint"), angle.get("end_hint")
+        if start_hint is not None and end_hint is not None and end_hint <= start_hint:
+            angle["start_hint"] = None
+            angle["end_hint"] = None
 
     return {
         "summary": summary,
@@ -294,6 +305,39 @@ def _validate_report(report: dict, duration: float) -> dict:
         "suggested_angles": angles,
         "duration": round(duration, 2),
     }
+
+
+
+def _resolve_clip_bounds(min_clip=None, max_clip=None, target_duration=None):
+    """Resolve hard clip bounds; an explicit target uses a +/-3s window."""
+    if target_duration is None:
+        return min_clip, max_clip
+    try:
+        target = float(target_duration)
+    except (TypeError, ValueError):
+        raise ValueError("target_duration must be between 5 and 120 seconds.")
+    if not 5.0 <= target <= float(config.HARD_MAX_CLIP_SECONDS):
+        raise ValueError("target_duration must be between 5 and 120 seconds.")
+    return max(5.0, target - 3.0), min(float(config.HARD_MAX_CLIP_SECONDS), target + 3.0)
+
+
+def _filter_clips_to_bounds(clips, min_clip=None, max_clip=None,
+                            min_tolerance=0.0, max_tolerance=0.0):
+    """Filter candidate durations without trimming away a sentence or payoff."""
+    filtered = []
+    for clip in clips or []:
+        try:
+            duration = float(clip["end"]) - float(clip["start"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if duration <= 0:
+            continue
+        if min_clip is not None and duration < float(min_clip) - min_tolerance:
+            continue
+        if max_clip is not None and duration > float(max_clip) + max_tolerance:
+            continue
+        filtered.append(clip)
+    return filtered
 
 
 def find_viral_clips(transcript: dict, api_key: str = None, model: str = None,
@@ -316,14 +360,11 @@ def find_viral_clips(transcript: dict, api_key: str = None, model: str = None,
     # Hard ceiling: no clip is ever longer than HARD_MAX_CLIP_SECONDS (2 min).
     max_s = min(max_s, config.HARD_MAX_CLIP_SECONDS)
     target_s = float(target_duration) if target_duration is not None else (min_s + max_s) / 2.0
-    target_s = min(target_s, config.HARD_MAX_CLIP_SECONDS)
-    if target_s <= 0:
-        raise ValueError("target_duration must be greater than zero.")
     if target_duration is not None:
-        # Give the model a small editing window around the target, while preserving
-        # natural sentence boundaries. Hard validation still happens after generation.
-        min_s = max(5.0, target_s - 3.0)
-        max_s = min(config.HARD_MAX_CLIP_SECONDS, target_s + 3.0)
+        min_s, max_s = _resolve_clip_bounds(min_s, max_s, target_duration)
+        target_s = min(float(target_duration), config.HARD_MAX_CLIP_SECONDS)
+    elif target_s <= 0:
+        raise ValueError("The resolved target duration must be greater than zero.")
 
     transcript_text = _build_transcript_text(transcript)
     if not transcript_text.strip():
@@ -408,10 +449,13 @@ def _validate_clips(clips: list, total_duration: float,
             end = float(c["end"])
         except (KeyError, TypeError, ValueError):
             continue
+        start = max(0.0, start)
+        if total_duration:
+            if start >= total_duration:
+                continue
+            end = min(end, total_duration)
         if end <= start:
             continue
-        if total_duration and end > total_duration + 1:
-            end = total_duration
         length = end - start
         lower = (min_clip if min_clip is not None else config.MIN_CLIP_SECONDS) - 2
         upper = (max_clip if max_clip is not None else config.MAX_CLIP_SECONDS) + 3
