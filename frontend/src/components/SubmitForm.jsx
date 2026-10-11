@@ -14,6 +14,8 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
   const [clipCount, setClipCount] = useState(settings?.clipCount ?? 8)
   const [minClip, setMinClip] = useState(settings?.minClip ?? 15)
   const [maxClip, setMaxClip] = useState(settings?.maxClip ?? 60)
+  const [targetDuration, setTargetDuration] = useState(40)
+  const [customPrompt, setCustomPrompt] = useState('')
   const [contentType, setContentType] = useState('general')
   const [showGaming, setShowGaming] = useState(false)
   const [gamingReady, setGamingReady] = useState(null) // { source, layout }
@@ -105,6 +107,8 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
       clipCount: clipCount || undefined,
       minClip: minClip || undefined,
       maxClip: maxClip || undefined,
+      targetDuration: targetDuration || undefined,
+      customPrompt: customPrompt.trim() || undefined,
       splitScreen: splitScreen || undefined,
     }
     // Gaming: use the prepared 9:16 source instead of the raw file.
@@ -226,6 +230,21 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
                 setMaxClip(hi)
               }}
             />
+          </div>
+          <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs text-zinc-400 mb-1" htmlFor="targetDuration">Target duration (seconds)</label>
+              <input id="targetDuration" type="number" min="5" max="120" value={targetDuration}
+                onChange={(e) => setTargetDuration(Math.min(120, Math.max(5, Number(e.target.value) || 5)))}
+                className="w-full rounded-lg bg-background border border-border px-3 py-2 text-sm text-white" />
+              <p className="mt-1 text-[11px] text-zinc-500">AI aims for this length while keeping the thought complete.</p>
+            </div>
+            <div>
+              <label className="block text-xs text-zinc-400 mb-1" htmlFor="customPrompt">Editing direction (optional)</label>
+              <textarea id="customPrompt" rows="2" value={customPrompt} onChange={(e) => setCustomPrompt(e.target.value)}
+                maxLength={1200} placeholder="e.g. Focus on the speaker's advice about building habits"
+                className="w-full resize-y rounded-lg bg-background border border-border px-3 py-2 text-sm text-white placeholder-zinc-600" />
+            </div>
           </div>
         </div>
 
