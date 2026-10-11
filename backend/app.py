@@ -353,6 +353,9 @@ async def process(
     clip_count: int = Form(None),
     min_clip: float = Form(None),
     max_clip: float = Form(None),
+    target_duration: float = Form(None),
+    custom_prompt: str = Form(None),
+    selected_clip: str = Form(None),
     content_type: str = Form("general"),
     current: User = Depends(get_current_user),
 ):
@@ -413,6 +416,9 @@ async def process(
         "clip_count": clip_count,
         "min_clip": min_clip,
         "max_clip": max_clip,
+        "target_duration": target_duration,
+        "custom_prompt": custom_prompt,
+        "selected_clip": json.loads(selected_clip) if selected_clip else None,
         "content_type": content_type or "general",
     }
     if (
