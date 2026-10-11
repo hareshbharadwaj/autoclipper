@@ -3,12 +3,13 @@ httpx==0.28.1
 google-genai==1.75.0
 python-dotenv==1.2.2
 tqdm==4.67.3
+imageio-ffmpeg>=0.5.1
 
 # Vertical reframing (face/subject tracking)
-opencv-python
+opencv-python-headless
 numpy
 mediapipe
-scenedetect[opencv]
+scenedetect
 # Optional: enable --no-yolo to disable; install ultralytics only if you want
 # person-detection fallback when no face is visible (pulls in PyTorch).
 # ultralytics

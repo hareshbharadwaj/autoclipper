@@ -42,9 +42,8 @@ export default function App() {
   const [error, setError] = useState('')
   const pollRef = useRef(null)
 
-  // Load the user's server-side settings (API keys) after login.
+  // Load the user's server-side settings (API keys).
   useEffect(() => {
-    if (!authed) return
     fetchSettings()
       .then((s) => {
         setSettings((prev) => ({
@@ -59,13 +58,6 @@ export default function App() {
         }))
       })
       .catch(() => {})
-  }, [authed])
-
-  // Redirect to login if the server rejects our token.
-  useEffect(() => {
-    const onUnauthorized = () => setAuthed(false)
-    window.addEventListener('ac:unauthorized', onUnauthorized)
-    return () => window.removeEventListener('ac:unauthorized', onUnauthorized)
   }, [])
 
   useEffect(() => {
@@ -106,9 +98,9 @@ export default function App() {
       use_yolo: settings.useYolo,
       subtitles: settings.subtitles,
       force_hd: settings.forceHd,
+      groq_key: settings.groqKey || undefined,
+      gemini_key: settings.geminiKey || undefined,
     }
-    // API keys are resolved server-side from the authenticated user's
-    // stored settings, so we no longer send them in the request body.
     // Clip generation params come from the Clip Generator form (payload),
     // falling back to saved settings if the form didn't send them.
     if (payload.clipCount) opts.clip_count = payload.clipCount
@@ -147,10 +139,6 @@ export default function App() {
         },
       }
     })
-  }
-
-  if (!authed) {
-    return <AuthPage onAuthed={() => setAuthed(true)} />
   }
 
   return (

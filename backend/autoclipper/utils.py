@@ -28,12 +28,35 @@ def sanitize_filename(name: str) -> str:
 
 
 def ensure_ffmpeg():
-    """Verify ffmpeg/ffprobe are available on PATH."""
-    for exe in ("ffmpeg", "ffprobe"):
-        if shutil.which(exe) is None:
-            raise RuntimeError(
-                f"'{exe}' not found on PATH. Install FFmpeg: https://ffmpeg.org/download.html"
-            )
+    """Verify ffmpeg is available on PATH, falling back to imageio_ffmpeg and ~/bin."""
+    # Check ~/bin and /usr/local/bin
+    for extra_dir in (os.path.expanduser("~/bin"), "/usr/local/bin"):
+        if os.path.isdir(extra_dir) and extra_dir not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = f"{extra_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+
+    if shutil.which("ffmpeg") is None:
+        try:
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+            if exe and os.path.exists(exe):
+                bin_dir = os.path.dirname(exe)
+                if bin_dir not in os.environ.get("PATH", "").split(os.pathsep):
+                    os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+                target = os.path.join(bin_dir, "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
+                if not os.path.exists(target):
+                    try:
+                        shutil.copy2(exe, target)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug("imageio_ffmpeg fallback failed: %s", e)
+
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            "'ffmpeg' not found on PATH. Install FFmpeg: https://ffmpeg.org/download.html"
+        )
+    if shutil.which("ffprobe") is None:
+        logger.warning("'ffprobe' not found on PATH; duration/stream probes may use fallback.")
 
 
 def run_command(cmd, check: bool = True, cwd: str = None) -> subprocess.CompletedProcess:
@@ -55,24 +78,39 @@ def run_command(cmd, check: bool = True, cwd: str = None) -> subprocess.Complete
 
 
 def probe_duration(path: str) -> float:
-    """Return media duration in seconds using ffprobe."""
-    result = run_command(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "json",
-            path,
-        ]
-    )
-    try:
-        data = json.loads(result.stdout)
-        return float(data["format"]["duration"])
-    except (json.JSONDecodeError, KeyError, ValueError):
-        return 0.0
+    """Return media duration in seconds using ffprobe (with ffmpeg fallback)."""
+    if shutil.which("ffprobe"):
+        try:
+            result = run_command(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "json",
+                    path,
+                ],
+                check=False,
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                return float(data["format"]["duration"])
+        except Exception:
+            pass
+
+    if shutil.which("ffmpeg"):
+        try:
+            res = run_command(["ffmpeg", "-i", path], check=False)
+            match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", res.stderr or "")
+            if match:
+                h, m, s = match.groups()
+                return int(h) * 3600 + int(m) * 60 + float(s)
+        except Exception:
+            pass
+
+    return 0.0
 
 
 def file_size_mb(path: str) -> float:
