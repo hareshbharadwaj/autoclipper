@@ -6,10 +6,18 @@ from . import config
 from .analyze import find_viral_clips
 from .clip import cut_all
 from .ingest import ingest
-from .reframe import reframe_clip
+from .reframe import VERTICAL_ASPECT, reframe_clip
 from .subtitles import add_subtitles
 from .transcribe import transcribe
-from .utils import ensure_ffmpeg, logger, sanitize_filename, write_json, save_to_library
+from .utils import (
+    ASPECT_PRESETS,
+    ensure_ffmpeg,
+    logger,
+    probe_video_info,
+    sanitize_filename,
+    write_json,
+    save_to_library,
+)
 
 
 def _enforce_clip_constraints(clips, min_clip, max_clip, clip_count, video_dur, trim_long=True, pad_short=True):
@@ -73,6 +81,8 @@ def run(
     target_duration: float = None,
     custom_prompt: str = None,
     selected_clip: dict = None,
+    aspect_ratio: str = None,
+    add_hook: bool = False,
     on_clip=None,
 ) -> dict:
     """Run the full auto-clip pipeline and return a result summary dict.
@@ -84,11 +94,40 @@ def run(
     ensure_ffmpeg()
     start_time = time.time()
 
+    # Hard ceiling: a single clip is never longer than 2 minutes.
+    if target_duration is not None:
+        try:
+            target_duration = min(float(target_duration), float(config.HARD_MAX_CLIP_SECONDS))
+        except (TypeError, ValueError):
+            target_duration = None
+    if max_clip is not None:
+        try:
+            max_clip = min(float(max_clip), float(config.HARD_MAX_CLIP_SECONDS))
+        except (TypeError, ValueError):
+            max_clip = None
+
     os.makedirs(output_dir, exist_ok=True)
 
     # 1. Ingest
     video_path, title = ingest(source, output_dir, force_hd=force_hd, cookies_text=cookies_text)
     base_name = sanitize_filename(title)
+
+    # 1b. Resolve the output aspect ratio (9:16 portrait / 1:1 square / 16:9).
+    #     `vertical` is kept for backwards compatibility with older clients.
+    target_aspect = None
+    aspect_key = (aspect_ratio or "").strip()
+    if aspect_key and aspect_key in ASPECT_PRESETS:
+        if aspect_key != "16:9":
+            target_aspect = ASPECT_PRESETS[aspect_key]["ratio"]
+    elif aspect_key and aspect_key not in ASPECT_PRESETS:
+        logger.warning("Unknown aspect_ratio '%s'; falling back to 9:16.", aspect_key)
+        target_aspect = VERTICAL_ASPECT
+    elif vertical:
+        target_aspect = VERTICAL_ASPECT
+    if target_aspect is not None:
+        logger.info("Reframing to %s (aspect %.4f)", aspect_key or "9:16", target_aspect)
+    else:
+        logger.info("Keeping original 16:9 framing (no crop).")
 
     # 2. Transcribe (Groq Whisper)
     transcript = transcribe(
@@ -151,20 +190,44 @@ def run(
                 except Exception as e:
                     logger.warning("Chat-split skipped for %s: %s", src, e)
 
-        # 5. Reframe to vertical 9:16
-        if vertical and not clip.get("split_screen"):
+        # 5. Reframe to the requested aspect ratio (9:16 / 1:1), skipping the
+        #    crop entirely for 16:9 so the original framing is preserved.
+        if target_aspect is not None and not clip.get("split_screen"):
             src = os.path.join(output_dir, clip["file"])
             if os.path.exists(src):
-                v_name = clip["file"].rsplit(".", 1)[0] + "_9x16.mp4"
+                suffix = "9x16" if abs(target_aspect - (9 / 16)) < 1e-6 else (
+                    "1x1" if abs(target_aspect - 1.0) < 1e-6 else "crop"
+                )
+                v_name = clip["file"].rsplit(".", 1)[0] + f"_{suffix}.mp4"
                 v_path = os.path.join(output_dir, v_name)
-                if reframe_clip(src, v_path, use_yolo=use_yolo):
+                if reframe_clip(src, v_path, use_yolo=use_yolo, aspect=target_aspect):
                     clip["vertical_file"] = v_name
                     os.remove(src)
                     clip["file"] = v_name
 
-        # 6. Generate subtitle tracks (SRT)
+        # 6. Generate + burn subtitle tracks (word-level karaoke captions).
+        #    Captions are burned in by default so every exported clip has them.
         if subtitles:
             add_subtitles([clip], transcript, output_dir, burn=True)
+
+        # 6b. Burn the curiosity-hook banner on top of the finished clip.
+        if add_hook and clip.get("hook"):
+            try:
+                from .hooks import add_hook_to_video
+
+                src = os.path.join(output_dir, clip["file"])
+                if os.path.exists(src):
+                    h_name = clip["file"].rsplit(".", 1)[0] + "_hook.mp4"
+                    h_path = os.path.join(output_dir, h_name)
+                    add_hook_to_video(
+                        src, clip["hook"], h_path, position="top", duration=4.0
+                    )
+                    os.remove(src)
+                    clip["file"] = h_name
+                    clip["hook_file"] = h_name
+                    logger.info("Hook banner burned into %s", h_name)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Hook banner skipped for clip %s: %s", clip.get("index"), e)
 
         processed.append(clip)
 
@@ -176,6 +239,10 @@ def run(
                 pass
 
     # 7. Persist metadata
+    try:
+        video_info = probe_video_info(video_path)
+    except Exception:  # noqa: BLE001
+        video_info = {}
     result = {
         "title": title,
         "source": source,
@@ -183,6 +250,8 @@ def run(
         "video_file": os.path.basename(video_path),
         "language": transcript.get("language"),
         "duration": transcript.get("duration"),
+        "video_info": video_info,
+        "aspect_ratio": aspect_key or ("16:9" if target_aspect is None else "9:16"),
         "clips": processed,
         "elapsed_seconds": round(time.time() - start_time, 1),
     }

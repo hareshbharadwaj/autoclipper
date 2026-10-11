@@ -117,6 +117,160 @@ def file_size_mb(path: str) -> float:
     return os.path.getsize(path) / (1024 * 1024)
 
 
+# --- Aspect ratio presets -------------------------------------------------
+# ratio = width / height
+ASPECT_PRESETS = {
+    "9:16": {
+        "ratio": 9 / 16,
+        "label": "9:16 Portrait",
+        "blurb": "Reels, TikTok & YouTube Shorts",
+    },
+    "1:1": {
+        "ratio": 1.0,
+        "label": "1:1 Square",
+        "blurb": "Feed posts & in-stream playback",
+    },
+    "16:9": {
+        "ratio": 16 / 9,
+        "label": "16:9 Landscape",
+        "blurb": "Original widescreen (no crop)",
+    },
+}
+
+
+def classify_aspect(width: int, height: int) -> str:
+    """Return the closest '9:16' / '1:1' / '16:9' preset for raw dimensions."""
+    if not width or not height:
+        return "16:9"
+    ratio = width / float(height)
+    return min(ASPECT_PRESETS, key=lambda k: abs(ASPECT_PRESETS[k]["ratio"] - ratio))
+
+
+def recommend_aspect(width: int, height: int) -> dict:
+    """Detect the source format and recommend the best publishing format.
+
+    Short-form platforms reward vertical video, so landscape sources are
+    recommended for a 9:16 reframe (with subject tracking); vertical sources
+    stay vertical.
+    """
+    detected = classify_aspect(width, height)
+    if detected == "16:9":
+        recommended = "9:16"
+        reason = (
+            "Source is landscape. 9:16 Portrait performs best on Reels, TikTok "
+            "and Shorts — AutoClipper will smart-crop with face/subject tracking."
+        )
+    elif detected == "1:1":
+        recommended = "9:16"
+        reason = (
+            "Source is square. 9:16 Portrait fills the whole screen on Reels, "
+            "TikTok and Shorts."
+        )
+    else:
+        recommended = "9:16"
+        reason = "Source is already vertical — 9:16 is the native short-form format."
+    return {
+        "detected": detected,
+        "detected_label": ASPECT_PRESETS[detected]["label"],
+        "recommended": recommended,
+        "recommended_label": ASPECT_PRESETS[recommended]["label"],
+        "reason": reason,
+        "options": [
+            {"id": k, "label": v["label"], "blurb": v["blurb"]} for k, v in ASPECT_PRESETS.items()
+        ],
+    }
+
+
+def probe_video_info(path: str) -> dict:
+    """Probe a media file for dimensions, duration, audio and aspect metadata.
+
+    Uses ffprobe when available and degrades gracefully to an `ffmpeg -i`
+    parse (and finally to zeros) so analysis never hard-fails on a probe.
+    """
+    info = {
+        "width": 0,
+        "height": 0,
+        "duration": 0.0,
+        "has_audio": False,
+        "aspect_ratio": None,
+        "aspect": recommend_aspect(0, 0),
+    }
+    if not path or not os.path.exists(path):
+        return info
+
+    width = height = 0
+    duration = 0.0
+    has_audio = False
+
+    if shutil.which("ffprobe"):
+        try:
+            result = run_command(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "stream=index,codec_type,width,height,duration",
+                    "-show_entries", "format=duration",
+                    "-of", "json",
+                    path,
+                ],
+                check=False,
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout or "{}")
+                for stream in data.get("streams") or []:
+                    if stream.get("codec_type") == "audio":
+                        has_audio = True
+                        continue
+                    if stream.get("codec_type") != "video":
+                        continue
+                    try:
+                        width = int(stream.get("width") or 0)
+                        height = int(stream.get("height") or 0)
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        duration = duration or float(stream.get("duration") or 0.0)
+                    except (TypeError, ValueError):
+                        pass
+                try:
+                    duration = duration or float(((data.get("format") or {}).get("duration")) or 0.0)
+                except (TypeError, ValueError):
+                    pass
+        except Exception as e:  # noqa: BLE001
+            logger.debug("ffprobe stream probe failed for %s: %s", path, e)
+
+    if not (width and height) and shutil.which("ffmpeg"):
+        try:
+            res = run_command(["ffmpeg", "-i", path], check=False)
+            stderr = res.stderr or ""
+            match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", stderr)
+            if match:
+                h, m, s = match.groups()
+                duration = duration or int(h) * 3600 + int(m) * 60 + float(s)
+            match = re.search(r",\s*(\d{2,5})x(\d{2,5})", stderr)
+            if match:
+                width = int(match.group(1))
+                height = int(match.group(2))
+            if "Audio:" in stderr:
+                has_audio = True
+        except Exception as e:  # noqa: BLE001
+            logger.debug("ffmpeg dimension probe failed for %s: %s", path, e)
+
+    if not duration:
+        duration = probe_duration(path)
+
+    info.update(
+        {
+            "width": width,
+            "height": height,
+            "duration": round(duration, 2),
+            "has_audio": has_audio,
+            "aspect_ratio": (width / float(height)) if width and height else None,
+            "aspect": recommend_aspect(width, height),
+        }
+    )
+    return info
+
+
 def write_json(path: str, data) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

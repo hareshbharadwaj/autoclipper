@@ -111,6 +111,14 @@ export default function App() {
     if (payload.selectedClip) opts.selected_clip = JSON.stringify(payload.selectedClip)
     if (payload.contentType) opts.content_type = payload.contentType
     if (payload.splitScreen) opts.split_screen = true
+    if (payload.aspectRatio) opts.aspect_ratio = payload.aspectRatio
+    if (payload.addHook) opts.add_hook = true
+    // Analysis-first flow: only a target duration matters, so drop the legacy
+    // min/max window (it would clamp the clip back below the requested length).
+    if (payload.analyzed) {
+      delete opts.min_clip
+      delete opts.max_clip
+    }
 
     const file = payload.file || null
     const body = file ? opts : { ...opts, source: payload.source }

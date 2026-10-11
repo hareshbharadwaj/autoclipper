@@ -95,6 +95,71 @@ export async function authFetch(url, options = {}) {
   return res
 }
 
+/** Step 1 of the analysis-first studio: upload/submit a video for whole-video
+ *  understanding (summary, chapters, suggested angles). Returns {analysis_id}. */
+export async function analyzeVideo(payload, file, onProgress) {
+  const fd = new FormData()
+  if (file) fd.append('file', file)
+  for (const [k, v] of Object.entries(payload || {})) {
+    if (v !== undefined && v !== null) fd.append(k, String(v))
+  }
+
+  if (!file) {
+    const res = await authFetch(`${API_URL}/api/analyze-video`, { method: 'POST', body: fd })
+    if (!res.ok) {
+      let detail = ''
+      try {
+        detail = (await res.json()).detail || ''
+      } catch {
+        /* ignore */
+      }
+      throw new Error(`Analysis failed (${res.status}) ${detail}`)
+    }
+    return res.json()
+  }
+
+  // Stream the upload so long files show a real progress bar.
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100))
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText))
+        } catch {
+          resolve({})
+        }
+      } else {
+        let detail = ''
+        try {
+          detail = JSON.parse(xhr.responseText).detail || ''
+        } catch {
+          /* ignore */
+        }
+        if (xhr.status === 401) {
+          setToken('')
+          window.dispatchEvent(new Event('ac:unauthorized'))
+        }
+        reject(new Error(`Analysis failed (${xhr.status}) ${detail}`))
+      }
+    }
+    xhr.onerror = () => reject(new Error('Network error'))
+    xhr.open('POST', `${API_URL}/api/analyze-video`)
+    const token = getToken()
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    xhr.send(fd)
+  })
+}
+
+/** Poll an in-flight analysis. Resolves the raw entry {status, logs, result, error}. */
+export async function getAnalysis(analysisId) {
+  const res = await authFetch(`${API_URL}/api/analyze-video/${analysisId}`)
+  if (!res.ok) throw new Error(`Analysis status failed (${res.status})`)
+  return res.json()
+}
+
 export async function submitJob(payload, file, onProgress) {
   // Backend /api/process expects multipart/form-data (Form fields), so we
   // always send FormData — with a 'file' for uploads or 'source' for URLs.

@@ -117,8 +117,8 @@ def _sweep_old_jobs() -> int:
     """Delete job folders (not library folders) older than the retention window."""
     if not os.path.isdir(config.OUTPUT_ROOT):
         return 0
-    # Never touch these shared/persistent folders.
-    protected = {"library", "uploads", "models"}
+    # Never touch these shared/persistent folders ("analysis" has its own sweep).
+    protected = {"library", "uploads", "models", "analysis"}
     cutoff = time.time() - JOB_RETENTION_HOURS * 3600
     removed = 0
     for name in os.listdir(config.OUTPUT_ROOT):
@@ -146,6 +146,12 @@ async def _cleanup_loop():
             n = await asyncio.to_thread(_sweep_old_jobs)
             if n:
                 logger.info("Cleanup: removed %d old job folder(s) (>%.0fh).", n, JOB_RETENTION_HOURS)
+            m = await asyncio.to_thread(_sweep_old_analyses)
+            if m:
+                logger.info(
+                    "Cleanup: removed %d old analysis folder(s) (>%.0fh).",
+                    m, ANALYSIS_RETENTION_HOURS,
+                )
         except Exception as e:  # noqa: BLE001
             logger.warning("Cleanup sweep failed: %s", e)
 
@@ -356,6 +362,8 @@ async def process(
     target_duration: float = Form(None),
     custom_prompt: str = Form(None),
     selected_clip: str = Form(None),
+    aspect_ratio: str = Form(None),
+    add_hook: bool = Form(False),
     content_type: str = Form("general"),
     current: User = Depends(get_current_user),
 ):
@@ -419,6 +427,8 @@ async def process(
         "target_duration": target_duration,
         "custom_prompt": custom_prompt,
         "selected_clip": json.loads(selected_clip) if selected_clip else None,
+        "aspect_ratio": aspect_ratio or None,
+        "add_hook": bool(add_hook),
         "content_type": content_type or "general",
     }
     if (
@@ -429,6 +439,193 @@ async def process(
         opts["min_clip"], opts["max_clip"] = opts["max_clip"], opts["min_clip"]
     asyncio.create_task(_run_job(job_id, source, opts))
     return {"job_id": job_id, "status": "queued"}
+
+
+# --- Analysis-first workflow ------------------------------------------------
+# Step 1 of the 2-step studio: ingest + transcribe + understand the WHOLE video
+# and hand back a summary, timestamped chapters and video-specific clip angles.
+# No video is cut here. The returned `source` is a server-side path that the
+# client passes straight back to /api/process for step 2, so the video is only
+# downloaded / uploaded once.
+ANALYSIS_RETENTION_HOURS = float(os.environ.get("ANALYSIS_RETENTION_HOURS", "24"))
+analyses: dict = {}
+
+
+def _sweep_old_analyses() -> int:
+    """Delete analysis folders older than the retention window."""
+    root = os.path.join(config.OUTPUT_ROOT, "analysis")
+    if not os.path.isdir(root):
+        return 0
+    cutoff = time.time() - ANALYSIS_RETENTION_HOURS * 3600
+    removed = 0
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if mtime < cutoff:
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+@app.post("/api/analyze-video")
+async def analyze_video(
+    source: str = Form(""),
+    file: UploadFile = File(None),
+    whisper_model: str = Form(None),
+    gemini_model: str = Form(None),
+    force_hd: bool = Form(False),
+    youtube_cookies: str = Form(None),
+    groq_key: str = Form(None),
+    gemini_key: str = Form(None),
+    content_type: str = Form("general"),
+    angle_count: int = Form(4),
+    current: User = Depends(get_current_user),
+):
+    """Analyze a video (download/upload -> transcribe -> understand) without cutting."""
+    ensure_ffmpeg()
+
+    from autoclipper.db import decrypt_value
+
+    if not groq_key:
+        groq_key = decrypt_value(current.groq_key) or config.GROQ_API_KEY
+    if not gemini_key:
+        gemini_key = decrypt_value(current.gemini_key) or config.GEMINI_API_KEY
+    if not whisper_model and current.whisper_model:
+        whisper_model = current.whisper_model
+    if not gemini_model and current.gemini_model:
+        gemini_model = current.gemini_model
+    if not youtube_cookies and current.youtube_cookies:
+        youtube_cookies = decrypt_value(current.youtube_cookies)
+
+    if file is not None:
+        uploads = os.path.join(config.OUTPUT_ROOT, "uploads")
+        os.makedirs(uploads, exist_ok=True)
+        original = file.filename or "upload.mp4"
+        ext = os.path.splitext(original)[1] or ".mp4"
+        name = f"{uuid.uuid4().hex[:8]}_{sanitize_filename(os.path.splitext(original)[0])}{ext}"
+        path = os.path.join(uploads, name)
+        with open(path, "wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                out.write(chunk)
+        source = path
+
+    if not source or not source.strip():
+        raise HTTPException(status_code=400, detail="Provide a 'source' URL/path or upload a 'file'.")
+
+    analysis_id = uuid.uuid4().hex[:12]
+    analyses[analysis_id] = {
+        "analysis_id": analysis_id,
+        "status": "queued",
+        "source": source,
+        "created_at": time.time(),
+        "finished_at": None,
+        "logs": [],
+        "result": None,
+        "error": None,
+    }
+    opts = {
+        "whisper_model": whisper_model,
+        "gemini_model": gemini_model,
+        "force_hd": force_hd,
+        "cookies_text": youtube_cookies,
+        "groq_key": groq_key,
+        "gemini_key": gemini_key,
+        "content_type": content_type or "general",
+        "angle_count": angle_count or 4,
+    }
+    # Analysis is CPU/IO heavy (download + transcribe + LLM); run it off the loop.
+    asyncio.create_task(asyncio.to_thread(_run_analysis, analysis_id, source, opts))
+    return {"analysis_id": analysis_id, "status": "queued"}
+
+
+@app.get("/api/analyze-video/{analysis_id}")
+async def analyze_video_status(analysis_id: str):
+    """Poll an in-flight video analysis."""
+    entry = analyses.get(analysis_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Unknown analysis id.")
+    return entry
+
+
+def _run_analysis(analysis_id: str, source: str, opts: dict):
+    """Worker: ingest -> probe -> transcribe -> whole-video understanding."""
+    from autoclipper import ingest as ingest_mod
+    from autoclipper.analyze import analyze_video_summary_and_angles
+    from autoclipper.transcribe import transcribe
+    from autoclipper.utils import probe_video_info
+
+    entry = analyses[analysis_id]
+
+    def log(msg: str, *args):
+        try:
+            text = msg % args if args else msg
+        except (TypeError, ValueError):
+            text = msg
+        entry["logs"].append(text)
+        logger.info("[analysis %s] %s", analysis_id, text)
+
+    out_dir = os.path.join(config.OUTPUT_ROOT, "analysis", analysis_id)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        entry["status"] = "downloading"
+        log("Fetching video…")
+        local_source, title = ingest_mod.ingest(
+            source, out_dir, force_hd=opts.get("force_hd", False),
+            cookies_text=opts.get("cookies_text"), max_height=720,
+        )
+
+        entry["status"] = "probing"
+        log("Probing video metadata…")
+        video_info = probe_video_info(local_source)
+
+        entry["status"] = "transcribing"
+        log("Transcribing the full audio with Groq Whisper…")
+        transcript = transcribe(
+            local_source, out_dir,
+            api_key=opts.get("groq_key"), model=opts.get("whisper_model"),
+        )
+
+        entry["status"] = "analyzing"
+        log("Reading the whole video with Gemini…")
+        report = analyze_video_summary_and_angles(
+            transcript,
+            api_key=opts.get("gemini_key"),
+            model=opts.get("gemini_model"),
+            video_info=video_info,
+            angle_count=opts.get("angle_count", 4),
+            content_type=opts.get("content_type"),
+        )
+
+        report.update(
+            {
+                "analysis_id": analysis_id,
+                "title": title,
+                "source": local_source,
+                "language": transcript.get("language"),
+                "video_info": video_info,
+                "word_count": len(transcript.get("words") or []),
+                "segment_count": len(transcript.get("segments") or []),
+            }
+        )
+        entry["status"] = "done"
+        entry["finished_at"] = time.time()
+        entry["result"] = report
+        log(
+            "Analysis complete: %d chapter(s), %d angle(s).",
+            len(report.get("chapters") or []),
+            len(report.get("suggested_angles") or []),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Video analysis failed")
+        entry["status"] = "error"
+        entry["error"] = str(e)
+        entry["finished_at"] = time.time()
+        log(f"Error: {e}")
 
 
 class GamingPrepareRequest(BaseModel):

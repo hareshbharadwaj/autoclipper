@@ -604,8 +604,54 @@ def _compute_scene_trajectory(
 
 
 # --- Main entry point ------------------------------------------------------
-def reframe_clip(input_video: str, output_video: str, use_yolo: bool = True) -> bool:
-    """Convert a horizontal clip into vertical 9:16 with smooth AI subject tracking."""
+def plan_aspect_dims(src_w: int, src_h: int, aspect: float = VERTICAL_ASPECT):
+    """Compute output + crop box for a target aspect ratio (width / height).
+
+    Keeps as much resolution as the source allows: a landscape source is scaled
+    up to a full-height 1080x1920 for 9:16, while 1:1 keeps the source height.
+    Returns (out_w, out_h, crop_w, crop_h).
+    """
+    aspect = float(aspect) if aspect else VERTICAL_ASPECT
+    if src_w > src_h:
+        # Landscape source: crop the sides. Portrait targets scale up to the
+        # source width so a 1920x1080 clip becomes a full 1080x1920 vertical.
+        out_h = src_w if aspect < 1.0 else src_h
+    else:
+        out_h = src_h
+
+    out_w = int(round(out_h * aspect))
+    if out_w > src_w:
+        out_w = src_w
+        out_h = int(round(out_w / aspect))
+
+    # Source crop box (as large as the source allows at this aspect).
+    crop_h = src_h
+    crop_w = int(round(crop_h * aspect))
+    if crop_w > src_w:
+        crop_w = src_w
+        crop_h = int(round(crop_w / aspect))
+    if crop_h > src_h:
+        crop_h = src_h
+        crop_w = int(round(crop_h * aspect))
+
+    # Encoders require even dimensions.
+    if out_w % 2 != 0:
+        out_w += 1
+    if out_h % 2 != 0:
+        out_h += 1
+    if crop_w % 2 != 0:
+        crop_w -= 1
+    if crop_h % 2 != 0:
+        crop_h -= 1
+    return max(2, out_w), max(2, out_h), max(2, crop_w), max(2, crop_h)
+
+
+def reframe_clip(input_video: str, output_video: str, use_yolo: bool = True,
+                 aspect: float = VERTICAL_ASPECT) -> bool:
+    """Reframe a clip to a target aspect ratio with smooth AI subject tracking.
+
+    ``aspect`` is width / height: 9/16 for Reels/TikTok/Shorts, 1.0 for square.
+    """
     base = os.path.splitext(output_video)[0]
     temp_video = f"{base}_tmp_video.mp4"
     temp_audio = f"{base}_tmp_audio.aac"
@@ -631,29 +677,8 @@ def reframe_clip(input_video: str, output_video: str, use_yolo: bool = True) -> 
         logger.error("Invalid video dimensions or frame count for %s", input_video)
         return False
 
-    # Output dimensions: standard 9:16 vertical
-    is_landscape = src_w > src_h
-    if is_landscape:
-        out_h = src_w  # e.g. 1920 from 1920x1080 source
-    else:
-        out_h = src_h  # already vertical, keep height
-
-    out_w = int(round(out_h * VERTICAL_ASPECT))
-    if out_w % 2 != 0:
-        out_w += 1
-    if out_h % 2 != 0:
-        out_h += 1
-
-    # Source crop dimensions
-    crop_h = src_h
-    crop_w = int(round(crop_h * VERTICAL_ASPECT))
-    if crop_w > src_w:
-        crop_w = src_w
-        crop_h = int(round(crop_w / VERTICAL_ASPECT))
-    if crop_w % 2 != 0:
-        crop_w -= 1
-    if crop_h % 2 != 0:
-        crop_h -= 1
+    # Output + crop dimensions for the requested aspect ratio (9:16, 1:1, ...).
+    out_w, out_h, crop_w, crop_h = plan_aspect_dims(src_w, src_h, aspect)
 
     # Step 1: Detect scenes
     scenes, detected_fps = _detect_scenes(input_video)
