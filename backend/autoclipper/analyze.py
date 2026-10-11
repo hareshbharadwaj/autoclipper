@@ -91,8 +91,8 @@ def find_viral_clips(transcript: dict, api_key: str = None, model: str = None,
     if target_duration is not None:
         # Give the model a small editing window around the target, while preserving
         # natural sentence boundaries. Hard validation still happens after generation.
-        min_s = max(5.0, min(min_s, target_s - 3.0))
-        max_s = min(120.0, max(max_s, target_s + 3.0))
+        min_s = max(5.0, target_s - 3.0)
+        max_s = min(120.0, target_s + 3.0)
 
     transcript_text = _build_transcript_text(transcript)
     if not transcript_text.strip():
