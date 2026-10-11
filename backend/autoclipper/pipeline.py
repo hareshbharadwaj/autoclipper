@@ -12,7 +12,7 @@ from .transcribe import transcribe
 from .utils import ensure_ffmpeg, logger, sanitize_filename, write_json, save_to_library
 
 
-def _enforce_clip_constraints(clips, min_clip, max_clip, clip_count, video_dur):
+def _enforce_clip_constraints(clips, min_clip, max_clip, clip_count, video_dur, trim_long=True, pad_short=True):
     """Adjust Gemini's candidates to respect the user's count and duration window."""
     cleaned = []
     for c in clips:
@@ -26,12 +26,12 @@ def _enforce_clip_constraints(clips, min_clip, max_clip, clip_count, video_dur):
         dur = end - start
 
         # Trim clips longer than the requested max.
-        if max_clip and dur > max_clip:
+        if trim_long and max_clip and dur > max_clip:
             end = start + max_clip
             dur = max_clip
 
         # Pad short clips outward (within video bounds) up to the min duration.
-        if min_clip and dur < min_clip:
+        if pad_short and min_clip and dur < min_clip:
             need = min_clip - dur
             pad_before = min(start, need / 2.0)
             pad_after = min(max(0.0, video_dur - end), need - pad_before)
@@ -70,6 +70,9 @@ def run(
     min_clip: float = None,
     max_clip: float = None,
     content_type: str = None,
+    target_duration: float = None,
+    custom_prompt: str = None,
+    selected_clip: dict = None,
     on_clip=None,
 ) -> dict:
     """Run the full auto-clip pipeline and return a result summary dict.
@@ -94,25 +97,33 @@ def run(
 
     # 3. Analyze (Gemini) — language is auto-read from the transcript so that
     # titles / descriptions / hooks are written in the video's own language.
-    clip_candidates = find_viral_clips(
-        transcript, api_key=gemini_key, model=gemini_model,
-        clip_count=clip_count, min_clip=min_clip, max_clip=max_clip,
-        content_type=content_type,
-    )
+    if selected_clip:
+        # Reuse the candidate selected during an analysis-first workflow.
+        clip_candidates = [dict(selected_clip)]
+    else:
+        clip_candidates = find_viral_clips(
+            transcript, api_key=gemini_key, model=gemini_model,
+            clip_count=clip_count, min_clip=min_clip, max_clip=max_clip,
+            content_type=content_type, target_duration=target_duration,
+            custom_prompt=custom_prompt,
+        )
     logger.info(
         "Clip params -> requested count=%s min=%s max=%s | Gemini returned %d candidates",
         clip_count, min_clip, max_clip, len(clip_candidates),
     )
 
-    # Enforce the user's duration window and clip count even if Gemini drifts:
-    # - pad short clips outward (within video bounds) up to min_clip
-    # - trim clips longer than max_clip
-    # - cap the total number at clip_count
+    # Apply hard duration bounds without blindly padding with unrelated footage or
+    # truncating a sentence/payoff. Candidate selection should respect the bounds.
     video_dur = transcript.get("duration") or 0.0
     if min_clip or max_clip or clip_count:
         clip_candidates = _enforce_clip_constraints(
-            clip_candidates, min_clip, max_clip, clip_count, video_dur
+            clip_candidates, min_clip, max_clip, 1 if selected_clip else clip_count,
+            video_dur, trim_long=False, pad_short=False,
         )
+        if min_clip is not None:
+            clip_candidates = [c for c in clip_candidates if c["end"] - c["start"] >= min_clip - 2]
+        if max_clip is not None:
+            clip_candidates = [c for c in clip_candidates if c["end"] - c["start"] <= max_clip + 3]
         logger.info("After enforcement: %d clip(s)", len(clip_candidates))
     if not clip_candidates:
         logger.warning("No viral clips detected.")
@@ -153,7 +164,7 @@ def run(
 
         # 6. Generate subtitle tracks (SRT)
         if subtitles:
-            add_subtitles([clip], transcript, output_dir, burn=False)
+            add_subtitles([clip], transcript, output_dir, burn=True)
 
         processed.append(clip)
 
