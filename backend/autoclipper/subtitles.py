@@ -17,12 +17,11 @@ REFERENCE_FRAME_HEIGHT = 1920
 
 
 def subtitle_layout(width=1080, height=1920, font_size=None, outline_width=4, margin_v=None):
-    """Scale subtitle styling from the 1080x1920 design canvas to a video frame.
+    """Scale subtitle styling from the reference canvas to video frame with aspect-ratio awareness.
 
-    `SUBTITLE_FONT_SIZE`, `font_size`, `outline_width`, and `margin_v` are
-    reference-canvas values, not literal pixels for every output resolution.
-    The short side drives text size so both portrait and landscape footage stay
-    readable without letting captions dominate low-resolution frames.
+    The short side drives baseline scaling, and aspect ratio (width / height) adjusts
+    portrait (9:16) font sizing and vertical safe margins so captions stay readable
+    without dominating portrait video or clipping against mobile UI bars.
     """
     try:
         width = max(2, int(width or 1080))
@@ -32,13 +31,28 @@ def subtitle_layout(width=1080, height=1920, font_size=None, outline_width=4, ma
 
     short_side = min(width, height)
     scale = short_side / float(REFERENCE_SHORT_SIDE)
+    aspect = width / float(height)
+
     requested_size = config.SUBTITLE_FONT_SIZE if font_size is None else font_size
     try:
         requested_size = max(1.0, float(requested_size))
     except (TypeError, ValueError):
         requested_size = float(config.SUBTITLE_FONT_SIZE)
-    max_size = max(12, int(round(short_side * 0.085)))
-    size = max(12, min(int(round(requested_size * scale)), max_size, int(round(width * 0.12))))
+
+    # In portrait (width < height, e.g. 9:16), horizontal width is narrow.
+    # When font_size is None (automatic layout), scale font so captions remain readable
+    # without dominating the portrait video (~4.2%-4.8% of width).
+    if font_size is None and aspect < 0.75:  # Auto portrait 9:16
+        aspect_scale = 0.58
+        max_size = max(12, int(round(width * 0.052)))
+        size = max(12, min(int(round(requested_size * scale * aspect_scale)), max_size))
+    elif font_size is None and aspect <= 1.05:  # Auto square 1:1
+        aspect_scale = 0.85
+        max_size = max(12, int(round(width * 0.065)))
+        size = max(12, min(int(round(requested_size * scale * aspect_scale)), max_size))
+    else:  # Explicit font_size or landscape
+        max_size = max(12, int(round(short_side * 0.085)))
+        size = max(12, min(int(round(requested_size * scale)), max_size, int(round(width * 0.12))))
 
     try:
         requested_outline = max(1.0, float(outline_width))
@@ -51,14 +65,24 @@ def subtitle_layout(width=1080, height=1920, font_size=None, outline_width=4, ma
         requested_margin = max(0.0, float(requested_margin))
     except (TypeError, ValueError):
         requested_margin = float(config.SUBTITLE_MARGIN_V)
-    scaled_margin = int(round(requested_margin * height / float(REFERENCE_FRAME_HEIGHT)))
-    vertical_safe_margin = int(round(height * 0.05))
-    vertical_max_margin = int(round(height * 0.15))
-    margin = max(vertical_safe_margin, min(scaled_margin, vertical_max_margin))
 
-    side_margin = max(2, int(round(width * 0.06)))
+    scaled_margin = int(round(requested_margin * height / float(REFERENCE_FRAME_HEIGHT)))
+    if aspect < 0.75:  # Portrait: bottom safe area (14% - 22% of height to clear mobile UI)
+        vertical_safe_margin = int(round(height * 0.14))
+        vertical_max_margin = int(round(height * 0.22))
+        margin = max(vertical_safe_margin, min(scaled_margin, vertical_max_margin))
+    else:  # Landscape / Square
+        vertical_safe_margin = int(round(height * 0.05))
+        vertical_max_margin = int(round(height * 0.15))
+        margin = max(vertical_safe_margin, min(scaled_margin, vertical_max_margin))
+
+    side_margin = max(8, int(round(width * 0.08)))
     available_width = max(size * 6, width - (2 * side_margin))
-    max_chars = max(10, min(32, int(available_width / max(1.0, size * 0.58))))
+    if aspect < 0.75:
+        max_chars = max(10, min(24, int(available_width / max(1.0, size * 0.58))))
+    else:
+        max_chars = max(10, min(36, int(available_width / max(1.0, size * 0.58))))
+
     return {
         "width": width,
         "height": height,
@@ -74,14 +98,52 @@ def subtitle_layout(width=1080, height=1920, font_size=None, outline_width=4, ma
 
 
 def _wrap_caption_text(text, max_chars, line_break="\n"):
-    """Wrap caption text to the safe width, breaking unusually long words too."""
+    """Wrap caption text to the safe width, balancing line lengths and breaking long words."""
+    raw_text = " ".join((text or "").split())
+    if not raw_text:
+        return ""
     width = max(1, int(max_chars or 20))
-    lines = textwrap.wrap(
-        " ".join((text or "").split()),
-        width=width,
-        break_long_words=True,
-        break_on_hyphens=False,
-    )
+    if len(raw_text) <= width:
+        return raw_text
+
+    raw_words = raw_text.split()
+    words = []
+    for w in raw_words:
+        if len(w) > width:
+            words.extend([w[i : i + width] for i in range(0, len(w), width)])
+        else:
+            words.append(w)
+
+    # Count how many lines greedy packing requires
+    greedy_lines = 1
+    cur = 0
+    for w in words:
+        if cur == 0:
+            cur = len(w)
+        elif cur + 1 + len(w) <= width:
+            cur += 1 + len(w)
+        else:
+            greedy_lines += 1
+            cur = len(w)
+
+    num_lines = max(2, greedy_lines)
+    total_len = sum(len(w) for w in words) + len(words) - 1
+    target_line_len = total_len / float(num_lines)
+
+    lines, current_line, current_len = [], [], 0
+    for word in words:
+        extra = len(word) + (1 if current_line else 0)
+        if current_line and (
+            current_len + extra > width
+            or (len(lines) < num_lines - 1 and abs(current_len - target_line_len) <= abs(current_len + extra - target_line_len))
+        ):
+            lines.append(" ".join(current_line))
+            current_line, current_len = [word], len(word)
+        else:
+            current_line.append(word)
+            current_len += extra
+    if current_line:
+        lines.append(" ".join(current_line))
     return line_break.join(lines)
 
 

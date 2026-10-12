@@ -8,6 +8,7 @@ from . import config
 from .analyze import (
     find_viral_clips, review_clip_candidates, rank_and_diversify_candidates,
     _filter_clips_to_bounds, _resolve_clip_bounds, _validate_clips,
+    extend_candidate_to_target_duration,
 )
 from .clip import cut_all
 from .ingest import ingest
@@ -516,12 +517,21 @@ def run(
     elif selected_clip:
         # Keep the selected angle as a real output when its hinted timestamps are
         # valid. Other slots draw from an over-generated, distinct candidate pool.
+        active_selected = selected_clip
+        if target_duration:
+            active_selected = extend_candidate_to_target_duration(
+                selected_clip, transcript, target_duration, total_duration=video_dur
+            )
+            if active_selected.get("duration_warning"):
+                candidate_warnings.append(active_selected["duration_warning"])
         selected_candidates = _validate_clips(
-            [selected_clip],
+            [active_selected],
             total_duration=video_dur,
             min_clip=effective_min_clip,
             max_clip=effective_max_clip,
         )
+        if not selected_candidates and active_selected.get("duration_warning"):
+            selected_candidates = [active_selected]
         selected_candidates = [{**item, "_user_selected": True} for item in selected_candidates]
         if clip_count is not None and len(selected_candidates) < requested_individual_count:
             extra_prompt = (custom_prompt or "").strip()
@@ -547,6 +557,11 @@ def run(
                 content_type=content_type, target_duration=target_duration,
                 custom_prompt=extra_prompt,
             )
+            if target_duration:
+                generated_candidates = [
+                    extend_candidate_to_target_duration(c, transcript, target_duration, total_duration=video_dur)
+                    for c in generated_candidates
+                ]
             candidate_pool = _merge_unique_clip_candidates(
                 selected_candidates, generated_candidates, candidate_pool_size
             )
@@ -561,6 +576,11 @@ def run(
             content_type=content_type, target_duration=target_duration,
             custom_prompt=custom_prompt,
         )
+        if target_duration:
+            candidate_pool = [
+                extend_candidate_to_target_duration(c, transcript, target_duration, total_duration=video_dur)
+                for c in candidate_pool
+            ]
 
     if not montage:
         candidate_pool = _merge_unique_clip_candidates(
@@ -924,6 +944,7 @@ def run(
         )
         qa_args = {
             "expected_duration": expected_duration,
+            "target_duration": target_duration,
             "expected_aspect": target_aspect,
             "expected_audio": expected_audio,
             "subtitles_requested": bool(subtitles and not is_montage_clip),
@@ -1011,6 +1032,31 @@ def run(
         clip["quality_assurance"] = qa
         clip["qa_status"] = qa.get("status", "fail")
         checks = qa.get("checks") or {}
+        dur_check = checks.get("duration") or {}
+        actual_dur = dur_check.get("actual_seconds") or clip.get("duration")
+        clip["requested_duration"] = target_duration
+        clip["actual_duration"] = actual_dur
+        if target_duration is not None:
+            computed_delta = dur_check.get("target_delta_seconds")
+            if computed_delta is None and actual_dur is not None:
+                computed_delta = round(float(actual_dur) - float(target_duration), 2)
+            clip["duration_delta"] = (
+                computed_delta if computed_delta is not None else clip.get("duration_delta")
+            )
+            passed = dur_check.get("target_duration_passed")
+            clip["duration_passed"] = (
+                passed if passed is not None else clip.get("duration_passed", True)
+            )
+        else:
+            clip["duration_delta"] = (
+                dur_check.get("delta_seconds")
+                if dur_check.get("delta_seconds") is not None
+                else clip.get("duration_delta")
+            )
+            clip["duration_passed"] = dur_check.get("ok", True)
+        clip["subtitles_requested"] = bool(subtitles and not is_montage_clip)
+        clip["subtitles_burned"] = bool(clip.get("subtitled_file"))
+
         if clip.get("vertical_file") in fallbacks:
             if (checks.get("aspect_ratio") or {}).get("ok"):
                 clip["vertical_file"] = clip["file"]
@@ -1026,6 +1072,12 @@ def run(
             "index": clip.get("index"),
             "file": clip.get("file"),
             "status": clip["qa_status"],
+            "requested_duration": clip.get("requested_duration"),
+            "actual_duration": clip.get("actual_duration"),
+            "duration_delta": clip.get("duration_delta"),
+            "duration_passed": clip.get("duration_passed"),
+            "subtitles_requested": clip.get("subtitles_requested"),
+            "subtitles_burned": clip.get("subtitles_burned"),
             "checks": qa.get("checks", {}),
             "warnings": qa.get("warnings", []),
             "errors": qa.get("errors", []),

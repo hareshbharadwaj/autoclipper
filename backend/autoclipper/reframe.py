@@ -414,6 +414,57 @@ class SpeakerTracker:
 
 
 # --- Scene Strategy & Analysis ---------------------------------------------
+def _detect_scenes_opencv(video_path: str, total_frames: int, fps: float) -> List[Tuple[int, int]]:
+    """Fast, dependency-free scene cut detector using OpenCV HSV color histogram differences."""
+    if total_frames <= 0:
+        return [(0, max(1, total_frames))]
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return [(0, total_frames)]
+
+    step = max(2, int(round(fps / 5.0)))  # ~5 fps sampling
+    min_scene_frames = max(5, int(round(fps * 0.6)))  # min 0.6s per shot
+
+    cuts = [0]
+    prev_hist = None
+    last_cut = 0
+
+    for f_idx in range(0, total_frames, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_LINEAR)
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+        cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+
+        if prev_hist is not None and (f_idx - last_cut) >= min_scene_frames:
+            correlation = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
+            # A sudden correlation drop across consecutive samples marks a camera/shot transition
+            if correlation < 0.52:
+                cuts.append(f_idx)
+                last_cut = f_idx
+
+        prev_hist = hist
+
+    cap.release()
+
+    if cuts[-1] != total_frames:
+        cuts.append(total_frames)
+
+    ranges = []
+    for i in range(len(cuts) - 1):
+        start = cuts[i]
+        end = cuts[i + 1]
+        if end > start:
+            ranges.append((start, end))
+
+    return ranges or [(0, total_frames)]
+
+
 def _detect_scenes(video_path: str) -> Tuple[List[Tuple[int, int]], float]:
     """Return list of (start_frame, end_frame) and fps. Falls back cleanly."""
     cap = cv2.VideoCapture(video_path)
@@ -440,9 +491,10 @@ def _detect_scenes(video_path: str) -> Tuple[List[Tuple[int, int]], float]:
                 scene_ranges[-1] = (scene_ranges[-1][0], total)
             return scene_ranges, float(video.frame_rate or fps)
     except Exception as e:
-        logger.debug("Scene detection fallback (%s); using single scene.", e)
+        logger.debug("PySceneDetect unavailable (%s); using OpenCV histogram detector.", e)
 
-    return [(0, total)], fps
+    # Robust OpenCV color histogram difference fallback
+    return _detect_scenes_opencv(video_path, total, fps), fps
 
 
 # --- Two-Pass Trajectory Engine -------------------------------------------
@@ -480,9 +532,7 @@ def _compute_scene_trajectory(
 
     tracker = SpeakerTracker(cooldown_frames=int(fps * 1.5))
     samples_data = []
-    face_counts = []
-    dual_fit_votes = 0
-    multi_face_frames = 0
+    dual_mode_active = False
 
     for f_idx in sample_frames:
         cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
@@ -491,20 +541,25 @@ def _compute_scene_trajectory(
             continue
 
         faces = detect_faces(frame, max_dim=640)
-        face_counts.append(len(faces))
 
         target_center_x = None
         target_center_y = None
 
         if len(faces) >= 2:
-            multi_face_frames += 1
-            # Check if top 2 faces fit within the vertical 9:16 crop width
+            # Check if top 2 faces fit within the vertical crop width
             f1, f2 = faces[0]["box"], faces[1]["box"]
             min_x = min(f1[0], f2[0])
             max_x = max(f1[0] + f1[2], f2[0] + f2[2])
             span = max_x - min_x
-            if span <= crop_w * 0.88:
-                dual_fit_votes += 1
+
+            # Hysteresis for dual-speaker fit: enter when span <= 0.86 crop_w,
+            # exit only when span exceeds 0.94 crop_w
+            if not dual_mode_active and span <= crop_w * 0.86:
+                dual_mode_active = True
+            elif dual_mode_active and span > crop_w * 0.94:
+                dual_mode_active = False
+
+            if dual_mode_active:
                 target_center_x = (min_x + max_x) / 2.0
                 target_center_y = (f1[1] + f2[1]) / 2.0 + max(f1[3], f2[3]) * 0.4
             else:
@@ -514,10 +569,12 @@ def _compute_scene_trajectory(
                     target_center_x = active_box[0] + active_box[2] / 2.0
                     target_center_y = active_box[1] + active_box[3] * 0.4
         elif len(faces) == 1:
+            dual_mode_active = False
             box = faces[0]["box"]
             target_center_x = box[0] + box[2] / 2.0
             target_center_y = box[1] + box[3] * 0.4
         elif use_yolo:
+            dual_mode_active = False
             person = detect_person_yolo(frame, max_dim=640)
             if person:
                 target_center_x = person[0] + person[2] / 2.0

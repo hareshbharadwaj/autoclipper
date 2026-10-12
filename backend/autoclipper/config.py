@@ -102,10 +102,10 @@ OUTPUT_ROOT = os.environ.get("OUTPUT_ROOT", "output")
 # --- Burned-in subtitles ---
 SUBTITLE_FONT = os.environ.get("SUBTITLE_FONT", "Arial")
 # Font size / vertical margin are reference values for a 1080x1920 design canvas;
-# the subtitle renderer scales them to each clip's actual dimensions.
+# the subtitle renderer scales them to each clip's actual dimensions and aspect ratio.
 SUBTITLE_FONT_SIZE = int(os.environ.get("SUBTITLE_FONT_SIZE", "80"))
 SUBTITLE_WORDS_PER_CUE = int(os.environ.get("SUBTITLE_WORDS_PER_CUE", "1"))
-SUBTITLE_MARGIN_V = int(os.environ.get("SUBTITLE_MARGIN_V", "120"))
+SUBTITLE_MARGIN_V = int(os.environ.get("SUBTITLE_MARGIN_V", "280"))
 SUBTITLE_PRIMARY = os.environ.get("SUBTITLE_PRIMARY", "&H00FFFFFF")      # white (opaque)
 SUBTITLE_OUTLINE = os.environ.get("SUBTITLE_OUTLINE", "&H00000000")      # black
 SUBTITLE_BACKGROUND = os.environ.get("SUBTITLE_BACKGROUND", "&H80000000")  # 50% black

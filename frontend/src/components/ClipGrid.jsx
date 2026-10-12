@@ -137,8 +137,17 @@ function ClipCard({ jobId, clip, onApply }) {
         <div className="text-sm font-semibold text-zinc-100 line-clamp-2">
           {clip.title || `Clip ${clip.index}`}
         </div>
-        <div className="text-xs text-zinc-500 mt-1">
-          {clip.start?.toFixed(1)}s – {clip.end?.toFixed(1)}s
+        <div className="text-xs text-zinc-500 mt-1 flex items-center justify-between">
+          <span>{clip.start?.toFixed(1)}s – {clip.end?.toFixed(1)}s ({((clip.end || 0) - (clip.start || 0)).toFixed(1)}s)</span>
+          {clip.requested_duration != null && (
+            <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+              clip.duration_passed === false
+                ? 'bg-amber-500/10 text-amber-300 border border-amber-500/30'
+                : 'text-zinc-400'
+            }`}>
+              Target: {clip.requested_duration}s
+            </span>
+          )}
         </div>
 
         {clip.review_status && (

@@ -833,7 +833,7 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <SliderRow
-                  label="Target duration (sec)"
+                  label={montageMode ? "Total montage target duration (sec)" : "Target duration per clip (sec)"}
                   value={targetDuration}
                   min={10}
                   max={120}
@@ -842,7 +842,9 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
                   onChange={setTargetDuration}
                 />
                 <p className="mt-1 text-[11px] text-zinc-500">
-                  Hard cap 120s. The clip ends on a finished sentence, so it may land a few seconds off.
+                  {montageMode
+                    ? "Target combined length for the multi-shot montage (hard cap 120s). Moments will be balanced across selected shots."
+                    : "Target length for each individual clip (hard cap 120s). AutoClipper extends candidate moments along coherent transcript sentences to reach this target without cutting off thoughts."}
                 </p>
               </div>
               <div className="space-y-2">

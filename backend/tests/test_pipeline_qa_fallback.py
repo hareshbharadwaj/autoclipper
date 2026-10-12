@@ -14,6 +14,7 @@ def test_pipeline_restores_previous_verified_render_when_final_qa_fails(tmp_path
         "words": [],
     }
 
+    monkeypatch.setattr(pipeline.config, "GEMINI_API_KEY", None)
     monkeypatch.setattr(pipeline, "ensure_ffmpeg", lambda: None)
     monkeypatch.setattr(pipeline, "ingest", lambda *args, **kwargs: (str(source), "source"))
     monkeypatch.setattr(pipeline, "probe_video_info", lambda _path: {

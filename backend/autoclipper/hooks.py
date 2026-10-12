@@ -14,6 +14,8 @@ import uuid
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
+from .utils import logger
+
 # OpenShorts uses PIL's textlength; ensure it's available.
 try:
     from PIL import ImageDraw as _id
@@ -366,7 +368,7 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
             overlay_y = int(video_height * 0.20)  # 20% from top
 
         # 4. FFmpeg Command
-        print(f"🔥 Overlaying hook: '{text}' at {overlay_x},{overlay_y}")
+        logger.info("Overlaying hook: '%s' at %d,%d", text, overlay_x, overlay_y)
 
         ffmpeg_cmd = [
             'ffmpeg', '-y',
@@ -382,17 +384,18 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         ]
 
         subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800)
-        print(f"✅ Hook added to {output_path}")
+        logger.info("Hook added to %s", output_path)
         return True
 
     except subprocess.TimeoutExpired:
-        print("⚠️ FFmpeg hook overlay timed out after 1800s.")
+        logger.warning("FFmpeg hook overlay timed out after 1800s.")
         raise RuntimeError("FFmpeg hook overlay timed out after 1800s.")
     except subprocess.CalledProcessError as e:
-        print(f"❌ FFmpeg Error: {e.stderr.decode() if e.stderr else 'Unknown'}")
+        err_msg = e.stderr.decode('utf-8', errors='replace') if e.stderr else 'Unknown'
+        logger.error("FFmpeg Error: %s", err_msg)
         raise e
     except Exception as e:
-        print(f"❌ Hook Gen Error: {e}")
+        logger.error("Hook Gen Error: %s", e)
         raise e
     finally:
         # Cleanup temp image

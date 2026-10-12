@@ -44,6 +44,7 @@ def test_pipeline_reports_actual_individual_clip_count_and_shortfall(
         {"start": 25, "end": 35, "title": "Two"},
         {"start": 50, "end": 60, "title": "Three"},
     ]
+    monkeypatch.setattr(pipeline.config, "GEMINI_API_KEY", None)
     monkeypatch.setattr(pipeline, "ensure_ffmpeg", lambda: None)
     monkeypatch.setattr(pipeline, "ingest", lambda *args, **kwargs: (str(video_path), "source"))
     monkeypatch.setattr(pipeline, "probe_video_info", lambda path: {

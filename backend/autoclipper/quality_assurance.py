@@ -147,6 +147,7 @@ def verify_rendered_file(
     path,
     *,
     expected_duration=None,
+    target_duration=None,
     expected_aspect=None,
     expected_audio=None,
     subtitles_requested=False,
@@ -208,6 +209,10 @@ def verify_rendered_file(
         "actual_seconds": round(actual_duration, 3) if actual_duration > 0 else None,
         "delta_seconds": None,
         "tolerance_seconds": None,
+        "target_seconds": None,
+        "target_delta_seconds": None,
+        "target_tolerance_seconds": None,
+        "target_duration_passed": None,
     }
     try:
         expected = float(expected_duration) if expected_duration is not None else None
@@ -223,8 +228,40 @@ def verify_rendered_file(
             "delta_seconds": round(delta, 3),
             "tolerance_seconds": round(tolerance, 3),
         })
+
+    try:
+        target = float(target_duration) if target_duration is not None else None
+    except (TypeError, ValueError):
+        target = None
+
+    if target is not None and math.isfinite(target) and target > 0 and actual_duration > 0:
+        target_tolerance = max(4.0, min(10.0, target * 0.15))
+        target_delta = actual_duration - target
+        target_passed = abs(target_delta) <= target_tolerance and actual_duration <= float(config.HARD_MAX_CLIP_SECONDS) + 0.25
+        duration_check.update({
+            "target_seconds": round(target, 3),
+            "target_delta_seconds": round(target_delta, 3),
+            "target_tolerance_seconds": round(target_tolerance, 3),
+            "target_duration_passed": target_passed,
+        })
+        if not target_passed:
+            # If the actual clip is severely shorter than requested (e.g. 7.2s vs 60s):
+            if actual_duration < target * 0.5:
+                duration_ok = False
+                report["errors"].append(
+                    f"Requested duration of {target:.1f}s was not respected; actual rendered clip is only {actual_duration:.1f}s ({target_delta:+.1f}s delta)."
+                )
+            else:
+                report["warnings"].append(
+                    f"Rendered clip duration ({actual_duration:.1f}s) deviated from requested target ({target:.1f}s) by {target_delta:+.1f}s."
+                )
+    if clip and clip.get("duration_warning"):
+        if clip["duration_warning"] not in report["warnings"]:
+            report["warnings"].append(clip["duration_warning"])
+
+    duration_check["ok"] = duration_ok
     report["checks"]["duration"] = duration_check
-    if not duration_ok:
+    if not duration_ok and not any("duration" in e.lower() for e in report["errors"]):
         report["errors"].append("Rendered duration is missing, outside tolerance, or above the hard clip limit.")
 
     aspect = _ratio_value(expected_aspect)

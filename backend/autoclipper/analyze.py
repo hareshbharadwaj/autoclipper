@@ -421,6 +421,156 @@ def _resolve_clip_bounds(min_clip=None, max_clip=None, target_duration=None):
     return max(5.0, target - 3.0), min(float(config.HARD_MAX_CLIP_SECONDS), target + 3.0)
 
 
+def extend_candidate_to_target_duration(
+    candidate: dict,
+    transcript: dict,
+    target_duration: float,
+    total_duration: float = None,
+    tolerance: float = None,
+) -> dict:
+    """Extend a short clip candidate along complete transcript sentence boundaries.
+
+    Expands along contiguous dialogue (speech gap <= 4.0s) so that the clip achieves
+    approximately the user's requested duration (target_duration) while preserving
+    coherent story context (opening setup, explanation, and payoff).
+
+    If coherent context cannot reach the target (e.g. source has no more contiguous speech),
+    the maximum coherent span is returned with duration_target_met = False and a clear
+    duration_warning. Filler or unrelated footage is never added.
+    """
+    if target_duration is None:
+        return dict(candidate)
+    try:
+        target = float(target_duration)
+    except (TypeError, ValueError):
+        return dict(candidate)
+    if target <= 0:
+        return dict(candidate)
+
+    target = min(float(config.HARD_MAX_CLIP_SECONDS), target)
+    if tolerance is None:
+        tolerance = max(4.0, min(10.0, target * 0.15))
+
+    try:
+        cand_start = float(candidate.get("start", 0.0))
+        cand_end = float(candidate.get("end", 0.0))
+    except (TypeError, ValueError):
+        return dict(candidate)
+
+    if cand_end <= cand_start:
+        return dict(candidate)
+
+    cand_dur = cand_end - cand_start
+
+    segments = []
+    for s in (transcript.get("segments") or []):
+        if not isinstance(s, dict):
+            continue
+        try:
+            start = float(s.get("start", 0.0))
+            end = float(s.get("end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        text = (s.get("text") or "").strip()
+        if end > start and text:
+            if total_duration:
+                start = max(0.0, min(start, float(total_duration)))
+                end = max(0.0, min(end, float(total_duration)))
+            if end > start:
+                segments.append({"start": start, "end": end, "text": text})
+    segments.sort(key=lambda s: (s["start"], s["end"]))
+
+    if not segments:
+        updated = dict(candidate)
+        updated["requested_duration"] = target
+        updated["duration_target_met"] = abs(cand_dur - target) <= tolerance
+        if not updated["duration_target_met"]:
+            updated["duration_warning"] = (
+                f"Requested target duration was {target:.0f}s, but transcript has no segments "
+                f"to extend candidate (current {cand_dur:.1f}s)."
+            )
+        return updated
+
+    overlapping = [
+        i for i, s in enumerate(segments)
+        if s["start"] < cand_end and s["end"] > cand_start
+    ]
+    if overlapping:
+        seed_start_idx = min(overlapping)
+        seed_end_idx = max(overlapping)
+    else:
+        closest_idx = min(
+            range(len(segments)),
+            key=lambda i: min(abs(segments[i]["start"] - cand_start), abs(segments[i]["end"] - cand_end)),
+        )
+        seed_start_idx = closest_idx
+        seed_end_idx = closest_idx
+
+    # Contiguous bounds (speech gap <= 4.0s)
+    max_gap = 4.0
+    min_i = seed_start_idx
+    while min_i > 0 and (segments[min_i]["start"] - segments[min_i - 1]["end"]) <= max_gap:
+        min_i -= 1
+
+    max_j = seed_end_idx
+    while max_j < len(segments) - 1 and (segments[max_j + 1]["start"] - segments[max_j]["end"]) <= max_gap:
+        max_j += 1
+
+    # Search for the best (i, j) that encompasses the seed hook/explanation
+    # and gets closest to target duration without exceeding hard ceiling.
+    best_i, best_j = seed_start_idx, seed_end_idx
+    best_score = float("inf")
+
+    # We evaluate spans [i, j] covering seed_start_idx to seed_end_idx.
+    # When expanding to fill a target, forward expansion (explanation/payoff)
+    # is evaluated first, then backward expansion (setup).
+    for i in range(seed_start_idx, min_i - 1, -1):
+        for j in range(seed_end_idx, max_j + 1):
+            s_start = segments[i]["start"]
+            s_end = segments[j]["end"]
+            s_dur = s_end - s_start
+            if s_dur <= 0:
+                continue
+            if s_dur > float(config.HARD_MAX_CLIP_SECONDS) + 0.5:
+                continue
+
+            # Score by delta to target.
+            delta = abs(s_dur - target)
+            # Slight preference for forward context (payoff) over backward setup.
+            forward_bonus = 0.05 * (j - seed_end_idx)
+            score = delta - forward_bonus
+
+            if score < best_score:
+                best_score = score
+                best_i, best_j = i, j
+
+    best_start = segments[best_i]["start"]
+    best_end = segments[best_j]["end"]
+    best_dur = best_end - best_start
+    target_met = abs(best_dur - target) <= tolerance
+
+    updated = dict(candidate)
+    updated["start"] = round(best_start, 2)
+    updated["end"] = round(best_end, 2)
+    updated["requested_duration"] = target
+    updated["duration_target_met"] = target_met
+
+    if not target_met and best_dur < target - tolerance:
+        updated["duration_warning"] = (
+            f"Requested duration was {target:.0f}s, but only {best_dur:.1f}s of coherent "
+            f"contiguous context was available in this moment without adding unrelated footage."
+        )
+    elif not target_met and best_dur > target + tolerance:
+        updated["duration_warning"] = (
+            f"Requested duration was {target:.0f}s, but candidate was kept at {best_dur:.1f}s "
+            "to avoid cutting off a sentence or payoff mid-thought."
+        )
+    else:
+        updated.pop("duration_warning", None)
+
+    return updated
+
+
 def _filter_clips_to_bounds(clips, min_clip=None, max_clip=None,
                             min_tolerance=0.0, max_tolerance=0.0):
     """Filter candidate durations without trimming away a sentence or payoff."""
@@ -433,6 +583,10 @@ def _filter_clips_to_bounds(clips, min_clip=None, max_clip=None,
         if duration <= 0:
             continue
         if min_clip is not None and duration < float(min_clip) - min_tolerance:
+            # If the clip has an explicit duration warning explaining why it could not be
+            # extended further, preserve it rather than leaving zero clips!
+            if clip.get("duration_warning"):
+                filtered.append(clip)
             continue
         if max_clip is not None and duration > float(max_clip) + max_tolerance:
             continue

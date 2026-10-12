@@ -16,7 +16,8 @@ def test_local_fernet_key_is_persisted_with_private_permissions(tmp_path):
 
     assert first_key == second_key
     assert Fernet(second_key).decrypt(ciphertext) == b"synthetic test value"
-    assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
 
 
 def test_corrupt_persistent_fernet_key_fails_closed(tmp_path):
@@ -69,7 +70,8 @@ def test_empty_key_file_from_interrupted_creation_is_regenerated(tmp_path):
     key = db._persistent_fernet_key(str(key_path))
     Fernet(key)  # valid key material
     assert key_path.read_bytes().strip() == key
-    assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
     # A simulated restart reuses the regenerated key (persistence).
     assert db._persistent_fernet_key(str(key_path)) == key
 

@@ -172,16 +172,21 @@ def test_srt_wraps_long_words_to_the_safe_caption_width():
 
 def test_subtitle_layout_scales_for_portrait_square_and_landscape():
     portrait = subtitle_layout(540, 960)
+    full_portrait = subtitle_layout(1080, 1920)
     square = subtitle_layout(1080, 1080)
     landscape = subtitle_layout(1920, 1080)
 
-    assert portrait["font_size"] == 40
+    # Portrait font size is scaled to avoid dominating the screen (~4.2%-4.8% of width)
+    assert portrait["font_size"] == 23
+    assert full_portrait["font_size"] == 46
     assert portrait["outline_width"] == 2
-    assert portrait["margin_v"] == 60
+    assert portrait["margin_v"] >= round(960 * 0.14)
+    assert full_portrait["margin_v"] >= round(1920 * 0.14)
     assert portrait["max_chars"] < landscape["max_chars"]
-    assert square["font_size"] == landscape["font_size"] == 80
+    assert square["font_size"] == 68
+    assert landscape["font_size"] == 80
     assert landscape["margin_v"] <= round(1080 * 0.15)
-    assert landscape["margin_l"] == round(1920 * 0.06)
+    assert landscape["margin_l"] == round(1920 * 0.08)
 
 
 def test_ass_uses_the_actual_resolution_scaled_style_and_wraps_long_text():
