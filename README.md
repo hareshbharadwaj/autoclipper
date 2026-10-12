@@ -147,8 +147,18 @@ sends them in the request body.
 
 - **Storage:** SQLite (`autoclipper.db`, mounted to the `autoclipper_data` volume in Docker).
 - **Encryption:** `AUTOCLIPPER_SECRET` signs JWTs and derives the Fernet key. **Set this
-  to a long random value in production** — if unset, an ephemeral key is used and stored
-  keys cannot survive a restart.
+  to a long random value in production** and keep it identical across restarts/replicas.
+  If it is unset, the backend falls back to a private persistent key file next to the
+  SQLite database (`<AUTOCLIPPER_DB>.fernet-key`, or `AUTOCLIPPER_SECRET_FILE`) so local
+  development keeps credentials working across restarts.
+- **Upgrading from the ephemeral-key build:** older versions generated a *random
+  in-memory key* when `AUTOCLIPPER_SECRET` was unset, so anything encrypted by them can
+  never be decrypted again — the old key no longer exists. After upgrading, the backend
+  logs exactly which users/fields are affected at startup, and `GET /api/auth/settings`
+  returns an `undecryptable_fields` list; the Settings page shows a banner naming the
+  credentials (Groq/Gemini/YouTube keys, cookies, OAuth tokens) that must be saved
+  again. Non-secret preferences and job data are unaffected. If `AUTOCLIPPER_SECRET`
+  was already set and is unchanged, no re-entry is needed.
 - **Endpoints:** `POST /api/auth/register`, `POST /api/auth/login` (returns a JWT),
   `GET /api/auth/me`, `GET /api/auth/settings`, `PUT /api/auth/settings`.
 - **Protected routes:** `/api/process`, `/api/trending`, `/api/trending/youtube` require a
@@ -272,7 +282,7 @@ Every clip is selected under a strict **story arc**: a hook in the first 0–3s,
 | `GEMINI_API_KEY` | — | Required. Gemini for viral detection + trending ideas. |
 | `YOUTUBE_API_KEY` | — | YouTube Data API v3 key for trending + view counts. |
 | `GROQ_API_KEY` | — | Required. Groq Whisper transcription. |
-| `AUTOCLIPPER_SECRET` | — | **Required in production.** Long random string for JWT signing + API key encryption. If unset, an ephemeral key is used and stored keys won't survive a restart. |
+| `AUTOCLIPPER_SECRET` | — | **Required in production.** Long random string for JWT signing + API key encryption. If unset, a persistent private key file (`AUTOCLIPPER_SECRET_FILE` or `<AUTOCLIPPER_DB>.fernet-key`) is used for local development. Credentials encrypted by the *old* ephemeral-key builds cannot be recovered and must be re-saved (see "Accounts & Per-User API Keys"). |
 | `GEMINI_MODEL` | `gemini-3.5-flash` | Gemini model (e.g. `gemini-3.5-flash`, `gemini-3-flash`). |
 | `GROQ_WHISPER_MODEL` | `whisper-large-v3-turbo` | Whisper model (Groq cloud). |
 | `YOUTUBE_REGION` | `ID` | Default region for trending. |

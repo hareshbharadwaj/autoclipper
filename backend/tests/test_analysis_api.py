@@ -1,6 +1,8 @@
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 import app as app_module
@@ -38,6 +40,7 @@ def test_analyze_video_stubbed_worker_returns_expected_report(monkeypatch):
     app_module.app.dependency_overrides[app_module.get_current_user] = _fake_user
 
     def fake_worker(analysis_id, source, opts):
+        assert opts["content_type"] is None
         entry = app_module.analyses[analysis_id]
         entry["status"] = "done"
         entry["finished_at"] = time.time()
@@ -81,6 +84,18 @@ def test_analyze_video_stubbed_worker_returns_expected_report(monkeypatch):
         assert len(report["result"]["chapters"]) == 1
         assert report["result"]["suggested_angles"][0]["target_duration"] == 10
         assert report["result"]["source"] == "https://example.invalid/synthetic.mp4"
+    finally:
+        app_module.app.dependency_overrides.pop(app_module.get_current_user, None)
+
+
+@pytest.mark.parametrize("clip_count", ["0", "31", "-1"])
+def test_process_rejects_invalid_clip_count_before_starting_work(clip_count):
+    app_module.app.dependency_overrides[app_module.get_current_user] = _fake_user
+    try:
+        with TestClient(app_module.app) as client:
+            response = client.post("/api/process", data={"clip_count": clip_count})
+        assert response.status_code == 400
+        assert "clip_count" in response.json()["detail"]
     finally:
         app_module.app.dependency_overrides.pop(app_module.get_current_user, None)
 
@@ -177,7 +192,7 @@ def test_process_resolves_source_and_transcript_from_analysis_id(tmp_path, monke
         with TestClient(app_module.app) as client:
             response = client.post(
                 "/api/process",
-                data={"analysis_id": analysis_id, "target_duration": "40"},
+                data={"analysis_id": analysis_id, "target_duration": "40", "clip_count": "3"},
             )
             assert response.status_code == 200, response.text
             for _ in range(20):
@@ -186,6 +201,7 @@ def test_process_resolves_source_and_transcript_from_analysis_id(tmp_path, monke
                 time.sleep(0.01)
         assert captured["source"] == source_path
         assert captured["opts"]["cached_transcript_path"] == str(transcript_path)
+        assert captured["opts"]["clip_count"] == 3
     finally:
         app_module.app.dependency_overrides.pop(app_module.get_current_user, None)
         app_module.analyses.pop(analysis_id, None)

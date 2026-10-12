@@ -19,6 +19,15 @@ function maskKey(key) {
   return key.slice(0, 4) + '••••' + key.slice(-4)
 }
 
+const CREDENTIAL_FIELD_LABELS = {
+  groq_key: 'Groq API key',
+  gemini_key: 'Gemini API key',
+  youtube_api_key: 'YouTube Data API key',
+  youtube_cookies: 'YouTube cookies',
+  youtube_token: 'YouTube account connection',
+  facebook_token: 'Facebook account connection',
+}
+
 export default function SettingsPanel({ settings, setSettings, alwaysOpen = false }) {
   const [open, setOpen] = useState(alwaysOpen)
   const [showKeys, setShowKeys] = useState({})
@@ -34,11 +43,26 @@ export default function SettingsPanel({ settings, setSettings, alwaysOpen = fals
   const apiKeys = [
     { key: 'groqKey', label: 'Groq API Key', placeholder: 'gsk_…', required: true, docs: 'https://console.groq.com/keys' },
     { key: 'geminiKey', label: 'Gemini API Key', placeholder: 'AIza…', required: true, docs: 'https://aistudio.google.com/apikey' },
-    { key: 'youtubeApiKey', label: 'YouTube Data API Key', placeholder: 'AIza… (for Trending)', required: false, docs: 'https://console.cloud.google.com' },
+    { key: 'youtubeApiKey', label: 'YouTube Data API Key', placeholder: 'AIza… (for Explore)', required: false, docs: 'https://console.cloud.google.com' },
   ]
 
   return (
     <div className={alwaysOpen ? '' : 'mt-4'}>
+      {Array.isArray(settings.undecryptableFields) && settings.undecryptableFields.length > 0 && (
+        <div className="mb-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          <span className="flex items-center gap-1.5 font-medium">
+            <AlertTriangle size={12} />
+            Saved credentials need to be entered again
+          </span>
+          <p className="mt-1 text-amber-200/80">
+            The server encryption key changed, so these saved values could not be
+            decrypted: {settings.undecryptableFields
+              .map((field) => CREDENTIAL_FIELD_LABELS[field] || field)
+              .join(', ')}.
+            Re-enter them below and save; everything else was migrated unchanged.
+          </p>
+        </div>
+      )}
       {!alwaysOpen && (
         <button
           onClick={() => setOpen((o) => !o)}

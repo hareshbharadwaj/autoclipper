@@ -1,17 +1,19 @@
 """End-to-end orchestration: ingest -> transcribe -> analyze -> cut."""
 import json
+import math
 import os
 import time
 
 from . import config
 from .analyze import (
-    find_viral_clips, _filter_clips_to_bounds,
-    _resolve_clip_bounds, _validate_clips,
+    find_viral_clips, review_clip_candidates, rank_and_diversify_candidates,
+    _filter_clips_to_bounds, _resolve_clip_bounds, _validate_clips,
 )
 from .clip import cut_all
 from .ingest import ingest
 from .reframe import VERTICAL_ASPECT, reframe_clip
 from .subtitles import add_subtitles
+from .quality_assurance import verify_rendered_file
 from .transcribe import transcribe
 from .utils import (
     ASPECT_PRESETS,
@@ -50,11 +52,211 @@ def _normalize_target_duration(target_duration):
     return min(value, 120.0)
 
 
-def _fit_montage_candidates(candidates, transcript, target_duration, total_duration):
-    """Turn 2-3 selected analysis angles into transcript-aligned montage shots.
+MAX_CLIP_COUNT = 30  # Preserve the classic generator's existing 1-30 control.
 
-    Segment boundaries come from Whisper timestamps. We preserve whole transcript
-    segments rather than arbitrarily cutting a word to hit the duration exactly.
+
+def _normalize_clip_count(clip_count):
+    """Validate an optional clip-count request while preserving legacy defaults."""
+    if clip_count is None:
+        return None
+    if isinstance(clip_count, bool):
+        raise ValueError("clip_count must be a whole number between 1 and 30.")
+    try:
+        value = float(clip_count)
+    except (TypeError, ValueError):
+        raise ValueError("clip_count must be a whole number between 1 and 30.")
+    if not math.isfinite(value) or not value.is_integer() or not 1 <= value <= MAX_CLIP_COUNT:
+        raise ValueError("clip_count must be a whole number between 1 and 30.")
+    return int(value)
+
+
+def _same_clip_moment(candidate, existing):
+    """Return true when most of a candidate's duration duplicates another."""
+    try:
+        candidate_start, candidate_end = float(candidate["start"]), float(candidate["end"])
+        existing_start, existing_end = float(existing["start"]), float(existing["end"])
+        overlap = max(0.0, min(candidate_end, existing_end) - max(candidate_start, existing_start))
+        shorter = min(candidate_end - candidate_start, existing_end - existing_start)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return shorter > 0 and overlap / shorter >= 0.35
+
+
+def _merge_unique_clip_candidates(selected, generated, clip_count):
+    """Keep the selected moment and fill remaining slots with distinct candidates."""
+    limit = max(0, int(clip_count or 0))
+    if not limit:
+        return []
+    unique = []
+    for candidate in list(selected or []) + list(generated or []):
+        if any(_same_clip_moment(candidate, accepted) for accepted in unique):
+            continue
+        unique.append(candidate)
+        if len(unique) >= limit:
+            break
+    return sorted(unique, key=lambda item: float(item.get("start", 0.0)))
+
+
+def _candidate_pool_size(requested_count):
+    """Over-generate a bounded candidate pool for ranking and independent review."""
+    try:
+        requested = max(1, int(requested_count))
+    except (TypeError, ValueError):
+        requested = 1
+    return min(40, requested * 2)
+
+
+def _add_render_warning(clip, warning, warnings):
+    clip.setdefault("render_warnings", []).append(warning)
+    if warning not in warnings:
+        warnings.append(warning)
+    logger.warning("Clip %s: %s", clip.get("index", "?"), warning)
+
+
+def _nonempty_file(path):
+    return bool(path and os.path.isfile(path) and os.path.getsize(path) > 0)
+
+
+def _subtitle_repair_needed(qa):
+    """True when the only blocking QA problem is the requested captions."""
+    checks = qa.get("checks") or {}
+    subtitle_check = checks.get("subtitles")
+    if not isinstance(subtitle_check, dict) or subtitle_check.get("ok") is not False:
+        return False
+    required = ("file", "streams", "duration", "audio", "visual_samples")
+    return all(
+        isinstance(checks.get(name), dict) and checks[name].get("ok") is True
+        for name in required
+    )
+
+
+def _rank_montage_candidates(candidates):
+    """Order user-selected montage moments chronologically without de-duplication.
+
+    `_fit_montage_candidates` already guarantees 2-3 distinct, non-overlapping,
+    transcript-aligned shots, so every candidate is retained and ranked; only
+    the internal selection marker is normalized away like the ranking pass does.
+    """
+    ordered = []
+    for item in candidates or []:
+        try:
+            start = float(item.get("start", 0.0))
+        except (TypeError, ValueError):
+            start = 0.0
+        ordered.append((start, dict(item)))
+    ordered.sort(key=lambda pair: pair[0])
+    ranked = []
+    for index, (_, item) in enumerate(ordered):
+        item["candidate_rank"] = index + 1
+        item.pop("_user_selected", None)
+        ranked.append(item)
+    return ranked
+
+
+def _repair_subtitle_failure(clip, transcript, output_dir, qa, qa_args, fallbacks, processing_warnings):
+    """Try once to still deliver the requested captions before falling back/failing.
+
+    Returns the (possibly updated) QA report and fallback list.
+
+    - If no transcript words overlap the clip, captions are impossible; the clip
+      is an acceptable subtitle-free fallback, so the failure is downgraded to
+      an explicit warning that explains the missing feature.
+    - Otherwise retry the caption stage once on the current (otherwise verified)
+      render. If the repaired file passes QA it becomes the final render and the
+      captionless file is kept as a fallback; if not, the original QA report is
+      returned unchanged so the normal fallback/failure handling runs.
+    """
+    if not _subtitle_repair_needed(qa):
+        return qa, fallbacks
+
+    warning = clip.get("subtitle_warning") or ""
+    if warning.startswith("No transcript words overlap"):
+        remaining = [
+            error for error in qa.get("errors") or []
+            if not error.lower().startswith("requested subtitles")
+        ]
+        explanation = (
+            "Requested subtitles could not be generated because no transcript words "
+            "overlap this clip; it was delivered without captions."
+        )
+        repaired = {
+            **qa,
+            "errors": remaining,
+            "warnings": list(qa.get("warnings") or []) + [explanation],
+        }
+        repaired["status"] = "fail" if remaining else "warning"
+        return repaired, fallbacks
+
+    try:
+        base_name = clip.get("file")
+        repair_clip = {**clip}
+        repair_clip.pop("subtitled_file", None)
+        repair_clip.pop("subtitle_warning", None)
+        add_subtitles([repair_clip], transcript, output_dir, burn=True, preserve_source=True)
+        repaired_name = repair_clip.get("file")
+        if not repaired_name or repaired_name == base_name or repair_clip.get("subtitle_warning"):
+            raise RuntimeError(
+                repair_clip.get("subtitle_warning")
+                or "The caption retry did not produce a burned subtitle file."
+            )
+        repaired_path = os.path.join(output_dir, os.path.basename(repaired_name))
+        if not _nonempty_file(repaired_path):
+            raise RuntimeError("The caption retry produced an empty subtitle file.")
+        repaired_qa = verify_rendered_file(repaired_path, **{**qa_args, "clip": repair_clip})
+        if repaired_qa.get("status") == "fail":
+            raise RuntimeError("The repaired caption output failed QA verification.")
+        # Adopt the repaired render; keep the captionless file as a fallback.
+        fallbacks = list(dict.fromkeys(list(fallbacks) + [base_name]))
+        clip["file"] = repaired_name
+        clip["subtitled_file"] = repaired_name
+        if repair_clip.get("srt"):
+            clip["srt"] = repair_clip["srt"]
+        clip.pop("subtitle_warning", None)
+        repaired_qa.setdefault("warnings", []).append(
+            "Captions were re-generated and burned successfully after an initial subtitle failure."
+        )
+        processing_warnings.append(
+            "Subtitle rendering initially failed; captions were repaired on a second attempt."
+        )
+        logger.info("Subtitle repair succeeded for clip %s.", clip.get("index"))
+        return repaired_qa, fallbacks
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Subtitle repair attempt failed for clip %s (%s); continuing with fallback handling.",
+            clip.get("index"), type(exc).__name__,
+        )
+        return qa, fallbacks
+
+
+def _emit_progress(callback, stage, message, *, current=None, total=None, **details):
+    if callback is None:
+        return
+    event = {"stage": stage, "message": message, "updated_at": time.time()}
+    if current is not None:
+        event["current"] = int(current)
+    if total is not None:
+        event["total"] = int(total)
+    event.update(details)
+    try:
+        callback(event)
+    except Exception:
+        pass
+
+
+def _montage_duration_tolerance(target_duration):
+    """Maximum acceptable target variance before explaining the actual duration."""
+    target = max(0.0, float(target_duration or 0.0))
+    return max(3.0, min(8.0, target * 0.08))
+
+
+def _fit_montage_candidates(candidates, transcript, target_duration, total_duration,
+                            crossfade_seconds=0.25):
+    """Fit selected angles to complete transcript segments near the target length.
+
+    Segment boundaries come from Whisper timestamps. The per-shot target reserves
+    time for the montage crossfades. When no boundary is close enough, the closest
+    complete segment is retained (never duplicated or cut mid-sentence); the caller
+    reports the actual stitched duration and its deviation from the target.
     """
     segments = []
     for segment in transcript.get("segments", []) or []:
@@ -62,17 +264,29 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
             start, end = float(segment["start"]), float(segment["end"])
         except (KeyError, TypeError, ValueError):
             continue
-        if end > start and (segment.get("text") or "").strip():
+        if end <= start or not (segment.get("text") or "").strip():
+            continue
+        if total_duration:
+            start = max(0.0, min(start, float(total_duration)))
+            end = max(0.0, min(end, float(total_duration)))
+        if end > start:
             segments.append({"start": start, "end": end})
-    segments.sort(key=lambda item: item["start"])
+    segments.sort(key=lambda item: (item["start"], item["end"]))
     if not segments:
         raise ValueError("Montage needs word/sentence timestamps from the transcript.")
+    if not candidates or not 2 <= len(candidates) <= 3:
+        raise ValueError("Montage mode requires 2 or 3 selected video moments.")
 
-    shot_count = max(1, len(candidates))
-    per_shot = max(3.0, float(target_duration) / shot_count)
-    # Leave a little room for sentence-boundary rounding, but never exceed the
-    # 120-second total ceiling when the requested target is already at the cap.
-    max_shot = per_shot + min(0.75, max(0.0, (120.0 - float(target_duration)) / shot_count))
+    target = min(float(config.HARD_MAX_CLIP_SECONDS), max(3.0, float(target_duration)))
+    shot_count = len(candidates)
+    fade = max(0.0, float(crossfade_seconds))
+    # The output duration is sum(segment durations) - fade * (shots - 1).
+    desired_source_total = min(
+        float(config.HARD_MAX_CLIP_SECONDS), target + fade * (shot_count - 1)
+    )
+    desired_per_shot = max(3.0, desired_source_total / shot_count)
+    hard_per_shot = (float(config.HARD_MAX_CLIP_SECONDS) + fade * (shot_count - 1)) / shot_count
+
     chosen = []
     for angle in candidates:
         try:
@@ -82,26 +296,46 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
             continue
         if hint_end <= hint_start:
             continue
-        desired_start = max(0.0, min(hint_start, max(0.0, total_duration - 0.1)))
-        start_idx = min(range(len(segments)), key=lambda i: abs(segments[i]["start"] - desired_start))
-        end_idx = start_idx
-        while end_idx + 1 < len(segments) and segments[end_idx]["end"] - segments[start_idx]["start"] < per_shot - 1.0:
-            end_idx += 1
-        shot_start = segments[start_idx]["start"]
-        shot_end = segments[end_idx]["end"]
-        if shot_end - shot_start > max_shot:
-            possible = [seg for seg in segments[start_idx:end_idx + 1]
-                        if seg["end"] - shot_start <= max_shot]
-            if not possible:
-                continue
-            shot_end = possible[-1]["end"]
         if total_duration:
-            shot_start = max(0.0, min(shot_start, total_duration))
-            shot_end = max(0.0, min(shot_end, total_duration))
-        if shot_end <= shot_start:
+            hint_start = max(0.0, min(hint_start, float(total_duration)))
+            hint_end = max(0.0, min(hint_end, float(total_duration)))
+        if hint_end <= hint_start:
             continue
+
+        # Start on the complete transcript segment containing the angle's opening
+        # hint; otherwise use the nearest boundary. This includes the opening setup.
+        containing = [
+            i for i, segment in enumerate(segments)
+            if segment["start"] <= hint_start < segment["end"]
+        ]
+        start_idx = containing[0] if containing else min(
+            range(len(segments)), key=lambda i: abs(segments[i]["start"] - hint_start)
+        )
+        shot_start = segments[start_idx]["start"]
+
+        # Do not silently trim off the selected angle's hinted ending. The nearest
+        # eligible complete boundary is chosen, with the overall hard cap preserved.
+        minimum_end_idx = next(
+            (i for i in range(start_idx, len(segments)) if segments[i]["end"] >= hint_end),
+            len(segments) - 1,
+        )
+        possible_ends = []
+        for end_idx in range(minimum_end_idx, len(segments)):
+            shot_end = segments[end_idx]["end"]
+            shot_duration = shot_end - shot_start
+            if shot_duration <= 0:
+                continue
+            if shot_duration > hard_per_shot:
+                break
+            possible_ends.append((shot_duration, shot_end))
+        if not possible_ends:
+            continue
+
+        shot_duration, shot_end = min(
+            possible_ends,
+            key=lambda item: (abs(item[0] - desired_per_shot), item[0] > desired_per_shot),
+        )
         if any(shot_start < item["end"] and shot_end > item["start"] for item in chosen):
-            # Avoid duplicate/overlapping moments; leave a clear error if all angles overlap.
             continue
         chosen.append({
             "start": round(shot_start, 2),
@@ -111,7 +345,9 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
             "hook": (angle.get("hook") or "")[:120],
             "reason": angle.get("reason") or "Selected from whole-video analysis",
             "story_arc": "Selected angle; transcript-aligned montage segment",
+            "_user_selected": True,
         })
+
     chosen.sort(key=lambda item: item["start"])
     if not 2 <= len(chosen) <= 3:
         raise ValueError("Could not find 2-3 distinct, non-overlapping transcript moments for this montage.")
@@ -190,34 +426,42 @@ def run(
     music_volume: float = 0.18,
     cached_transcript_path: str = None,
     on_clip=None,
+    on_progress=None,
 ) -> dict:
     """Run the full auto-clip pipeline and return a result summary dict.
 
     If *on_clip* is provided it will be called with ``(clip_dict, index, total)``
-    after each clip is fully processed (cut + reframe + subtitle), enabling the
-    caller to stream partial results to the frontend.
+    after each clip has been rendered, before final QA. *on_progress*, when set,
+    receives structured stage and per-clip QA events for progress polling.
     """
-    # Clamp oversized requests before resolving target bounds.
+    # Clamp oversized requests and validate count before any ingest/model work.
     target_duration = _normalize_target_duration(target_duration)
+    clip_count = _normalize_clip_count(clip_count)
+    if montage:
+        if not selected_clips or not 2 <= len(selected_clips) <= 3:
+            raise ValueError("Montage mode requires 2 or 3 selected video moments.")
+        requested_individual_count = len(selected_clips)
+        effective_min_clip, effective_max_clip = 3.0, float(config.HARD_MAX_CLIP_SECONDS)
+    else:
+        requested_individual_count = (
+            clip_count if clip_count is not None
+            else (1 if selected_clip else config.TARGET_CLIP_COUNT)
+        )
+        effective_min_clip, effective_max_clip = _resolve_clip_bounds(
+            min_clip, max_clip, target_duration
+        )
     if max_clip is not None:
         try:
             max_clip = min(float(max_clip), float(config.HARD_MAX_CLIP_SECONDS))
         except (TypeError, ValueError):
             max_clip = None
-    if montage:
-        if not selected_clips or not 2 <= len(selected_clips) <= 3:
-            raise ValueError("Montage mode requires 2 or 3 selected video moments.")
-        effective_min_clip, effective_max_clip = 3.0, float(config.HARD_MAX_CLIP_SECONDS)
-    else:
-        effective_min_clip, effective_max_clip = _resolve_clip_bounds(
-            min_clip, max_clip, target_duration
-        )
     ensure_ffmpeg()
     start_time = time.time()
 
     os.makedirs(output_dir, exist_ok=True)
 
     # 1. Ingest
+    _emit_progress(on_progress, "ingesting", "Preparing the source video.")
     video_path, title = ingest(source, output_dir, force_hd=force_hd, cookies_text=cookies_text)
     base_name = sanitize_filename(title)
     video_info = probe_video_info(video_path)
@@ -242,6 +486,7 @@ def run(
         logger.info("Keeping original 16:9 framing (no crop).")
 
     # 2. Reuse the whole-video transcript when analysis-first already paid for it.
+    _emit_progress(on_progress, "transcribing", "Transcribing or loading the source transcript.")
     if cached_transcript_path:
         transcript = _load_cached_transcript(cached_transcript_path)
         logger.info("Reusing cached whole-video transcript; skipping a second Groq call.")
@@ -250,43 +495,146 @@ def run(
             video_path, output_dir, api_key=groq_key, model=whisper_model
         )
 
-    # 3. Analyze (Gemini) — language is auto-read from the transcript so that
-    # titles / descriptions / hooks are written in the video's own language.
+    # 3. Generate a bounded candidate pool, independently review it, then rank
+    #    and diversify. Transcript-grounded timestamps remain authoritative.
+    _emit_progress(
+        on_progress,
+        "reviewing_candidates",
+        "Finding distinct moments and checking them against transcript/visual evidence.",
+    )
+    video_dur = video_info.get("duration") or transcript.get("duration") or 0.0
+    candidate_pool_size = _candidate_pool_size(requested_individual_count)
+    candidate_warnings = []
+    candidate_review = {"status": "not_run", "reviewed_count": 0, "rejected_count": 0}
+
     if montage:
-        clip_candidates = _fit_montage_candidates(
+        candidate_pool = _fit_montage_candidates(
             selected_clips, transcript,
             target_duration=float(target_duration or 40),
-            total_duration=video_info.get("duration") or transcript.get("duration", 0.0),
+            total_duration=video_dur,
         )
     elif selected_clip:
-        # Reuse the selected candidate only after validating its source timestamps.
-        clip_candidates = _validate_clips(
+        # Keep the selected angle as a real output when its hinted timestamps are
+        # valid. Other slots draw from an over-generated, distinct candidate pool.
+        selected_candidates = _validate_clips(
             [selected_clip],
-            total_duration=video_info.get("duration") or transcript.get("duration", 0.0),
+            total_duration=video_dur,
             min_clip=effective_min_clip,
             max_clip=effective_max_clip,
         )
+        selected_candidates = [{**item, "_user_selected": True} for item in selected_candidates]
+        if clip_count is not None and len(selected_candidates) < requested_individual_count:
+            extra_prompt = (custom_prompt or "").strip()
+            if selected_candidates:
+                chosen = selected_candidates[0]
+                direction = (
+                    f"The user-selected moment from {chosen['start']:.1f}s to "
+                    f"{chosen['end']:.1f}s is already one output. Return other "
+                    "distinct, non-overlapping moments only."
+                )
+            else:
+                angle_title = (selected_clip.get("title") or "").strip()
+                direction = (
+                    f"Use the selected angle '{angle_title}' as creative direction "
+                    "where it fits, but return valid transcript-aligned moments."
+                )
+            extra_prompt = f"{extra_prompt}\n\n{direction}".strip()
+            generated_candidates = find_viral_clips(
+                transcript, api_key=gemini_key, model=gemini_model,
+                clip_count=candidate_pool_size,
+                min_clip=effective_min_clip if target_duration is not None else min_clip,
+                max_clip=effective_max_clip if target_duration is not None else max_clip,
+                content_type=content_type, target_duration=target_duration,
+                custom_prompt=extra_prompt,
+            )
+            candidate_pool = _merge_unique_clip_candidates(
+                selected_candidates, generated_candidates, candidate_pool_size
+            )
+        else:
+            candidate_pool = selected_candidates
     else:
-        clip_candidates = find_viral_clips(
+        candidate_pool = find_viral_clips(
             transcript, api_key=gemini_key, model=gemini_model,
-            clip_count=clip_count,
+            clip_count=candidate_pool_size,
             min_clip=effective_min_clip if target_duration is not None else min_clip,
             max_clip=effective_max_clip if target_duration is not None else max_clip,
             content_type=content_type, target_duration=target_duration,
             custom_prompt=custom_prompt,
         )
+
+    if not montage:
+        candidate_pool = _merge_unique_clip_candidates(
+            [], candidate_pool, candidate_pool_size
+        )
+
+    review_key = gemini_key or config.GEMINI_API_KEY
+    if candidate_pool and review_key:
+        try:
+            from .visual_context import sample_candidate_frames
+
+            sampled = sample_candidate_frames(video_path, candidate_pool)
+            if sampled.get("warning"):
+                candidate_warnings.append(
+                    "Candidate visual sampling was incomplete; independent review used transcript evidence and any extracted frames."
+                )
+            review = review_clip_candidates(
+                transcript,
+                candidate_pool,
+                api_key=review_key,
+                model=gemini_model,
+                visual_samples=sampled.get("frames") or [],
+                total_duration=video_dur,
+                min_clip=effective_min_clip,
+                max_clip=effective_max_clip,
+            )
+            candidate_pool = review["candidates"]
+            candidate_review = {
+                "status": "reviewed",
+                "reviewed_count": review["reviewed_count"],
+                "rejected_count": review["rejected_count"],
+            }
+        except Exception as exc:  # fall back to validated, unchanged candidates
+            logger.warning(
+                "Independent candidate review unavailable (%s); retaining original timestamps.",
+                type(exc).__name__,
+            )
+            candidate_review = {
+                "status": "fallback_unreviewed",
+                "reviewed_count": 0,
+                "rejected_count": 0,
+            }
+            candidate_warnings.append(
+                "Independent candidate review could not be completed; original transcript-validated timestamps were retained. Check provider availability and retry if needed."
+            )
+    elif candidate_pool:
+        candidate_review = {"status": "skipped_no_key", "reviewed_count": 0, "rejected_count": 0}
+
+    _emit_progress(
+        on_progress,
+        "ranking_candidates",
+        "Ranking and diversifying the reviewed moments.",
+        candidate_count=len(candidate_pool),
+        candidate_review=candidate_review,
+    )
+    if montage:
+        # Every fitted montage moment is a required user selection; text-similarity
+        # de-duplication must never drop one (two selected angles with similar
+        # titles/hooks would otherwise lose a shot and the montage would fail).
+        clip_candidates = _rank_montage_candidates(candidate_pool)
+    else:
+        clip_candidates = rank_and_diversify_candidates(candidate_pool, requested_individual_count)
     logger.info(
-        "Clip params -> requested count=%s min=%s max=%s | Gemini returned %d candidates",
-        clip_count, min_clip, max_clip, len(clip_candidates),
+        "Clip params -> requested count=%s min=%s max=%s | reviewed pool=%d | selected %d candidate(s)",
+        requested_individual_count, min_clip, max_clip, len(candidate_pool), len(clip_candidates),
     )
 
     # Apply hard duration bounds without blindly padding with unrelated footage or
     # truncating a sentence/payoff. Candidate selection should respect the bounds.
-    video_dur = video_info.get("duration") or transcript.get("duration") or 0.0
-    if effective_min_clip is not None or effective_max_clip is not None or clip_count:
+    if effective_min_clip is not None or effective_max_clip is not None or requested_individual_count:
+        constraint_count = len(clip_candidates) if montage else requested_individual_count
         clip_candidates = _enforce_clip_constraints(
             clip_candidates, effective_min_clip, effective_max_clip,
-            1 if selected_clip else clip_count, video_dur,
+            constraint_count, video_dur,
             trim_long=False, pad_short=False,
         )
         if not montage:
@@ -302,80 +650,145 @@ def run(
         logger.warning("No viral clips detected.")
 
     # 4. Cut clips (FFmpeg)
+    _emit_progress(
+        on_progress,
+        "rendering",
+        "Rendering selected clips and requested transformations.",
+        current=0,
+        total=len(clip_candidates),
+        candidate_review=candidate_review,
+    )
     clips = cut_all(video_path, clip_candidates, output_dir, base_name)
     total_clips = len(clips)
 
-    # Process each clip one-by-one so that partial results stream to the UI.
+    # Process each clip one-by-one so partial results can stream to the UI.
+    # Keep earlier stages until post-render QA confirms the final file is usable.
     processed = []
+    processing_warnings = list(candidate_warnings)
     for idx, clip in enumerate(clips):
-        # 4b. Chat-split
+        fallbacks = []
+
+        # 4b. Chat-split. Keep the source clip if the transform fails.
         if split_screen:
             from .gaming_layout import auto_chat_split_clip as _auto_split
-            src = os.path.join(output_dir, clip["file"])
-            if os.path.exists(src):
-                s_name = clip["file"].rsplit(".", 1)[0] + "_split.mp4"
-                s_path = os.path.join(output_dir, s_name)
-                try:
-                    _auto_split(src, s_path)
-                    os.remove(src)
-                    clip["file"] = s_name
-                    clip["split_screen"] = True
-                    logger.info("Chat-split applied to %s -> %s", src, s_name)
-                except Exception as e:
-                    logger.warning("Chat-split skipped for %s: %s", src, e)
-
-        # 5. Reframe to the requested aspect ratio (9:16 / 1:1), skipping the
-        #    crop entirely for 16:9 so the original framing is preserved.
-        if target_aspect is not None and not clip.get("split_screen"):
-            src = os.path.join(output_dir, clip["file"])
-            if os.path.exists(src):
-                suffix = "9x16" if abs(target_aspect - (9 / 16)) < 1e-6 else (
-                    "1x1" if abs(target_aspect - 1.0) < 1e-6 else "crop"
-                )
-                v_name = clip["file"].rsplit(".", 1)[0] + f"_{suffix}.mp4"
-                v_path = os.path.join(output_dir, v_name)
-                if reframe_clip(src, v_path, use_yolo=use_yolo, aspect=target_aspect):
-                    clip["vertical_file"] = v_name
-                    os.remove(src)
-                    clip["file"] = v_name
-
-        # 6. Generate + burn subtitle tracks (word-level karaoke captions).
-        #    Captions are burned in by default so every exported clip has them.
-        if subtitles:
-            add_subtitles([clip], transcript, output_dir, burn=True)
-
-        # 6b. Burn the curiosity-hook banner on top of the finished clip.
-        if add_hook and clip.get("hook"):
+            source_name = clip["file"]
+            src = os.path.join(output_dir, source_name)
+            s_name = source_name.rsplit(".", 1)[0] + "_split.mp4"
+            s_path = os.path.join(output_dir, s_name)
             try:
+                if not _nonempty_file(src):
+                    raise RuntimeError("The source clip is missing or empty.")
+                _auto_split(src, s_path)
+                if not _nonempty_file(s_path):
+                    raise RuntimeError("No non-empty split-screen file was created.")
+                fallbacks.append(source_name)
+                clip["file"] = s_name
+                clip["split_screen"] = True
+            except Exception as exc:  # noqa: BLE001
+                _add_render_warning(
+                    clip,
+                    f"Split-screen processing was skipped ({type(exc).__name__}); the prior clip was retained.",
+                    processing_warnings,
+                )
+                try:
+                    if os.path.exists(s_path):
+                        os.remove(s_path)
+                except OSError:
+                    pass
+
+        # 5. Reframe to the requested aspect ratio, retaining the prior render
+        #    if subject tracking or the output stream check fails.
+        if target_aspect is not None and not clip.get("split_screen"):
+            prior_name = clip["file"]
+            src = os.path.join(output_dir, prior_name)
+            suffix = "9x16" if abs(target_aspect - (9 / 16)) < 1e-6 else (
+                "1x1" if abs(target_aspect - 1.0) < 1e-6 else "crop"
+            )
+            v_name = prior_name.rsplit(".", 1)[0] + f"_{suffix}.mp4"
+            v_path = os.path.join(output_dir, v_name)
+            try:
+                if not _nonempty_file(src):
+                    raise RuntimeError("The source clip is missing or empty.")
+                if not reframe_clip(src, v_path, use_yolo=use_yolo, aspect=target_aspect):
+                    raise RuntimeError("The reframed output failed verification.")
+                if not _nonempty_file(v_path):
+                    raise RuntimeError("No non-empty reframed file was created.")
+                fallbacks.append(prior_name)
+                clip["vertical_file"] = v_name
+                clip["file"] = v_name
+            except Exception as exc:  # noqa: BLE001
+                _add_render_warning(
+                    clip,
+                    f"Aspect-ratio reframing failed ({type(exc).__name__}); the prior framing was retained.",
+                    processing_warnings,
+                )
+                try:
+                    if os.path.exists(v_path):
+                        os.remove(v_path)
+                except OSError:
+                    pass
+
+        # 6. Generate/burn captions. Preserve the uncaptained video for fallback.
+        if subtitles:
+            prior_name = clip["file"]
+            add_subtitles([clip], transcript, output_dir, burn=True, preserve_source=True)
+            if clip.get("file") != prior_name:
+                fallbacks.append(prior_name)
+            if clip.get("subtitle_warning"):
+                _add_render_warning(clip, clip["subtitle_warning"], processing_warnings)
+
+        # 6b. Burn the hook banner only if a complete output is produced.
+        if add_hook and clip.get("hook"):
+            prior_name = clip["file"]
+            src = os.path.join(output_dir, prior_name)
+            h_name = prior_name.rsplit(".", 1)[0] + "_hook.mp4"
+            h_path = os.path.join(output_dir, h_name)
+            try:
+                if not _nonempty_file(src):
+                    raise RuntimeError("The source clip is missing or empty.")
                 from .hooks import add_hook_to_video
+                add_hook_to_video(src, clip["hook"], h_path, position="top", duration=4.0)
+                if not _nonempty_file(h_path):
+                    raise RuntimeError("No non-empty hook-overlay file was created.")
+                fallbacks.append(prior_name)
+                clip["file"] = h_name
+                clip["hook_file"] = h_name
+            except Exception as exc:  # noqa: BLE001
+                _add_render_warning(
+                    clip,
+                    f"Hook overlay was skipped ({type(exc).__name__}); the prior clip was retained.",
+                    processing_warnings,
+                )
+                try:
+                    if os.path.exists(h_path):
+                        os.remove(h_path)
+                except OSError:
+                    pass
 
-                src = os.path.join(output_dir, clip["file"])
-                if os.path.exists(src):
-                    h_name = clip["file"].rsplit(".", 1)[0] + "_hook.mp4"
-                    h_path = os.path.join(output_dir, h_name)
-                    add_hook_to_video(
-                        src, clip["hook"], h_path, position="top", duration=4.0
-                    )
-                    os.remove(src)
-                    clip["file"] = h_name
-                    clip["hook_file"] = h_name
-                    logger.info("Hook banner burned into %s", h_name)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Hook banner skipped for clip %s: %s", clip.get("index"), e)
-
+        clip["_render_fallbacks"] = list(dict.fromkeys(fallbacks))
         processed.append(clip)
+        _emit_progress(
+            on_progress,
+            "rendering",
+            f"Clip {idx + 1} of {total_clips} rendered; final QA is pending.",
+            current=idx + 1,
+            total=total_clips,
+            candidate_review=candidate_review,
+        )
 
-        # Notify caller that this clip is ready
+        # Do not expose internal fallback filenames in incremental job polling.
         if on_clip is not None:
             try:
-                on_clip(clip, idx + 1, total_clips)
+                public_clip = {key: value for key, value in clip.items() if not key.startswith("_")}
+                on_clip(public_clip, idx + 1, total_clips)
             except Exception:
                 pass
 
-    processing_warnings = []
+    actual_individual_count = len(processed)
 
     # Plan B: stitch the selected, independently captioned moments into one montage.
     if montage:
+        _emit_progress(on_progress, "montage", "Stitching the selected clips into a montage.")
         try:
             from .montage import stitch_montage
             montage_name = f"{base_name}_montage.mp4"
@@ -390,10 +803,15 @@ def run(
                     f"Montage duration {montage_duration:.1f}s exceeds the hard "
                     f"{config.HARD_MAX_CLIP_SECONDS:.0f}s limit; choose fewer/shorter moments."
                 )
-            if target_duration and abs(montage_duration - float(target_duration)) > 3.0:
+            duration_delta = montage_duration - float(target_duration or 40)
+            duration_tolerance = _montage_duration_tolerance(target_duration or 40)
+            if abs(duration_delta) > duration_tolerance:
                 processing_warnings.append(
-                    f"Montage is {montage_duration:.1f}s versus the {float(target_duration):.0f}s target; "
-                    "whole transcript boundaries were prioritized."
+                    f"Montage actual duration is {montage_duration:.2f}s versus the "
+                    f"{float(target_duration or 40):.0f}s target ({duration_delta:+.2f}s; "
+                    f"tolerance ±{duration_tolerance:.1f}s). Complete transcript boundaries "
+                    "were preserved; meeting the target would require cutting speech or "
+                    "reusing footage."
                 )
             processed.append({
                 "index": len(processed) + 1,
@@ -402,6 +820,8 @@ def run(
                 "start": 0.0,
                 "end": round(montage_duration, 2),
                 "duration": round(montage_duration, 2),
+                "target_duration": float(target_duration or 40),
+                "duration_delta": round(duration_delta, 2),
                 "is_montage": True,
                 "reason": "Stitched from selected complementary moments with video/audio crossfades.",
             })
@@ -428,6 +848,7 @@ def run(
                 "Voiceover/music was applied to the first generated clip only; enable montage to mix one combined output."
             )
     if audio_target and (voiceover_text or background_music_path):
+        _emit_progress(on_progress, "audio", "Mixing requested voiceover and/or background music.")
         try:
             from .audio_mix import mix_audio_layers
             voiceover_path = None
@@ -444,19 +865,250 @@ def run(
             src = os.path.join(output_dir, audio_target["file"])
             mixed_name = audio_target["file"].rsplit(".", 1)[0] + "_audio.mp4"
             mixed_path = os.path.join(output_dir, mixed_name)
+            if voiceover_path and os.path.isfile(voiceover_path):
+                voice_duration = probe_duration(voiceover_path)
+                output_duration = probe_duration(src)
+                if voice_duration > 0 and output_duration > 0:
+                    audio_target["voiceover_duration"] = round(voice_duration, 2)
+                    if voice_duration < output_duration - max(2.0, output_duration * 0.05):
+                        warning = (
+                            f"Voiceover is {voice_duration:.1f}s for a {output_duration:.1f}s output. "
+                            "It plays once from the start; it is not stretched or repeated. "
+                            "Extend the script if narration should cover more of the video."
+                        )
+                        processing_warnings.append(warning)
+                        logger.info(warning)
             mix_audio_layers(
                 src, mixed_path,
                 voiceover_path=voiceover_path,
                 music_path=background_music_path,
                 music_volume=music_volume,
             )
-            if os.path.isfile(mixed_path) and os.path.getsize(mixed_path) > 0:
-                os.remove(src)
+            if _nonempty_file(mixed_path):
+                audio_target.setdefault("_render_fallbacks", []).append(audio_target["file"])
                 audio_target["file"] = mixed_name
                 audio_target["audio_mixed"] = True
+            else:
+                raise RuntimeError("Audio mix did not produce a non-empty output file.")
         except Exception as exc:
-            processing_warnings.append(f"Voiceover/music mixing failed: {exc}")
+            warning = f"Voiceover/music mixing failed ({type(exc).__name__}); the unmixed clip was retained."
+            processing_warnings.append(warning)
             logger.exception("Voiceover/music mixing failed")
+
+    # 6d. Verify the actual final artifacts. If a late transform is invalid,
+    #     try earlier known-good render stages before marking the clip unusable.
+    _emit_progress(
+        on_progress,
+        "quality_assurance",
+        "Checking rendered files, streams, durations, subtitles, audio, and sampled frames.",
+        current=0,
+        total=len(processed),
+        candidate_review=candidate_review,
+        qa_status="running",
+    )
+    quality_reports = []
+    failed_outputs = []
+    verified_clips = []
+    for clip in list(processed):
+        is_montage_clip = bool(clip.get("is_montage"))
+        try:
+            expected_duration = (
+                float(clip.get("duration")) if is_montage_clip
+                else float(clip.get("end", 0.0)) - float(clip.get("start", 0.0))
+            )
+        except (TypeError, ValueError):
+            expected_duration = None
+        expected_audio = (
+            True if is_montage_clip or clip.get("audio_mixed")
+            else bool(video_info.get("has_audio"))
+        )
+        qa_args = {
+            "expected_duration": expected_duration,
+            "expected_aspect": target_aspect,
+            "expected_audio": expected_audio,
+            "subtitles_requested": bool(subtitles and not is_montage_clip),
+            "clip": clip,
+            "output_dir": output_dir,
+        }
+        current_name = clip.get("file")
+        current_path = os.path.join(output_dir, current_name or "")
+        try:
+            qa = verify_rendered_file(current_path, **qa_args)
+        except Exception as exc:  # QA failure should be reported, not mask the job result
+            qa = {
+                "status": "fail",
+                "file": current_name,
+                "checks": {},
+                "warnings": [],
+                "errors": [f"Post-render QA could not inspect this file ({type(exc).__name__})."],
+            }
+
+        fallbacks = list(clip.get("_render_fallbacks") or [])
+        if qa.get("status") == "fail" and subtitles and not is_montage_clip:
+            # Requested captions must be delivered, repaired, explicitly
+            # downgraded (impossible case), or fail — never pass silently.
+            qa, fallbacks = _repair_subtitle_failure(
+                clip, transcript, output_dir, qa, qa_args, fallbacks, processing_warnings
+            )
+            clip["_render_fallbacks"] = list(dict.fromkeys(fallbacks))
+            current_name = clip.get("file")
+            current_path = os.path.join(output_dir, current_name or "")
+        if qa.get("status") == "fail":
+            for fallback_name in reversed(fallbacks):
+                fallback_path = os.path.join(output_dir, os.path.basename(fallback_name))
+                fallback_clip = {**clip, "file": os.path.basename(fallback_name)}
+                if fallback_clip.get("subtitled_file") != fallback_clip["file"]:
+                    fallback_clip.pop("subtitled_file", None)
+                fallback_args = {**qa_args, "clip": fallback_clip}
+                try:
+                    fallback_qa = verify_rendered_file(fallback_path, **fallback_args)
+                except Exception:
+                    continue
+                fallback_checks = fallback_qa.get("checks") or {}
+                playable_fallback = all(
+                    isinstance(fallback_checks.get(check), dict)
+                    and fallback_checks[check].get("ok") is True
+                    for check in ("file", "streams", "duration", "audio", "visual_samples")
+                )
+                if fallback_qa.get("status") != "fail" or playable_fallback:
+                    clip["file"] = fallback_clip["file"]
+                    if clip.get("hook_file") != clip["file"]:
+                        clip.pop("hook_file", None)
+                    if fallback_clip.get("subtitled_file") == clip["file"]:
+                        clip["subtitled_file"] = clip["file"]
+                    elif not (fallback_qa.get("checks", {}).get("subtitles") or {}).get("ok"):
+                        clip.pop("subtitled_file", None)
+                    if fallback_qa.get("status") == "fail":
+                        tolerated = list(fallback_qa.get("errors") or [])
+                        fallback_qa["tolerated_failures"] = tolerated
+                        fallback_qa["errors"] = []
+                        fallback_qa.setdefault("warnings", []).extend(
+                            f"The restored playable render does not meet this requested check: {error}"
+                            for error in tolerated
+                        )
+                    fallback_qa.setdefault("warnings", []).append(
+                        "Final render failed QA; a verified earlier render was restored. Recheck requested overlays/audio."
+                    )
+                    fallback_qa["status"] = "warning"
+                    fallback_qa["fallback_used"] = True
+                    superseded_errors = list(qa.get("errors") or [])
+                    fallback_qa["superseded_final_render"] = {
+                        "status": qa.get("status"),
+                        "errors": superseded_errors,
+                    }
+                    fallback_qa.setdefault("warnings", []).extend(
+                        f"The final render failed this check: {error}"
+                        for error in superseded_errors
+                    )
+                    qa = fallback_qa
+                    try:
+                        if current_path != fallback_path and os.path.exists(current_path):
+                            os.remove(current_path)
+                    except OSError:
+                        pass
+                    break
+
+        clip["quality_assurance"] = qa
+        clip["qa_status"] = qa.get("status", "fail")
+        checks = qa.get("checks") or {}
+        if clip.get("vertical_file") in fallbacks:
+            if (checks.get("aspect_ratio") or {}).get("ok"):
+                clip["vertical_file"] = clip["file"]
+            else:
+                clip.pop("vertical_file", None)
+        if clip.get("hook_file") != clip.get("file"):
+            clip.pop("hook_file", None)
+        if (checks.get("subtitles") or {}).get("ok"):
+            clip["subtitled_file"] = clip["file"]
+        elif clip.get("subtitled_file") in fallbacks and clip.get("subtitled_file") != clip.get("file"):
+            clip.pop("subtitled_file", None)
+        quality_reports.append({
+            "index": clip.get("index"),
+            "file": clip.get("file"),
+            "status": clip["qa_status"],
+            "checks": qa.get("checks", {}),
+            "warnings": qa.get("warnings", []),
+            "errors": qa.get("errors", []),
+            "fallback_used": bool(qa.get("fallback_used")),
+        })
+        _emit_progress(
+            on_progress,
+            "quality_assurance",
+            f"Checked {len(quality_reports)} of {len(processed)} rendered output(s).",
+            current=len(quality_reports),
+            total=len(processed),
+            qa_status="running",
+            last_clip_qa_status=clip["qa_status"],
+            clip_index=clip.get("index"),
+            candidate_review=candidate_review,
+        )
+        for warning in qa.get("warnings", []) or []:
+            _add_render_warning(clip, warning, processing_warnings)
+        for error in qa.get("errors", []) or []:
+            _add_render_warning(clip, error, processing_warnings)
+
+        if clip["qa_status"] == "fail":
+            failed_outputs.append({
+                "index": clip.get("index"),
+                "title": clip.get("title"),
+                "file": clip.get("file"),
+                "quality_assurance": qa,
+            })
+            clip.pop("_render_fallbacks", None)
+            continue
+
+        # Clean superseded intermediates only after a final/fallback render passes.
+        for fallback_name in fallbacks:
+            fallback_path = os.path.join(output_dir, os.path.basename(fallback_name))
+            if os.path.abspath(fallback_path) == os.path.abspath(os.path.join(output_dir, clip.get("file", ""))):
+                continue
+            try:
+                if os.path.isfile(fallback_path):
+                    os.remove(fallback_path)
+            except OSError:
+                pass
+        clip.pop("_render_fallbacks", None)
+        verified_clips.append(clip)
+
+    processed = verified_clips
+    actual_individual_count = sum(1 for clip in processed if not clip.get("is_montage"))
+    if not montage and actual_individual_count < requested_individual_count:
+        warning = (
+            f"Requested {requested_individual_count} individual clips, but generated "
+            f"{actual_individual_count}; {actual_individual_count} passed render QA; "
+            "review the per-clip QA details."
+        )
+        if warning not in processing_warnings:
+            processing_warnings.append(warning)
+            logger.warning(warning)
+
+    failed_qa_count = sum(report["status"] == "fail" for report in quality_reports)
+    if not quality_reports:
+        qa_status = "not_run"
+    elif failed_qa_count:
+        qa_status = "fail"
+    elif any(report["status"] == "warning" for report in quality_reports):
+        qa_status = "warning"
+    else:
+        qa_status = "pass"
+    quality_assurance = {
+        "status": qa_status,
+        "checked_clip_count": len(quality_reports),
+        "failed_clip_count": failed_qa_count,
+        "reports": quality_reports,
+        "failed_outputs": failed_outputs,
+    }
+    _emit_progress(
+        on_progress,
+        "quality_assurance",
+        f"Post-render QA finished with status: {qa_status}.",
+        current=len(quality_reports),
+        total=len(quality_reports),
+        qa_status=qa_status,
+        failed_clip_count=failed_qa_count,
+        candidate_review=candidate_review,
+    )
+    _emit_progress(on_progress, "persisting", "Saving clip metadata and library copies.")
 
     # 7. Persist metadata
     try:
@@ -473,24 +1125,41 @@ def run(
         "video_info": video_info,
         "aspect_ratio": aspect_key or ("16:9" if target_aspect is None else "9:16"),
         "clips": processed,
+        "requested_clip_count": requested_individual_count,
+        "individual_clip_count": actual_individual_count,
         "montage_file": next((item["file"] for item in processed if item.get("is_montage")), None),
-        "processing_warnings": processing_warnings,
+        "candidate_review": candidate_review,
+        "quality_assurance": quality_assurance,
+        "processing_warnings": list(dict.fromkeys(processing_warnings)),
         "elapsed_seconds": round(time.time() - start_time, 1),
     }
     metadata_path = os.path.join(output_dir, f"{base_name}_metadata.json")
     write_json(metadata_path, {**result, "transcript": transcript})
 
-    # 8. Save clips into the Saved Library (folder per source video).
-    try:
-        library_path = save_to_library(output_dir, title, result["job_id"], processed)
-        result["library_path"] = os.path.relpath(library_path, output_dir)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Could not save to library: %s", e)
+    # 8. Save verified clips into the Saved Library (folder per source video).
+    if processed:
+        try:
+            library_path = save_to_library(output_dir, title, result["job_id"], processed)
+            result["library_path"] = os.path.relpath(library_path, output_dir)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not save to library: %s", e)
+    else:
+        logger.info("No clips passed render QA; skipping the Saved Library copy.")
 
     logger.info(
         "Done in %.1fs — %d clip(s) written to %s",
         result["elapsed_seconds"],
         len(processed),
         output_dir,
+    )
+    _emit_progress(
+        on_progress,
+        "completed",
+        "Clip generation, QA, and metadata saving are complete.",
+        current=len(processed),
+        total=len(processed),
+        qa_status=qa_status,
+        failed_clip_count=failed_qa_count,
+        candidate_review=candidate_review,
     )
     return result

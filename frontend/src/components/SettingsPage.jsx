@@ -32,6 +32,7 @@ export default function SettingsPage({ settings, setSettings }) {
         geminiModel: updated.geminiModel || '',
         whisperModel: updated.whisperModel || '',
         youtubeCookies: updated.youtubeCookies || '',
+        undecryptableFields: updated.undecryptableFields || [],
       }))
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)

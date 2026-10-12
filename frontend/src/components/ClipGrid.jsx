@@ -7,10 +7,14 @@ import FacebookUploadModal from './FacebookUploadModal.jsx'
 import ChatSplitModal from './ChatSplitModal.jsx'
 
 export default function ClipGrid({ jobId, clips, onApply }) {
+  const individualCount = clips.filter((clip) => !clip.is_montage).length
+  const montageCount = clips.filter((clip) => clip.is_montage).length
+
   return (
     <section>
       <h2 className="text-lg font-semibold mb-3">
-        {clips.length} clip{clips.length > 1 ? 's' : ''} generated
+        {individualCount} individual clip{individualCount === 1 ? '' : 's'} generated
+        {montageCount > 0 && ` + ${montageCount} montage${montageCount === 1 ? '' : 's'}`}
       </h2>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {clips.map((clip) => (
@@ -18,6 +22,40 @@ export default function ClipGrid({ jobId, clips, onApply }) {
         ))}
       </div>
     </section>
+  )
+}
+
+function ClipQaBadge({ status }) {
+  const styles = {
+    pass: 'border-green-500/30 bg-green-500/10 text-green-300',
+    warning: 'border-amber-500/30 bg-amber-500/10 text-amber-200',
+    fail: 'border-red-500/30 bg-red-500/10 text-red-300',
+    pending: 'border-zinc-500/30 bg-zinc-500/10 text-zinc-300',
+  }
+  const labels = {
+    pass: 'QA passed',
+    warning: 'QA passed with notes',
+    fail: 'QA failed',
+    pending: 'Awaiting final QA',
+  }
+  return (
+    <span className={`inline-flex mt-2 rounded-full border px-2 py-0.5 text-[10px] font-medium ${styles[status] || styles.pending}`}>
+      {labels[status] || status}
+    </span>
+  )
+}
+
+function CandidateReviewBadge({ status, score }) {
+  const flagged = status === 'flagged_user_selected'
+  const rating = Number.isFinite(Number(score)) ? ` · ${Number(score).toFixed(0)}/100` : ''
+  return (
+    <span className={`inline-flex mt-2 mr-1 rounded-full border px-2 py-0.5 text-[10px] font-medium ${
+      flagged
+        ? 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+        : 'border-cyan-500/30 bg-cyan-500/10 text-cyan-200'
+    }`}>
+      {flagged ? 'Reviewer flagged · kept by request' : 'Candidate reviewed'}{rating}
+    </span>
   )
 }
 
@@ -32,6 +70,13 @@ function ClipCard({ jobId, clip, onApply }) {
   const [splitting, setSplitting] = useState(false)
   const [splitInfo, setSplitInfo] = useState(null) // { name, clip } after auto-save
   const url = fileUrl(jobId, clip.file)
+  const qa = clip.quality_assurance || {}
+  const qaWarnings = [
+    ...(clip.render_warnings || []),
+    ...(qa.warnings || []),
+    ...(qa.errors || []),
+    ...(qa.tolerated_failures || []),
+  ].filter((warning, index, items) => warning && items.indexOf(warning) === index)
 
   async function handleSave() {
     setSaving(true)
@@ -40,6 +85,7 @@ function ClipCard({ jobId, clip, onApply }) {
       const res = await saveToLibrary({
         jobId,
         filename: clip.file,
+        srt: clip.srt,
         clipTitle: clip.title,
         description: clip.description,
         hook: clip.hook,
@@ -59,6 +105,7 @@ function ClipCard({ jobId, clip, onApply }) {
       const res = await saveToLibrary({
         jobId,
         filename: clip.file,
+        srt: clip.srt,
         clipTitle: clip.title,
         description: clip.description,
         hook: clip.hook,
@@ -82,7 +129,7 @@ function ClipCard({ jobId, clip, onApply }) {
           className="w-full aspect-[9/16] object-contain bg-black"
         />
         <span className="absolute top-2 left-2 bg-black/60 text-white text-[10px] font-bold px-2 py-1 rounded-md uppercase tracking-wide">
-          Clip {clip.index}
+          {clip.is_montage ? 'Montage' : `Clip ${clip.index}`}
         </span>
       </div>
 
@@ -93,6 +140,51 @@ function ClipCard({ jobId, clip, onApply }) {
         <div className="text-xs text-zinc-500 mt-1">
           {clip.start?.toFixed(1)}s – {clip.end?.toFixed(1)}s
         </div>
+
+        {clip.review_status && (
+          <CandidateReviewBadge
+            status={clip.review_status}
+            score={clip.review_score}
+          />
+        )}
+        {clip.qa_status && <ClipQaBadge status={clip.qa_status} />}
+        {(clip.review_reason || clip.review_evidence || clip.visual_evidence || clip.review_warning || clip.timestamp_revision) && (
+          <details className="mt-2 rounded-lg border border-cyan-500/20 bg-cyan-500/5 px-2.5 py-2">
+            <summary className="cursor-pointer text-[11px] font-medium text-cyan-200">Candidate review evidence</summary>
+            <div className="mt-2 space-y-1.5 text-[11px] text-zinc-300">
+              {clip.review_warning && <p className="text-amber-200">{clip.review_warning}</p>}
+              {clip.review_reason && <p><span className="text-zinc-500">Reason:</span> {clip.review_reason}</p>}
+              {clip.review_evidence && <p><span className="text-zinc-500">Transcript:</span> “{clip.review_evidence}”</p>}
+              {clip.visual_evidence && <p><span className="text-zinc-500">Visual:</span> {clip.visual_evidence}</p>}
+              {clip.timestamp_revision && (
+                <p>
+                  <span className="text-zinc-500">Timing adjusted:</span>{' '}
+                  {clip.timestamp_revision.from?.start?.toFixed?.(1)}–{clip.timestamp_revision.from?.end?.toFixed?.(1)}s to{' '}
+                  {clip.timestamp_revision.to?.start?.toFixed?.(1)}–{clip.timestamp_revision.to?.end?.toFixed?.(1)}s
+                </p>
+              )}
+            </div>
+          </details>
+        )}
+        {qaWarnings.length > 0 && (
+          <details className="mt-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-2.5 py-2">
+            <summary className="cursor-pointer text-[11px] font-medium text-amber-200">
+              Render and QA notes ({qaWarnings.length})
+            </summary>
+            <ul className="mt-2 list-disc space-y-1 pl-4 text-[11px] text-amber-100/80">
+              {qaWarnings.map((warning, index) => <li key={`${index}-${warning}`}>{warning}</li>)}
+            </ul>
+            {qa.checks && (
+              <div className="mt-2 grid grid-cols-2 gap-1 text-[10px] text-zinc-400">
+                {Object.entries(qa.checks).map(([key, check]) => (
+                  <span key={key}>
+                    {key.replaceAll('_', ' ')}: {check?.ok === true ? 'OK' : check?.ok === false ? 'Review' : '—'}
+                  </span>
+                ))}
+              </div>
+            )}
+          </details>
+        )}
 
         {(clip.description || clip.hook) && (
           <button

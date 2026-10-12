@@ -23,13 +23,14 @@ Optimizations & Features:
 import os
 import subprocess
 import sys
+import threading
 import urllib.request
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-from .utils import logger
+from .utils import logger, probe_duration, probe_video_info
 
 VERTICAL_ASPECT = 9 / 16  # width / height
 
@@ -741,6 +742,18 @@ def reframe_clip(input_video: str, output_video: str, use_yolo: bool = True,
     proc = subprocess.Popen(
         ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
     )
+    stderr_chunks = []
+
+    def _drain_stderr():
+        try:
+            stderr_chunks.append(proc.stderr.read())
+        except Exception:
+            stderr_chunks.append(b"")
+
+    # Drain in parallel so a verbose encoder cannot fill the pipe and deadlock
+    # the raw-frame writer.
+    stderr_reader = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_reader.start()
 
     cap = cv2.VideoCapture(input_video)
     frame_number = 0
@@ -776,11 +789,18 @@ def reframe_clip(input_video: str, output_video: str, use_yolo: bool = True,
     except Exception:
         pass
 
-    stderr = proc.stderr.read().decode(errors="ignore") if proc.stderr else ""
     proc.wait()
+    stderr_reader.join(timeout=5)
+    stderr = b"".join(stderr_chunks).decode(errors="ignore")
 
-    if proc.returncode != 0:
-        logger.error("FFmpeg reframe encode failed: %s", stderr[-500:])
+    if proc.returncode != 0 or frame_number < max(1, int(total_frames * 0.9)):
+        logger.error("FFmpeg reframe encode failed (%s).", "encoder error" if proc.returncode else "incomplete frame output")
+        for path in (temp_video, temp_audio, output_video):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
         return False
 
     # Step 4: Merge original audio back in
@@ -835,9 +855,35 @@ def reframe_clip(input_video: str, output_video: str, use_yolo: bool = True,
                 pass
 
     if result.returncode != 0:
-        err_msg = result.stderr.decode(errors="ignore") if result.stderr else "Unknown error"
-        logger.error("FFmpeg reframe merge failed: %s", err_msg[-500:])
+        logger.error("FFmpeg reframe merge failed (%s).", "mux error")
+        try:
+            if os.path.exists(output_video):
+                os.remove(output_video)
+        except OSError:
+            pass
         return False
 
-    logger.info("Vertical clip saved: %s", output_video)
+    if not os.path.isfile(output_video) or os.path.getsize(output_video) == 0:
+        logger.error("FFmpeg reframe merge did not produce a non-empty output.")
+        return False
+    output_info = probe_video_info(output_video)
+    actual_duration = probe_duration(output_video)
+    source_info = probe_video_info(input_video)
+    expected_duration = source_info.get("duration") or (total_frames / float(fps or 30.0))
+    duration_tolerance = max(0.75, expected_duration * 0.08)
+    if (
+        not output_info.get("width")
+        or not output_info.get("height")
+        or actual_duration <= 0
+        or abs(actual_duration - expected_duration) > duration_tolerance
+        or (source_info.get("has_audio") and not output_info.get("has_audio"))
+    ):
+        logger.error("Reframed output failed duration/stream verification.")
+        try:
+            os.remove(output_video)
+        except OSError:
+            pass
+        return False
+
+    logger.info("Reframed clip saved and verified: %s", output_video)
     return True

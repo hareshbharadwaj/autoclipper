@@ -1,4 +1,5 @@
 """Multi-shot montage assembly with video and audio crossfades."""
+import math
 import os
 
 from .utils import logger, probe_duration, probe_video_info, run_command
@@ -18,24 +19,32 @@ def stitch_montage(video_paths, output_path, crossfade_seconds=0.25):
     if any(duration <= 0 for duration in durations):
         raise RuntimeError("Could not determine the duration of every montage segment.")
 
-    info = probe_video_info(paths[0])
-    width = int(info.get("width") or 720)
-    height = int(info.get("height") or 1280)
+    infos = [probe_video_info(path) for path in paths]
+    if any(not info.get("width") or not info.get("height") for info in infos):
+        raise RuntimeError("Could not verify video dimensions for every montage segment.")
+    width = int(infos[0].get("width") or 720)
+    height = int(infos[0].get("height") or 1280)
     width += width % 2
     height += height % 2
-    fade = max(0.0, min(float(crossfade_seconds), min(durations) / 4.0))
+    try:
+        requested_fade = float(crossfade_seconds)
+    except (TypeError, ValueError):
+        requested_fade = 0.25
+    if not math.isfinite(requested_fade):
+        requested_fade = 0.25
+    fade = min(max(0.01, requested_fade), min(durations) / 4.0)
     inputs = []
     graph = []
     video_labels = []
     audio_labels = []
 
-    for i, (path, duration) in enumerate(zip(paths, durations)):
+    for i, (path, duration, segment_info) in enumerate(zip(paths, durations, infos)):
         inputs.extend(["-i", path])
         graph.append(
-            f"[{i}:v:0]fps=30,settb=AVTB,setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"[{i}:v:0]setpts=PTS-STARTPTS,fps=30,settb=AVTB,scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v{i}]"
         )
-        if probe_video_info(path).get("has_audio"):
+        if segment_info.get("has_audio"):
             graph.append(
                 f"[{i}:a:0]aresample=44100,aformat=sample_fmts=fltp:"
                 f"channel_layouts=stereo[a{i}]"
@@ -63,22 +72,38 @@ def stitch_montage(video_paths, output_path, crossfade_seconds=0.25):
         elapsed += durations[i]
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    run_command([
-        "ffmpeg", "-y", *inputs,
-        "-filter_complex_threads", "1",
-        "-filter_complex", ";".join(graph),
-        "-map", f"[{v_current}]", "-map", f"[{a_current}]",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
-        output_path,
-    ])
-    if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
-        raise RuntimeError("FFmpeg did not produce a valid montage file.")
-    expected = sum(durations) - fade * (len(paths) - 1)
-    actual = probe_duration(output_path)
-    if actual <= 0 or abs(actual - expected) > max(1.5, expected * 0.08):
-        raise RuntimeError(
-            f"Montage duration check failed (expected about {expected:.2f}s, got {actual:.2f}s)."
-        )
-    logger.info("Montage created: %s (%.2fs, %d segments)", output_path, actual, len(paths))
+    try:
+        run_command([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *inputs,
+            "-filter_complex_threads", "1",
+            "-filter_complex", ";".join(graph),
+            "-map", f"[{v_current}]", "-map", f"[{a_current}]",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
+            output_path,
+        ])
+        if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError("FFmpeg did not produce a valid montage file.")
+        expected = sum(durations) - fade * (len(paths) - 1)
+        actual = probe_duration(output_path)
+        output_info = probe_video_info(output_path)
+        if (
+            actual <= 0
+            or abs(actual - expected) > max(1.5, expected * 0.08)
+            or output_info.get("width") != width
+            or output_info.get("height") != height
+            or not output_info.get("has_audio")
+        ):
+            raise RuntimeError(
+                f"Montage verification failed (expected about {expected:.2f}s, got {actual:.2f}s; "
+                "video/audio stream or dimensions did not match the requested output)."
+            )
+    except Exception:
+        try:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+        except OSError:
+            pass
+        raise
+    logger.info("Montage created and verified: %s (%.2fs, %d segments)", output_path, actual, len(paths))
     return output_path

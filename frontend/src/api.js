@@ -1,5 +1,7 @@
 export const API_URL = import.meta.env.VITE_API_URL || ''
 
+import { normalizeServerSettings, settingsSavePayload } from './utils/settingsStorage.js'
+
 // --- Auth token (client-side session) ----------------------------------
 const TOKEN_KEY = 'ac_token'
 
@@ -49,18 +51,11 @@ export async function register(username, password) {
 export async function fetchSettings() {
   const res = await authFetch(`${API_URL}/api/auth/settings`)
   if (!res.ok) throw new Error('Failed to load settings')
-  return res.json()
+  return normalizeServerSettings(await res.json())
 }
 
 export async function saveSettings(settings) {
-  const payload = {
-    groq_key: settings.groqKey || '',
-    gemini_key: settings.geminiKey || '',
-    youtube_api_key: settings.youtubeApiKey || '',
-    gemini_model: settings.geminiModel || '',
-    whisper_model: settings.whisperModel || '',
-    youtube_cookies: settings.youtubeCookies || '',
-  }
+  const payload = settingsSavePayload(settings)
   const res = await authFetch(`${API_URL}/api/auth/settings`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -72,14 +67,7 @@ export async function saveSettings(settings) {
     throw new Error(detail || 'Failed to save settings')
   }
   const data = await res.json()
-  return {
-    groqKey: data.groq_key || '',
-    geminiKey: data.gemini_key || '',
-    youtubeApiKey: data.youtube_api_key || '',
-    geminiModel: data.gemini_model || '',
-    whisperModel: data.whisper_model || '',
-    youtubeCookies: data.youtube_cookies || '',
-  }
+  return normalizeServerSettings(data)
 }
 
 // Authenticated fetch with the bearer token; 401 triggers logout.
@@ -357,13 +345,14 @@ export async function registerBurn({ name, sourceFile, resultFile }) {
   return res.json()
 }
 
-export async function saveToLibrary({ jobId, filename, title, clipTitle, description, hook }) {
+export async function saveToLibrary({ jobId, filename, srt, title, clipTitle, description, hook }) {
   const res = await fetch(`${API_URL}/api/library/save`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       job_id: jobId,
       filename,
+      srt: srt || undefined,
       title: title || undefined,
       clip_title: clipTitle || undefined,
       description: description || undefined,
@@ -759,7 +748,9 @@ export async function getYoutubeTrending({ region, category, maxResults, windowD
   if (!res.ok) {
     let detail = ''
     try { detail = (await res.json()).detail || '' } catch { /* ignore */ }
-    throw new Error(detail || `YouTube trending failed (${res.status})`)
+    const error = new Error(detail || `YouTube Explore failed (${res.status})`)
+    error.status = res.status
+    throw error
   }
   return res.json()
 }

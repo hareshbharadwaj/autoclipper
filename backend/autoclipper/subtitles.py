@@ -6,9 +6,101 @@ the classic short-form caption look.
 """
 import os
 import subprocess
+import textwrap
 
 from . import config
-from .utils import logger, run_command
+from .utils import logger, probe_video_info, run_command
+
+
+REFERENCE_SHORT_SIDE = 1080
+REFERENCE_FRAME_HEIGHT = 1920
+
+
+def subtitle_layout(width=1080, height=1920, font_size=None, outline_width=4, margin_v=None):
+    """Scale subtitle styling from the 1080x1920 design canvas to a video frame.
+
+    `SUBTITLE_FONT_SIZE`, `font_size`, `outline_width`, and `margin_v` are
+    reference-canvas values, not literal pixels for every output resolution.
+    The short side drives text size so both portrait and landscape footage stay
+    readable without letting captions dominate low-resolution frames.
+    """
+    try:
+        width = max(2, int(width or 1080))
+        height = max(2, int(height or 1920))
+    except (TypeError, ValueError):
+        width, height = 1080, 1920
+
+    short_side = min(width, height)
+    scale = short_side / float(REFERENCE_SHORT_SIDE)
+    requested_size = config.SUBTITLE_FONT_SIZE if font_size is None else font_size
+    try:
+        requested_size = max(1.0, float(requested_size))
+    except (TypeError, ValueError):
+        requested_size = float(config.SUBTITLE_FONT_SIZE)
+    max_size = max(12, int(round(short_side * 0.085)))
+    size = max(12, min(int(round(requested_size * scale)), max_size, int(round(width * 0.12))))
+
+    try:
+        requested_outline = max(1.0, float(outline_width))
+    except (TypeError, ValueError):
+        requested_outline = 4.0
+    outline = max(1, min(int(round(requested_outline * scale)), int(round(size * 0.08)), 6))
+
+    requested_margin = config.SUBTITLE_MARGIN_V if margin_v is None else margin_v
+    try:
+        requested_margin = max(0.0, float(requested_margin))
+    except (TypeError, ValueError):
+        requested_margin = float(config.SUBTITLE_MARGIN_V)
+    scaled_margin = int(round(requested_margin * height / float(REFERENCE_FRAME_HEIGHT)))
+    vertical_safe_margin = int(round(height * 0.05))
+    vertical_max_margin = int(round(height * 0.15))
+    margin = max(vertical_safe_margin, min(scaled_margin, vertical_max_margin))
+
+    side_margin = max(2, int(round(width * 0.06)))
+    available_width = max(size * 6, width - (2 * side_margin))
+    max_chars = max(10, min(32, int(available_width / max(1.0, size * 0.58))))
+    return {
+        "width": width,
+        "height": height,
+        "scale": scale,
+        "font_size": size,
+        "outline_width": outline,
+        "margin_v": margin,
+        "margin_l": side_margin,
+        "margin_r": side_margin,
+        "max_text_width": available_width,
+        "max_chars": max_chars,
+    }
+
+
+def _wrap_caption_text(text, max_chars, line_break="\n"):
+    """Wrap caption text to the safe width, breaking unusually long words too."""
+    width = max(1, int(max_chars or 20))
+    lines = textwrap.wrap(
+        " ".join((text or "").split()),
+        width=width,
+        break_long_words=True,
+        break_on_hyphens=False,
+    )
+    return line_break.join(lines)
+
+
+def _wrap_words(words, max_chars):
+    """Wrap ASS cue words, preserving the order used for karaoke timing."""
+    width = max(1, int(max_chars or 20))
+    lines, line, line_size = [], [], 0
+    for word in words:
+        chunks = textwrap.wrap(str(word), width=width, break_long_words=True, break_on_hyphens=False) or [str(word)]
+        for chunk in chunks:
+            extra = len(chunk) + (1 if line else 0)
+            if line and line_size + extra > width:
+                lines.append(line)
+                line, line_size = [], 0
+            line.append(chunk)
+            line_size += len(chunk) + (1 if len(line) > 1 else 0)
+    if line:
+        lines.append(line)
+    return lines
 
 
 def build_srt(words, start, end, max_chars=20, max_duration=2.0):
@@ -80,7 +172,46 @@ def build_srt(words, start, end, max_chars=20, max_duration=2.0):
 
     lines = []
     for idx, (cue_start, cue_end, cue_text) in enumerate(cues, start=1):
-        lines.append(f"{idx}\n{_fmt(cue_start)} --> {_fmt(cue_end)}\n{cue_text}\n")
+        wrapped_text = _wrap_caption_text(cue_text, max_chars=max_chars)
+        lines.append(f"{idx}\n{_fmt(cue_start)} --> {_fmt(cue_end)}\n{wrapped_text}\n")
+    return "\n".join(lines)
+
+
+def _srt_timestamp(t) -> str:
+    total_ms = max(0, int(round(float(t) * 1000)))
+    h, rem = divmod(total_ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    sec, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
+
+
+def cues_to_srt(cues: list) -> str:
+    """Serialize edited caption cues ({"start","end","text"} in seconds) to SRT.
+
+    Used by the subtitle editor endpoint so an edited clip is saved with an
+    SRT sidecar that matches its burned-in captions — never the stale
+    pre-edit SRT. Invalid or empty cues are skipped; returns "" when no cue
+    is usable.
+    """
+    blocks = []
+    for cue in cues or []:
+        if not isinstance(cue, dict):
+            continue
+        text = str(cue.get("text") or "").strip()
+        try:
+            start = float(cue.get("start"))
+            end = float(cue.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if not text or start < 0 or end <= start:
+            continue
+        blocks.append((start, end, text.replace("\r", " ").replace("\n", " ")))
+
+    if not blocks:
+        return ""
+    lines = []
+    for idx, (start, end, text) in enumerate(blocks, start=1):
+        lines.append(f"{idx}\n{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n{text}\n")
     return "\n".join(lines)
 
 
@@ -97,19 +228,19 @@ def _escape_filter_path(path: str) -> str:
     return name
 
 
-def burn_subtitles(video_path: str, srt_path: str, out_path: str) -> str:
-    """Burn an SRT into a video, returning the output path on success.
-
-    Uses the OpenShorts TikTok style: Arial Black, thick 4px black outline,
-    no shadow, bottom-center alignment."""
+def burn_subtitles(video_path: str, srt_path: str, out_path: str, layout=None) -> str:
+    """Burn an SRT using resolution-aware font, outline, and safe margins."""
+    if layout is None:
+        info = probe_video_info(video_path)
+        layout = subtitle_layout(info.get("width"), info.get("height"))
     style = (
         f"FontName={_map_font(config.SUBTITLE_FONT)},"
-        f"FontSize={config.SUBTITLE_FONT_SIZE},"
+        f"FontSize={layout['font_size']},"
         f"PrimaryColour={config.SUBTITLE_PRIMARY},"
         f"OutlineColour={config.SUBTITLE_OUTLINE},"
         f"BackColour={config.SUBTITLE_BACKGROUND},"
-        f"Bold=1,Outline=4,Shadow=0,Alignment=2,"
-        f"MarginV={config.SUBTITLE_MARGIN_V}"
+        f"Bold=1,Outline={layout['outline_width']},Shadow=0,Alignment=2,WrapStyle=2,"
+        f"MarginL={layout['margin_l']},MarginR={layout['margin_r']},MarginV={layout['margin_v']}"
     )
     vf = f"subtitles={_escape_filter_path(srt_path)}:force_style='{style}'"
     cwd = os.path.dirname(os.path.abspath(video_path))
@@ -127,18 +258,22 @@ def burn_subtitles(video_path: str, srt_path: str, out_path: str) -> str:
     return out_path
 
 
-def add_subtitles(clips, transcript, output_dir, burn=True):
+def add_subtitles(clips, transcript, output_dir, burn=True, preserve_source=False):
     """For each clip, generate and (optionally) burn subtitles.
 
     Updates each clip dict with 'srt' (path) and, when burned, replaces 'file'
-    with the subtitled version and records 'subtitled_file'.
+    with the subtitled version and records 'subtitled_file'. When ``preserve_source``
+    is true, the pre-subtitle render remains available as a safe fallback.
     """
     words = transcript.get("words", [])
     for clip in clips:
         cs, ce = clip.get("start"), clip.get("end")
         if cs is None or ce is None:
             continue
-        srt = build_srt(words, cs, ce)
+        src = os.path.join(output_dir, clip.get("file", ""))
+        info = probe_video_info(src) if os.path.isfile(src) else {}
+        layout = subtitle_layout(info.get("width"), info.get("height"))
+        srt = build_srt(words, cs, ce, max_chars=layout["max_chars"])
         if not srt:
             warning = "No transcript words overlap this clip; captions were not generated."
             clip["subtitle_warning"] = warning
@@ -154,23 +289,31 @@ def add_subtitles(clips, transcript, output_dir, burn=True):
         if not burn:
             continue
 
-        src = os.path.join(output_dir, clip["file"])
-        if not os.path.exists(src):
+        if not os.path.isfile(src):
             clip["subtitle_warning"] = "Clip file was missing; subtitles could not be burned."
             continue
         sub_name = clip["file"].rsplit(".", 1)[0] + "_sub.mp4"
         sub_path = os.path.join(output_dir, sub_name)
         try:
-            burn_subtitles(src, srt_path, sub_path)
+            burn_subtitles(src, srt_path, sub_path, layout=layout)
             if not os.path.isfile(sub_path) or os.path.getsize(sub_path) == 0:
                 raise RuntimeError("FFmpeg returned without creating a non-empty subtitled video.")
             clip["subtitled_file"] = sub_name
-            os.remove(src)
             clip["file"] = sub_name
             clip.pop("subtitle_warning", None)
-        except RuntimeError as e:
+            if not preserve_source:
+                try:
+                    os.remove(src)
+                except OSError:
+                    pass
+        except Exception as e:  # noqa: BLE001
+            try:
+                if os.path.exists(sub_path):
+                    os.remove(sub_path)
+            except OSError:
+                pass
             clip["subtitle_warning"] = f"Captions were generated as SRT but could not be burned in: {e}"
-            logger.error("Failed to burn subtitles for clip %s: %s", clip.get("index"), e)
+            logger.error("Failed to burn subtitles for clip %s (%s).", clip.get("index"), type(e).__name__)
     return clips
 
 
@@ -212,7 +355,7 @@ def _map_font(name: str) -> str:
     return aliases.get(n, name or config.SUBTITLE_FONT)
 
 
-def build_ass(cues: list, style: dict) -> str:
+def build_ass(cues: list, style: dict, video_width=1080, video_height=1920) -> str:
     """Build an ASS subtitle string from edited cues + styling options.
 
     `cues` is a list of {"start", "end", "text"} (seconds, relative to clip).
@@ -223,14 +366,23 @@ def build_ass(cues: list, style: dict) -> str:
     with `highlight_color` (the classic short-form caption effect).
     Maps to OpenShorts animation styles: karaoke/glow → highlight, none → no highlight, pop → highlight.
     """
+    style = style or {}
     font = _map_font(style.get("font", config.SUBTITLE_FONT))
-    size = int(style.get("font_size", config.SUBTITLE_FONT_SIZE))
-    # OpenShorts font size scaling factor: 0.85
-    size = max(10, int(size * 0.85))
+    layout = subtitle_layout(
+        video_width,
+        video_height,
+        font_size=style.get("font_size", config.SUBTITLE_FONT_SIZE),
+        outline_width=style.get("border_width", 2),
+        margin_v=style.get("margin_v", config.SUBTITLE_MARGIN_V),
+    )
+    # Keep the editor's existing 0.85 visual scale, then derive wrapping from
+    # the actual output frame and scaled font rather than a fixed 1080x1920 canvas.
+    size = max(10, int(round(layout["font_size"] * 0.85)))
     primary = hex_to_ass(style.get("text_color", "#FFFFFF"))
     outline = hex_to_ass(style.get("outline_color", "#000000"))
     highlight = hex_to_ass(style.get("highlight_color", "#FFFF00"))
-    margin_v = int(style.get("margin_v", config.SUBTITLE_MARGIN_V))
+    margin_v = layout["margin_v"]
+    max_chars = max(10, min(32, int(layout["max_text_width"] / max(1.0, size * 0.58))))
     position = (style.get("position", "bottom") or "bottom").lower()
     use_box = bool(style.get("box", False))
     animation = (style.get("animation", "karaoke") or "karaoke").lower()
@@ -243,7 +395,7 @@ def build_ass(cues: list, style: dict) -> str:
 
     # OpenShorts-style: BorderStyle 3 for box, BorderStyle 1 for outline with variable width
     border_style = 3 if use_box else 1
-    outline_width = int(style.get("border_width", 2)) if not use_box else 1
+    outline_width = 1 if use_box else layout["outline_width"]
     shadow = 0
     # Alignment: 1=top-left, 2=bottom-center, 5=middle-center, etc. We use the
     # center variants: top=6, middle=10, bottom=2 (horizontal center).
@@ -254,8 +406,8 @@ def build_ass(cues: list, style: dict) -> str:
     header = [
         "[Script Info]",
         "ScriptType: v4.00+",
-        "PlayResX: 1080",
-        "PlayResY: 1920",
+        f"PlayResX: {layout['width']}",
+        f"PlayResY: {layout['height']}",
         "WrapStyle: 2",
         "ScaledBorderAndShadow: yes",
         "",
@@ -265,7 +417,8 @@ def build_ass(cues: list, style: dict) -> str:
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV",
         f"Style: Default,{font},{size},{primary},{secondary},{outline},{back},"
-        f"-1,0,0,0,100,100,0,0,{border_style},{outline_width},{shadow},{alignment},10,10,{margin_v}",
+        f"-1,0,0,0,100,100,0,0,{border_style},{outline_width},{shadow},{alignment},"
+        f"{layout['margin_l']},{layout['margin_r']},{margin_v}",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
@@ -280,12 +433,16 @@ def build_ass(cues: list, style: dict) -> str:
         start = float(cue.get("start", 0.0))
         end = float(cue.get("end", start + 1.0))
         words = text.split()
-        n = len(words)
-        if use_highlight and n > 0:
-            dur = max(1, int(round((end - start) * 100 / n)))
-            line = "".join(f"{{\\k{dur}}}{w} " for w in words).strip()
+        wrapped_words = _wrap_words(words, max_chars)
+        wrapped_count = sum(len(line_words) for line_words in wrapped_words)
+        if use_highlight and wrapped_count > 0:
+            dur = max(1, int(round((end - start) * 100 / wrapped_count)))
+            line = "\\N".join(
+                "".join(f"{{\\k{dur}}}{word} " for word in line_words).strip()
+                for line_words in wrapped_words
+            )
         else:
-            line = text
+            line = "\\N".join(" ".join(line_words) for line_words in wrapped_words)
         events.append(
             f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,{line}"
         )
