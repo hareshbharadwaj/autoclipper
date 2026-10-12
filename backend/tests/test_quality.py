@@ -11,7 +11,9 @@ from autoclipper.analyze import (
     _resolve_clip_bounds, _validate_clips, _validate_report,
     analyze_video_summary_and_angles, find_viral_clips,
 )
-from autoclipper.subtitles import _ass_time, build_srt, hex_to_ass
+from autoclipper.subtitles import (
+    _ass_time, build_ass, build_srt, hex_to_ass, subtitle_layout,
+)
 
 
 def test_transcript_lines_keep_timestamps_and_skip_empty_segments():
@@ -156,7 +158,50 @@ def test_build_srt_returns_empty_when_no_words_overlap():
     assert build_srt([{"word": "outside", "start": 0, "end": 1}], 2, 5) == ""
 
 
-def test_ffmpeg_can_burn_captions_into_a_synthetic_clip(tmp_path):
+def test_srt_wraps_long_words_to_the_safe_caption_width():
+    srt = build_srt(
+        [{"word": "supercalifragilisticexpialidocious", "start": 0, "end": 1}],
+        0,
+        1,
+        max_chars=10,
+    )
+    caption = srt.splitlines()[2:]
+    assert caption
+    assert all(len(line) <= 10 for line in caption if line)
+
+
+def test_subtitle_layout_scales_for_portrait_square_and_landscape():
+    portrait = subtitle_layout(540, 960)
+    square = subtitle_layout(1080, 1080)
+    landscape = subtitle_layout(1920, 1080)
+
+    assert portrait["font_size"] == 40
+    assert portrait["outline_width"] == 2
+    assert portrait["margin_v"] == 60
+    assert portrait["max_chars"] < landscape["max_chars"]
+    assert square["font_size"] == landscape["font_size"] == 80
+    assert landscape["margin_v"] <= round(1080 * 0.15)
+    assert landscape["margin_l"] == round(1920 * 0.06)
+
+
+def test_ass_uses_the_actual_resolution_scaled_style_and_wraps_long_text():
+    ass = build_ass(
+        [{"start": 0, "end": 1, "text": "supercalifragilisticexpialidocious word"}],
+        {"font_size": 80, "border_width": 4, "margin_v": 120},
+        video_width=540,
+        video_height=960,
+    )
+    assert "PlayResX: 540" in ass
+    assert "PlayResY: 960" in ass
+    assert "Style: Default,Liberation Sans,34," in ass
+    assert "\\N" in ass
+
+
+@pytest.mark.parametrize("size,expected_dimensions", [
+    ("320x180", (320, 180)),
+    ("180x320", (180, 320)),
+])
+def test_ffmpeg_can_burn_captions_into_a_synthetic_clip(tmp_path, size, expected_dimensions):
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         pytest.skip("FFmpeg is not installed in this environment")
@@ -167,7 +212,7 @@ def test_ffmpeg_can_burn_captions_into_a_synthetic_clip(tmp_path):
     subprocess.run(
         [
             ffmpeg, "-y",
-            "-f", "lavfi", "-i", "color=c=black:s=320x240:r=25:d=2",
+            "-f", "lavfi", "-i", f"color=c=black:s={size}:r=25:d=2",
             "-f", "lavfi", "-i", "sine=frequency=1000:duration=2",
             "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
             "-c:a", "aac", str(source),
@@ -179,10 +224,13 @@ def test_ffmpeg_can_burn_captions_into_a_synthetic_clip(tmp_path):
         encoding="utf-8",
     )
     from autoclipper.subtitles import burn_subtitles
+    from autoclipper.utils import probe_video_info
 
     burn_subtitles(str(source), str(srt_path), str(output))
     assert output.is_file()
     assert output.stat().st_size > 0
+    info = probe_video_info(str(output))
+    assert (info["width"], info["height"]) == expected_dimensions
     probe = subprocess.run(
         [
             shutil.which("ffprobe") or "ffprobe", "-v", "error",
@@ -214,6 +262,8 @@ def test_hex_to_ass_converts_rgb_to_bgr():
 def test_analysis_report_sanitizes_chapters_and_angle_hints():
     report = _validate_report(
         {
+            "content_type": "gaming",
+            "content_type_reason": "A player streams live gameplay with commentary.",
             "summary": "A concise summary.",
             "chapters": [
                 {"start": 0, "end": 20, "label": "Intro"},
@@ -231,6 +281,8 @@ def test_analysis_report_sanitizes_chapters_and_angle_hints():
         },
         duration=50,
     )
+    assert report["content_type"] == "gaming"
+    assert report["content_type_reason"] == "A player streams live gameplay with commentary."
     assert report["summary"] == "A concise summary."
     assert len(report["chapters"]) == 2
     assert report["chapters"][-1]["end"] == 45
@@ -240,6 +292,15 @@ def test_analysis_report_sanitizes_chapters_and_angle_hints():
     assert report["suggested_angles"][0]["end_hint"] is None
 
 
+def test_analysis_report_falls_back_to_general_for_unknown_content_type():
+    report = _validate_report(
+        {"content_type": "not-a-supported-type", "content_type_reason": 42},
+        duration=0,
+    )
+    assert report["content_type"] == "general"
+    assert report["content_type_reason"] == ""
+
+
 def test_whole_video_analysis_keeps_summary_chapters_topics_and_angles():
     import json
 
@@ -247,6 +308,8 @@ def test_whole_video_analysis_keeps_summary_chapters_topics_and_angles():
     fake_google.genai = types.SimpleNamespace(Client=Mock(return_value=object()))
     response = types.SimpleNamespace(
         text=json.dumps({
+            "content_type": "tutorial",
+            "content_type_reason": "The speaker demonstrates and explains a technique.",
             "summary": "The video teaches one specific technique.",
             "chapters": [{"start": 0, "end": 20, "label": "Setup"}],
             "key_topics": ["specific grip"],
@@ -269,6 +332,8 @@ def test_whole_video_analysis_keeps_summary_chapters_topics_and_angles():
         report = analyze_video_summary_and_angles(
             transcript, api_key="test-key", video_info={"duration": 20, "width": 1920, "height": 1080}
         )
+    assert report["content_type"] == "tutorial"
+    assert report["content_type_reason"] == "The speaker demonstrates and explains a technique."
     assert report["summary"] == "The video teaches one specific technique."
     assert report["chapters"][0]["label"] == "Setup"
     assert report["key_topics"] == ["specific grip"]

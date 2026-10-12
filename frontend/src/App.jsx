@@ -4,10 +4,13 @@ import { submitJob, getStatus, isLoggedIn, setToken, fetchSettings } from './api
 import SubmitForm from './components/SubmitForm.jsx'
 import LogConsole from './components/LogConsole.jsx'
 import ClipGrid from './components/ClipGrid.jsx'
+import JobProgress from './components/JobProgress.jsx'
 import Library from './components/Library.jsx'
 import SettingsPage from './components/SettingsPage.jsx'
 import TrendingPage from './components/TrendingPage.jsx'
 import AuthPage from './components/AuthPage.jsx'
+import { withClipCountOption } from './utils/clipCount.js'
+import { mergeSafeSettings, settingsForLocalStorage } from './utils/settingsStorage.js'
 
 const DEFAULT_SETTINGS = {
   groqKey: '',
@@ -27,9 +30,12 @@ const DEFAULT_SETTINGS = {
 
 function loadSettings() {
   try {
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem('ac_settings') || '{}') }
+    const saved = JSON.parse(localStorage.getItem('ac_settings') || '{}')
+    // API credentials are loaded from the authenticated server settings endpoint,
+    // never from browser localStorage (including values saved by older versions).
+    return mergeSafeSettings(DEFAULT_SETTINGS, saved)
   } catch {
-    return DEFAULT_SETTINGS
+    return mergeSafeSettings(DEFAULT_SETTINGS, {})
   }
 }
 
@@ -61,7 +67,9 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    localStorage.setItem('ac_settings', JSON.stringify(settings))
+    // Persist only non-secret UI preferences. Provider credentials stay in the
+    // encrypted server-side account store and in React memory while signed in.
+    localStorage.setItem('ac_settings', JSON.stringify(settingsForLocalStorage(settings)))
   }, [settings])
 
   useEffect(() => () => clearInterval(pollRef.current), [])
@@ -103,7 +111,7 @@ export default function App() {
     }
     // Clip generation params come from the Clip Generator form (payload),
     // falling back to saved settings if the form didn't send them.
-    if (payload.clipCount) opts.clip_count = payload.clipCount
+    Object.assign(opts, withClipCountOption(opts, payload.clipCount))
     if (payload.minClip) opts.min_clip = payload.minClip
     if (payload.maxClip) opts.max_clip = payload.maxClip
     if (payload.targetDuration) opts.target_duration = payload.targetDuration
@@ -251,6 +259,7 @@ export default function App() {
                       {job.error}
                     </div>
                   )}
+                  <JobProgress job={job} />
                   {job?.result?.processing_warnings?.length > 0 && (
                     <div className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-200 px-4 py-3 text-sm">
                       <div className="font-semibold mb-1">Processing warnings</div>

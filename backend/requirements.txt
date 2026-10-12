@@ -1,4 +1,4 @@
-yt-dlp
+yt-dlp[curl-cffi]>=2026.8.19
 httpx==0.28.1
 google-genai==1.75.0
 python-dotenv==1.2.2

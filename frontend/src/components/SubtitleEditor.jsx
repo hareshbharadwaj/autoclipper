@@ -51,6 +51,28 @@ const DEFAULT_STYLE = {
   animation: 'karaoke',
 }
 
+function wrapCaptionWords(words, maxChars) {
+  const lines = []
+  let line = []
+  let lineLength = 0
+  words.forEach((word, index) => {
+    const chars = Array.from(word)
+    for (let offset = 0; offset < chars.length; offset += maxChars) {
+      const text = chars.slice(offset, offset + maxChars).join('')
+      const extra = text.length + (line.length ? 1 : 0)
+      if (line.length && lineLength + extra > maxChars) {
+        lines.push(line)
+        line = []
+        lineLength = 0
+      }
+      line.push({ text, index })
+      lineLength += text.length + (line.length > 1 ? 1 : 0)
+    }
+  })
+  if (line.length) lines.push(line)
+  return lines
+}
+
 export default function SubtitleEditor({ jobId, clip, onApply, onClose, srtUrl, name }) {
   const [cues, setCues] = useState([])
   const [style, setStyle] = useState(DEFAULT_STYLE)
@@ -58,6 +80,7 @@ export default function SubtitleEditor({ jobId, clip, onApply, onClose, srtUrl, 
   const [error, setError] = useState('')
   const [loaded, setLoaded] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
+  const [videoSize, setVideoSize] = useState({ width: 1080, height: 1920 })
 
   useEffect(() => {
     const url = srtUrl || (clip.srt ? getSrt(jobId, clip.srt) : null)
@@ -158,19 +181,26 @@ export default function SubtitleEditor({ jobId, clip, onApply, onClose, srtUrl, 
         </button>
 
         {/* Left: clip player with live subtitle overlay */}
-        <div className="flex-1 flex flex-col items-center justify-center bg-black rounded-l-2xl border-r border-white/5 overflow-hidden relative aspect-[9/16] max-h-[600px]">
+        <div
+          className="flex-1 flex flex-col items-center justify-center bg-black rounded-l-2xl border-r border-white/5 overflow-hidden relative max-h-[600px]"
+          style={{ aspectRatio: `${videoSize.width} / ${videoSize.height}` }}
+        >
           <div className="relative w-full h-full">
             <video
               src={name ? libraryFileUrl(name, clip.file) : fileUrl(jobId, clip.file)}
               controls
               playsInline
+              onLoadedMetadata={(e) => {
+                const { videoWidth, videoHeight } = e.currentTarget
+                if (videoWidth > 0 && videoHeight > 0) setVideoSize({ width: videoWidth, height: videoHeight })
+              }}
               onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
               className="w-full h-full object-contain"
             />
-            {/* SVG overlay — mirrors the ASS burn exactly (stroke = outline) */}
+            {/* SVG overlay scales with the loaded clip's actual aspect ratio. */}
             <svg
               className="pointer-events-none absolute inset-0 w-full h-full"
-              viewBox="0 0 1080 1920"
+              viewBox={`0 0 ${videoSize.width} ${videoSize.height}`}
               preserveAspectRatio="xMidYMid meet"
             >
                 {(() => {
@@ -179,24 +209,37 @@ export default function SubtitleEditor({ jobId, clip, onApply, onClose, srtUrl, 
                   )
                  if (!active) return null
                  const useHighlight = (style.animation || 'karaoke') !== 'none'
-                 const outline = style.box ? 1 : Math.max(1, style.border_width || 2)
+                 const scale = Math.min(videoSize.width, videoSize.height) / 1080
+                 const fontSize = Math.max(10, Math.round(style.font_size * scale * 0.85))
+                 const outline = style.box ? 1 : Math.max(1, Math.round((style.border_width || 2) * scale))
                  const words = active.text.split(/\s+/).filter(Boolean)
+                 const sideMargin = Math.round(videoSize.width * 0.06)
+                 const maxChars = Math.max(10, Math.min(
+                   32,
+                   Math.floor((videoSize.width - 2 * sideMargin) / Math.max(1, fontSize * 0.58))
+                 ))
+                 const wrappedLines = wrapCaptionWords(words, maxChars)
                  const span = Math.max(0.001, active.end - active.start)
                  const progress = Math.min(1, Math.max(0, (currentTime - active.start) / span))
                  const doneCount = useHighlight
                    ? Math.floor(progress * words.length + 0.0001)
                    : words.length
-                const pos = (style.position || 'bottom').toLowerCase()
-                const baseline =
-                  pos === 'top' ? 'hanging' : pos === 'middle' ? 'middle' : 'alphabetic'
-                const y =
-                  pos === 'top'
-                    ? style.margin_v
-                    : pos === 'middle'
-                    ? 960
-                    : 1920 - style.margin_v
-                const fontSize = style.font_size
-                const fontWeight = 800
+                 const requestedMargin = Math.round(style.margin_v * videoSize.height / 1920)
+                 const marginV = Math.max(
+                   Math.round(videoSize.height * 0.05),
+                   Math.min(requestedMargin, Math.round(videoSize.height * 0.15))
+                 )
+                 const pos = (style.position || 'bottom').toLowerCase()
+                 const baseline = pos === 'top' ? 'hanging' : pos === 'middle' ? 'middle' : 'alphabetic'
+                 const lineHeight = fontSize * 1.1
+                 const centerX = videoSize.width / 2
+                 const lastLineOffset = Math.max(0, wrappedLines.length - 1) * lineHeight
+                 const y = pos === 'top'
+                   ? marginV
+                   : pos === 'middle'
+                   ? videoSize.height / 2 - lastLineOffset / 2
+                   : videoSize.height - marginV - lastLineOffset
+                 const fontWeight = 800
 
                 return (
                   <g
@@ -206,31 +249,41 @@ export default function SubtitleEditor({ jobId, clip, onApply, onClose, srtUrl, 
                     textAnchor="middle"
                     dominantBaseline={baseline}
                   >
-                     {style.box && (
-                       <text
-                         x="540"
-                         y={y}
-                         fill={style.box_color}
-                         fillOpacity={style.box_opacity / 100}
-                         stroke="none"
-                         style={{ paintOrder: 'stroke', stroke: style.box_color, strokeWidth: outline * 2 + fontSize * 0.3 }}
-                       >
-                         {active.text}
-                       </text>
-                     )}
-                     <text
-                       x="540"
-                       y={y}
-                       fill={style.text_color}
-                       stroke={style.outline_color}
-                       strokeWidth={outline * 3}
-                       strokeLinejoin="round"
-                       paintOrder="stroke"
-                     >
-                      {words.map((w, i) => (
-                        <tspan key={i} fill={i < doneCount ? style.highlight_color : style.text_color} stroke="none">
-                          {w}
-                          {i < words.length - 1 ? ' ' : ''}
+                    {style.box && wrappedLines.map((lineWords, lineIndex) => (
+                      <text
+                        key={`box-${lineIndex}`}
+                        x={centerX}
+                        y={y + lineIndex * lineHeight}
+                        fill={style.box_color}
+                        fillOpacity={style.box_opacity / 100}
+                        stroke="none"
+                        style={{ paintOrder: 'stroke', stroke: style.box_color, strokeWidth: outline * 2 + fontSize * 0.3 }}
+                      >
+                        {lineWords.map((word, wordIndex) => (
+                          <tspan key={`${word.index}-${wordIndex}`}>{word.text}{wordIndex < lineWords.length - 1 ? ' ' : ''}</tspan>
+                        ))}
+                      </text>
+                    ))}
+                    <text
+                      x={centerX}
+                      y={y}
+                      fill={style.text_color}
+                      stroke={style.outline_color}
+                      strokeWidth={outline * 3}
+                      strokeLinejoin="round"
+                      paintOrder="stroke"
+                    >
+                      {wrappedLines.map((lineWords, lineIndex) => (
+                        <tspan key={`line-${lineIndex}`} x={centerX} y={y + lineIndex * lineHeight}>
+                          {lineWords.map((word, wordIndex) => (
+                            <tspan
+                              key={`${word.index}-${wordIndex}`}
+                              fill={word.index < doneCount ? style.highlight_color : style.text_color}
+                              stroke="none"
+                            >
+                              {word.text}{wordIndex < lineWords.length - 1 ? ' ' : ''}
+                            </tspan>
+                          ))}
                         </tspan>
                       ))}
                     </text>

@@ -75,7 +75,9 @@ export default function TrendingPage({ settings }) {
         setError('Tidak ada video ditemukan untuk kategori/region ini. Coba ganti Region atau pilih "Explore".')
       }
     } catch (e) {
-      setError(e.message || 'Gagal memuat Explore.')
+      setError(e.status === 500
+        ? 'Explore service returned an internal error. Check the backend logs and server configuration, then retry.'
+        : (e.message || 'Gagal memuat Explore.'))
       setVideos([])
     } finally {
       clearTimeout(timer)
@@ -182,11 +184,11 @@ export default function TrendingPage({ settings }) {
           <p className="text-xs text-zinc-500 mt-4">
             Using your YouTube Data API key from Settings. Gemini enriches each video with a clip idea.
           </p>
-        ) : (
+        ) : !error ? (
           <p className="text-xs text-amber-400/80 mt-4">
-            Add a YouTube Data API Key in Settings to load real Explore videos.
+            No account key is saved; Explore can still use a server-level YOUTUBE_API_KEY.
           </p>
-        )}
+        ) : null}
       </div>
 
       {error && (
