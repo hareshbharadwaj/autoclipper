@@ -1,12 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
-import { LayoutDashboard, FolderOpen, Scissors, Settings as SettingsIcon, Flame, LogOut } from 'lucide-react'
+import { LayoutDashboard, FolderOpen, Scissors, Flame, LogOut } from 'lucide-react'
 import { submitJob, getStatus, isLoggedIn, setToken, fetchSettings } from './api.js'
 import SubmitForm from './components/SubmitForm.jsx'
 import LogConsole from './components/LogConsole.jsx'
 import ClipGrid from './components/ClipGrid.jsx'
 import JobProgress from './components/JobProgress.jsx'
 import Library from './components/Library.jsx'
-import SettingsPage from './components/SettingsPage.jsx'
 import TrendingPage from './components/TrendingPage.jsx'
 import AuthPage from './components/AuthPage.jsx'
 import { withClipCountOption } from './utils/clipCount.js'
@@ -225,17 +224,11 @@ export default function App() {
           </SidebarButton>
         </nav>
 
-        <div className="px-4 pb-4">
-          <SidebarButton
-            active={tab === 'settings'}
-            onClick={() => setTab('settings')}
-            icon={SettingsIcon}
-          >
-            Settings
-          </SidebarButton>
-        </div>
-
         <div className="p-4 border-t border-white/5">
+          <div className="flex items-center gap-2 mb-3 px-2 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-xs text-emerald-400 font-medium">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+            <span className="hidden lg:inline">API Keys Connected (.env)</span>
+          </div>
           <button
             onClick={handleLogout}
             className="w-full flex items-center gap-3 px-3 py-3 rounded-xl text-zinc-400 hover:text-white hover:bg-white/5 transition-colors"
@@ -297,10 +290,8 @@ export default function App() {
             </>
            ) : tab === 'library' ? (
             <Library />
-          ) : tab === 'trending' ? (
-            <TrendingPage settings={settings} />
           ) : (
-            <SettingsPage settings={settings} setSettings={setSettings} />
+            <TrendingPage settings={settings} />
           )}
         </div>
       </main>

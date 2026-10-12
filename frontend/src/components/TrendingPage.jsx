@@ -180,15 +180,9 @@ export default function TrendingPage({ settings }) {
           </div>
         </div>
 
-        {settings?.youtubeApiKey ? (
-          <p className="text-xs text-zinc-500 mt-4">
-            Using your YouTube Data API key from Settings. Gemini enriches each video with a clip idea.
-          </p>
-        ) : !error ? (
-          <p className="text-xs text-amber-400/80 mt-4">
-            No account key is saved; Explore can still use a server-level YOUTUBE_API_KEY.
-          </p>
-        ) : null}
+        <p className="text-xs text-zinc-500 mt-4">
+          Connected to YouTube Data API & Gemini directly via environment configuration.
+        </p>
       </div>
 
       {error && (

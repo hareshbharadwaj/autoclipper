@@ -4,11 +4,17 @@ import time
 
 from dotenv import load_dotenv
 
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_backend_dir = os.path.dirname(_this_dir)
+_root_dir = os.path.dirname(_backend_dir)
+load_dotenv(os.path.join(_root_dir, ".env"))
+load_dotenv(os.path.join(_backend_dir, ".env"))
 load_dotenv()
 
 # --- API keys ---
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 
 # --- Models ---
 GROQ_WHISPER_MODEL = os.environ.get("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")

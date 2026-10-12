@@ -429,10 +429,10 @@ async def process(
     # Per-user keys take precedence; fall back to the server's .env keys.
     from autoclipper.db import decrypt_value
 
-    if not groq_key:
-        groq_key = decrypt_value(current.groq_key) or config.GROQ_API_KEY
-    if not gemini_key:
-        gemini_key = decrypt_value(current.gemini_key) or config.GEMINI_API_KEY
+    if not groq_key or not str(groq_key).strip():
+        groq_key = config.GROQ_API_KEY or decrypt_value(current.groq_key)
+    if not gemini_key or not str(gemini_key).strip():
+        gemini_key = config.GEMINI_API_KEY or decrypt_value(current.gemini_key)
     if not whisper_model and current.whisper_model:
         whisper_model = current.whisper_model
     if not gemini_model and current.gemini_model:
@@ -600,10 +600,10 @@ async def analyze_video(
 
     from autoclipper.db import decrypt_value
 
-    if not groq_key:
-        groq_key = decrypt_value(current.groq_key) or config.GROQ_API_KEY
-    if not gemini_key:
-        gemini_key = decrypt_value(current.gemini_key) or config.GEMINI_API_KEY
+    if not groq_key or not str(groq_key).strip():
+        groq_key = config.GROQ_API_KEY or decrypt_value(current.groq_key)
+    if not gemini_key or not str(gemini_key).strip():
+        gemini_key = config.GEMINI_API_KEY or decrypt_value(current.gemini_key)
     if not whisper_model and current.whisper_model:
         whisper_model = current.whisper_model
     if not gemini_model and current.gemini_model:
