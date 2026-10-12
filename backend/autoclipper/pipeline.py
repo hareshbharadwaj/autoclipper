@@ -130,6 +130,29 @@ def _subtitle_repair_needed(qa):
     )
 
 
+def _rank_montage_candidates(candidates):
+    """Order user-selected montage moments chronologically without de-duplication.
+
+    `_fit_montage_candidates` already guarantees 2-3 distinct, non-overlapping,
+    transcript-aligned shots, so every candidate is retained and ranked; only
+    the internal selection marker is normalized away like the ranking pass does.
+    """
+    ordered = []
+    for item in candidates or []:
+        try:
+            start = float(item.get("start", 0.0))
+        except (TypeError, ValueError):
+            start = 0.0
+        ordered.append((start, dict(item)))
+    ordered.sort(key=lambda pair: pair[0])
+    ranked = []
+    for index, (_, item) in enumerate(ordered):
+        item["candidate_rank"] = index + 1
+        item.pop("_user_selected", None)
+        ranked.append(item)
+    return ranked
+
+
 def _repair_subtitle_failure(clip, transcript, output_dir, qa, qa_args, fallbacks, processing_warnings):
     """Try once to still deliver the requested captions before falling back/failing.
 
@@ -593,7 +616,13 @@ def run(
         candidate_count=len(candidate_pool),
         candidate_review=candidate_review,
     )
-    clip_candidates = rank_and_diversify_candidates(candidate_pool, requested_individual_count)
+    if montage:
+        # Every fitted montage moment is a required user selection; text-similarity
+        # de-duplication must never drop one (two selected angles with similar
+        # titles/hooks would otherwise lose a shot and the montage would fail).
+        clip_candidates = _rank_montage_candidates(candidate_pool)
+    else:
+        clip_candidates = rank_and_diversify_candidates(candidate_pool, requested_individual_count)
     logger.info(
         "Clip params -> requested count=%s min=%s max=%s | reviewed pool=%d | selected %d candidate(s)",
         requested_individual_count, min_clip, max_clip, len(candidate_pool), len(clip_candidates),

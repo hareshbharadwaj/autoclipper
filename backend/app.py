@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 from autoclipper import config, pipeline
 from autoclipper.trending import get_trending_ideas
 from autoclipper.trending_youtube import fetch_trending, enrich_trending, CATEGORY_MAP
-from autoclipper.subtitles import build_ass, burn_ass
+from autoclipper.subtitles import build_ass, burn_ass, cues_to_srt
 from autoclipper.hooks import add_hook_to_video
 from autoclipper import voiceover as voiceover_mod
 from autoclipper.youtube_uploader import (
@@ -1066,10 +1066,26 @@ async def subtitle(req: SubtitleRequest):
             )
         )
 
+    # Keep an SRT sidecar that matches the EDITED captions, named after the
+    # edited video so job/library name-derived lookups stay in sync. Without
+    # this, saving an edited clip would carry the stale pre-edit SRT and the
+    # library could re-burn outdated text over the edited video.
+    edited_srt_name = f"{base}_edited.srt"
+    srt_text = cues_to_srt(req.cues)
+
     try:
         burn_ass(video, ass_path, out_path)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=f"Burn failed: {e}")
+
+    if srt_text:
+        try:
+            with open(os.path.join(output_dir, edited_srt_name), "w", encoding="utf-8") as f:
+                f.write(srt_text)
+        except OSError:
+            edited_srt_name = None
+    else:
+        edited_srt_name = None
 
     # Save to library manifest if name is provided (same pattern as /api/enhance)
     if req.name:
@@ -1095,6 +1111,11 @@ async def subtitle(req: SubtitleRequest):
                 edited_entry = dict(orig_entry)
                 edited_entry["file"] = out_name
                 edited_entry["subtitled"] = True
+                # Track the edited sidecar (or drop the stale pre-edit one).
+                if edited_srt_name:
+                    edited_entry["srt"] = edited_srt_name
+                else:
+                    edited_entry.pop("srt", None)
                 found = False
                 for i, c in enumerate(manifest.get("clips", [])):
                     if c.get("file") == out_name:
@@ -1105,7 +1126,7 @@ async def subtitle(req: SubtitleRequest):
                     manifest.setdefault("clips", []).append(edited_entry)
                 write_json(manifest_path, manifest)
 
-    return {"filename": out_name}
+    return {"filename": out_name, "srt": edited_srt_name}
 
 
 class HookRequest(BaseModel):

@@ -27,6 +27,24 @@ export function settingsForLocalStorage(settings) {
 }
 
 /**
+ * Build the PUT /api/auth/settings payload. Blank secret fields are OMITTED
+ * (never sent as empty strings): an untouched blank form after login must not
+ * erase the account's stored credentials on the server.
+ */
+export function settingsSavePayload(settings) {
+  const s = settings || {}
+  const payload = {
+    gemini_model: s.geminiModel || '',
+    whisper_model: s.whisperModel || '',
+  }
+  if ((s.groqKey || '').trim()) payload.groq_key = s.groqKey.trim()
+  if ((s.geminiKey || '').trim()) payload.gemini_key = s.geminiKey.trim()
+  if ((s.youtubeApiKey || '').trim()) payload.youtube_api_key = s.youtubeApiKey.trim()
+  if ((s.youtubeCookies || '').trim()) payload.youtube_cookies = s.youtubeCookies.trim()
+  return payload
+}
+
+/**
  * Normalize the server settings response (snake_case) into the camelCase
  * shape the UI uses. Also surfaces `undecryptableFields`: credentials stored
  * under a previous encryption key that the user must save again.

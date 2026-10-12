@@ -129,3 +129,22 @@ def test_init_db_reports_encryption_status_on_startup(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "report_encryption_status", lambda: calls.append(True) or {})
     db.init_db()
     assert calls == [True]
+
+
+def test_apply_settings_blank_secrets_never_erase_stored_credentials():
+    """An untouched blank form must not wipe encrypted credentials on save."""
+    user = db.User(username="blank-save", password_hash="x")
+    user.groq_key = db.encrypt_value("gsk_saved")
+    user.youtube_cookies = db.encrypt_value("cookies_saved")
+
+    db.apply_settings(user, db.UserSettingsUpdate(
+        groq_key="", gemini_key="   ", youtube_api_key="", youtube_cookies="",
+    ))
+    assert db.decrypt_value(user.groq_key) == "gsk_saved"
+    assert db.decrypt_value(user.youtube_cookies) == "cookies_saved"
+    assert user.gemini_key is None
+    assert user.youtube_api_key is None
+
+    # A real submission still updates (and trims) the stored secret.
+    db.apply_settings(user, db.UserSettingsUpdate(groq_key="  gsk_new  "))
+    assert db.decrypt_value(user.groq_key) == "gsk_new"

@@ -1,6 +1,6 @@
 export const API_URL = import.meta.env.VITE_API_URL || ''
 
-import { normalizeServerSettings } from './utils/settingsStorage.js'
+import { normalizeServerSettings, settingsSavePayload } from './utils/settingsStorage.js'
 
 // --- Auth token (client-side session) ----------------------------------
 const TOKEN_KEY = 'ac_token'
@@ -55,14 +55,7 @@ export async function fetchSettings() {
 }
 
 export async function saveSettings(settings) {
-  const payload = {
-    groq_key: settings.groqKey || '',
-    gemini_key: settings.geminiKey || '',
-    youtube_api_key: settings.youtubeApiKey || '',
-    gemini_model: settings.geminiModel || '',
-    whisper_model: settings.whisperModel || '',
-    youtube_cookies: settings.youtubeCookies || '',
-  }
+  const payload = settingsSavePayload(settings)
   const res = await authFetch(`${API_URL}/api/auth/settings`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },

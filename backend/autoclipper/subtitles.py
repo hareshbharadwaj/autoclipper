@@ -177,6 +177,44 @@ def build_srt(words, start, end, max_chars=20, max_duration=2.0):
     return "\n".join(lines)
 
 
+def _srt_timestamp(t) -> str:
+    total_ms = max(0, int(round(float(t) * 1000)))
+    h, rem = divmod(total_ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    sec, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
+
+
+def cues_to_srt(cues: list) -> str:
+    """Serialize edited caption cues ({"start","end","text"} in seconds) to SRT.
+
+    Used by the subtitle editor endpoint so an edited clip is saved with an
+    SRT sidecar that matches its burned-in captions — never the stale
+    pre-edit SRT. Invalid or empty cues are skipped; returns "" when no cue
+    is usable.
+    """
+    blocks = []
+    for cue in cues or []:
+        if not isinstance(cue, dict):
+            continue
+        text = str(cue.get("text") or "").strip()
+        try:
+            start = float(cue.get("start"))
+            end = float(cue.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if not text or start < 0 or end <= start:
+            continue
+        blocks.append((start, end, text.replace("\r", " ").replace("\n", " ")))
+
+    if not blocks:
+        return ""
+    lines = []
+    for idx, (start, end, text) in enumerate(blocks, start=1):
+        lines.append(f"{idx}\n{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n{text}\n")
+    return "\n".join(lines)
+
+
 def _escape_filter_path(path: str) -> str:
     """Return a filtergraph-safe reference to a subtitle file.
 

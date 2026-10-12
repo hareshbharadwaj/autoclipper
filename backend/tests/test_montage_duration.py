@@ -83,3 +83,84 @@ def test_pipeline_reports_actual_montage_duration_without_cutting_transcript_seg
     assert montage_result["duration"] == 50.5
     assert montage_result["duration_delta"] == -9.5
     assert any("actual duration is 50.50s" in warning for warning in result["processing_warnings"])
+
+
+def test_montage_keeps_user_selected_moments_with_identical_text(tmp_path, monkeypatch):
+    """Text-similarity de-duplication must never drop a required montage shot."""
+    video_path = tmp_path / "input.mp4"
+    video_path.write_bytes(b"stub")
+    transcript = {
+        "duration": 68,
+        "language": "English",
+        "segments": [
+            {"start": 0, "end": 17, "text": "First complete thought."},
+            {"start": 17, "end": 34, "text": "Second complete thought."},
+            {"start": 34, "end": 51, "text": "Third complete thought."},
+            {"start": 51, "end": 68, "text": "Fourth complete thought."},
+        ],
+        "words": [],
+    }
+    # Two NON-overlapping user selections whose metadata is textually identical:
+    # the generic ranking pass would score their similarity >= 0.78 and drop one.
+    selected = [
+        {"title": "Same hook", "hook": "Identical hook text", "description": "Identical description",
+         "start": 0, "end": 17},
+        {"title": "Same hook", "hook": "Identical hook text", "description": "Identical description",
+         "start": 34, "end": 51},
+    ]
+    captured = {}
+    rank_calls = []
+    monkeypatch.setattr(pipeline, "ensure_ffmpeg", lambda: None)
+    monkeypatch.setattr(pipeline, "ingest", lambda *args, **kwargs: (str(video_path), "source"))
+    monkeypatch.setattr(pipeline, "probe_video_info", lambda path: {
+        "width": 1920, "height": 1080, "duration": 68, "has_audio": True,
+    })
+    monkeypatch.setattr(pipeline, "transcribe", lambda *args, **kwargs: transcript)
+    monkeypatch.setattr(pipeline, "probe_duration", lambda path: 33.5)
+    monkeypatch.setattr(
+        pipeline,
+        "rank_and_diversify_candidates",
+        lambda *args, **kwargs: rank_calls.append(args) or [],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "cut_all",
+        lambda video, clips, out_dir, title: captured.setdefault(
+            "clips",
+            [{"index": i + 1, "file": f"clip_{i + 1}.mp4", **clip} for i, clip in enumerate(clips)],
+        ),
+    )
+
+    def fake_stitch(paths, output_path, crossfade_seconds=0.25):
+        captured["montage_inputs"] = paths
+        with open(output_path, "wb") as output:
+            output.write(b"synthetic montage")
+        return output_path
+
+    monkeypatch.setattr(montage_module, "stitch_montage", fake_stitch)
+    monkeypatch.setattr(pipeline, "verify_rendered_file", lambda path, **kwargs: {
+        "status": "pass", "file": os.path.basename(path), "checks": {},
+        "warnings": [], "errors": [],
+    })
+    monkeypatch.setattr(pipeline, "write_json", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        pipeline,
+        "save_to_library",
+        lambda output_root, title, job_id, clips: os.path.join(output_root, "library"),
+    )
+
+    result = pipeline.run(
+        source="stub-source",
+        output_dir=str(tmp_path / "job"),
+        vertical=False,
+        subtitles=False,
+        montage=True,
+        selected_clips=selected,
+        target_duration=40,
+    )
+
+    assert rank_calls == []  # montage mode must bypass similarity de-duplication
+    assert [(clip["start"], clip["end"]) for clip in captured["clips"]] == [(0, 17), (34, 51)]
+    assert len(captured["montage_inputs"]) == 2
+    assert result["individual_clip_count"] == 2
+    assert result["montage_file"] == "source_montage.mp4"

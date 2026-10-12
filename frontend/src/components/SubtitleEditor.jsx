@@ -161,7 +161,7 @@ export default function SubtitleEditor({ jobId, clip, onApply, onClose, srtUrl, 
     setError('')
     try {
       const res = await applySubtitles({ jobId, filename: clip.file, cues: editedCues, style, name })
-      onApply(clip.index, res.filename)
+      onApply(clip.index, res.filename, res.srt)
       onClose()
     } catch (e) {
       setError(e.message)

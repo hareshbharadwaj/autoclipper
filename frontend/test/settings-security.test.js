@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mergeSafeSettings, normalizeServerSettings, settingsForLocalStorage } from '../src/utils/settingsStorage.js'
+import { mergeSafeSettings, normalizeServerSettings, settingsForLocalStorage, settingsSavePayload } from '../src/utils/settingsStorage.js'
 
 const defaults = {
   groqKey: '',
@@ -78,4 +78,42 @@ test('undecryptable field notices never persist to localStorage', () => {
   const stored = settingsForLocalStorage({ ...settings, undecryptableFields: ['groq_key'] })
   assert.equal('undecryptableFields' in stored, false)
   assert.deepEqual(stored, { vertical: true, clipCount: 5 })
+})
+
+test('save payload omits blank secret fields and trims provided ones', () => {
+  const payload = settingsSavePayload({
+    groqKey: '',
+    geminiKey: '   ',
+    youtubeApiKey: '  AIza_example  ',
+    youtubeCookies: '',
+    geminiModel: 'gemini-3.5-flash',
+    whisperModel: '',
+  })
+  assert.deepEqual(payload, {
+    gemini_model: 'gemini-3.5-flash',
+    whisper_model: '',
+    youtube_api_key: 'AIza_example',
+  })
+  assert.equal('groq_key' in payload, false)
+  assert.equal('gemini_key' in payload, false)
+  assert.equal('youtube_cookies' in payload, false)
+})
+
+test('save payload sends every filled secret field', () => {
+  const payload = settingsSavePayload({
+    groqKey: 'gsk_a',
+    geminiKey: 'AIza_b',
+    youtubeApiKey: 'AIza_c',
+    youtubeCookies: 'cookies',
+    geminiModel: 'm',
+    whisperModel: 'w',
+  })
+  assert.deepEqual(payload, {
+    groq_key: 'gsk_a',
+    gemini_key: 'AIza_b',
+    youtube_api_key: 'AIza_c',
+    youtube_cookies: 'cookies',
+    gemini_model: 'm',
+    whisper_model: 'w',
+  })
 })

@@ -49,7 +49,11 @@ export default function App() {
   const [error, setError] = useState('')
   const pollRef = useRef(null)
 
-  // Load the user's server-side settings (API keys).
+  // Load the user's server-side settings (API keys) on mount AND every time
+  // authentication state changes, so logging in from the initial screen never
+  // leaves the form blank (a blank Save must not look like "no keys").
+  // Unauthenticated visitors still load the default account's settings
+  // (auth is optional; the backend auto-resolves the default user).
   useEffect(() => {
     fetchSettings()
       .then((s) => {
@@ -66,7 +70,7 @@ export default function App() {
         }))
       })
       .catch(() => {})
-  }, [])
+  }, [authed])
 
   useEffect(() => {
     // Persist only non-secret UI preferences. Provider credentials stay in the
@@ -79,6 +83,8 @@ export default function App() {
   function handleLogout() {
     setToken('')
     setAuthed(false)
+    // Drop in-memory credentials from the previous account immediately.
+    setSettings((prev) => mergeSafeSettings(prev, prev))
   }
 
   async function startPolling(jobId) {
@@ -158,7 +164,7 @@ export default function App() {
   const clips = (job?.result?.clips) || []
   const failed = job?.status === 'failed'
 
-  function applyEditedClip(index, newFile) {
+  function applyEditedClip(index, newFile, newSrt) {
     setJob((j) => {
       if (!j?.result?.clips) return j
       return {
@@ -166,7 +172,16 @@ export default function App() {
         result: {
           ...j.result,
           clips: j.result.clips.map((c) =>
-            c.index === index ? { ...c, file: newFile, subtitled_file: newFile } : c
+            c.index === index
+              ? {
+                  ...c,
+                  file: newFile,
+                  subtitled_file: newFile,
+                  // Track the edited-captions sidecar; never keep the stale
+                  // pre-edit SRT (the library could re-burn outdated text).
+                  srt: newSrt || null,
+                }
+              : c
           ),
         },
       }

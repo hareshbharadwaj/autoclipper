@@ -306,19 +306,28 @@ def settings_for(user: User) -> UserSettings:
 
 
 def apply_settings(user: User, data: UserSettingsUpdate) -> None:
-    """Persist settings, encrypting any key fields that were provided."""
-    if data.groq_key is not None:
-        user.groq_key = encrypt_value(data.groq_key)
-    if data.gemini_key is not None:
-        user.gemini_key = encrypt_value(data.gemini_key)
-    if data.youtube_api_key is not None:
-        user.youtube_api_key = encrypt_value(data.youtube_api_key)
+    """Persist settings, encrypting any key fields that were provided.
+
+    Blank/whitespace-only secret values mean "field was untouched in the
+    form" and must NEVER erase already-stored credentials — a stale or
+    freshly loaded blank settings form used to wipe encrypted keys on save.
+    Values are trimmed before encryption.
+    """
+    def _provided(value) -> bool:
+        return isinstance(value, str) and value.strip() != ""
+
+    if _provided(data.groq_key):
+        user.groq_key = encrypt_value(data.groq_key.strip())
+    if _provided(data.gemini_key):
+        user.gemini_key = encrypt_value(data.gemini_key.strip())
+    if _provided(data.youtube_api_key):
+        user.youtube_api_key = encrypt_value(data.youtube_api_key.strip())
     if data.gemini_model is not None:
         user.gemini_model = data.gemini_model
     if data.whisper_model is not None:
         user.whisper_model = data.whisper_model
-    if data.youtube_cookies is not None:
-        user.youtube_cookies = encrypt_value(data.youtube_cookies)
+    if _provided(data.youtube_cookies):
+        user.youtube_cookies = encrypt_value(data.youtube_cookies.strip())
 
 
 def save_youtube_token(user: User, token_json: str) -> None:
