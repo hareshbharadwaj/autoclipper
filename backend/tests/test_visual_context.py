@@ -1,3 +1,4 @@
+import importlib
 import json
 import subprocess
 import sys
@@ -6,8 +7,10 @@ from unittest.mock import Mock
 
 import pytest
 
+import autoclipper.visual_context as visual_context_mod
 from autoclipper.visual_context import (
     extract_video_frames,
+    sample_candidate_frames,
     sample_timestamps,
     sample_video_frames,
 )
@@ -18,9 +21,69 @@ def test_sample_timestamps_are_evenly_distributed_and_strictly_bounded():
     assert len(times) == 5
     assert times == pytest.approx([150, 300, 450, 600, 750])
     assert all(0 < time < 900 for time in times)
-    assert len(sample_timestamps(40, max_frames=50)) == 1
+    # Short videos are lifted to the minimum sample count instead of one frame.
+    short = sample_timestamps(40, max_frames=50)
+    assert len(short) == 3
+    assert short == pytest.approx([10, 20, 30])
     assert sample_timestamps(float("nan")) == []
     assert sample_timestamps(20, max_frames=0) == []
+
+
+def test_short_videos_receive_minimum_visual_coverage():
+    # A 90s video used to get a single midpoint frame; it now gets three.
+    times = sample_timestamps(90)
+    assert len(times) == 3
+    assert times == pytest.approx([22.5, 45.0, 67.5])
+
+    ten_seconds = sample_timestamps(10)
+    assert len(ten_seconds) == 3
+    assert ten_seconds == pytest.approx([2.5, 5.0, 7.5])
+
+    # Very short videos collapse so frames stay ~1s apart.
+    tiny = sample_timestamps(0.5)
+    assert len(tiny) == 1
+    assert tiny == pytest.approx([0.25])
+    two_seconds = sample_timestamps(2.0)
+    assert len(two_seconds) == 2
+
+
+def test_medium_and_long_videos_scale_with_the_sampling_interval():
+    medium = sample_timestamps(300)  # ceil(300/90) = 4
+    assert len(medium) == 4
+    assert medium == pytest.approx([60, 120, 180, 240])
+
+    long_video = sample_timestamps(3600)  # capped at MAX_ANALYSIS_FRAMES (8)
+    assert len(long_video) == visual_context_mod.MAX_ANALYSIS_FRAMES
+    assert all(0 < time < 3600 for time in long_video)
+
+    denser = sample_timestamps(300, interval=60)  # ceil(300/60) = 5
+    assert len(denser) == 5
+    sparse_floor = sample_timestamps(40, min_frames=1)
+    assert len(sparse_floor) == 1
+
+
+def test_sampling_limits_are_env_configurable_but_hard_bounded(monkeypatch):
+    try:
+        monkeypatch.setenv("AUTOCLIPPER_MAX_ANALYSIS_FRAMES", "100")  # over the cap
+        monkeypatch.setenv("AUTOCLIPPER_MIN_ANALYSIS_FRAMES", "6")
+        monkeypatch.setenv("AUTOCLIPPER_VISUAL_SAMPLE_INTERVAL_SECONDS", "30")
+        monkeypatch.setenv("AUTOCLIPPER_MAX_FRAME_BYTES", "999999999")  # over the cap
+        importlib.reload(visual_context_mod)
+
+        assert visual_context_mod.MAX_ANALYSIS_FRAMES == 16  # hard upper bound
+        assert visual_context_mod.MIN_ANALYSIS_FRAMES == 6
+        assert visual_context_mod.VISUAL_SAMPLE_INTERVAL_SECONDS == 30.0
+        assert visual_context_mod.MAX_FRAME_BYTES == 2_000_000  # hard upper bound
+        assert visual_context_mod.MAX_TOTAL_FRAME_BYTES >= visual_context_mod.MAX_FRAME_BYTES
+        assert len(visual_context_mod.sample_timestamps(600)) == 16
+    finally:
+        monkeypatch.delenv("AUTOCLIPPER_MAX_ANALYSIS_FRAMES", raising=False)
+        monkeypatch.delenv("AUTOCLIPPER_MIN_ANALYSIS_FRAMES", raising=False)
+        monkeypatch.delenv("AUTOCLIPPER_VISUAL_SAMPLE_INTERVAL_SECONDS", raising=False)
+        monkeypatch.delenv("AUTOCLIPPER_MAX_FRAME_BYTES", raising=False)
+        importlib.reload(visual_context_mod)
+    assert visual_context_mod.MAX_ANALYSIS_FRAMES == 8
+    assert visual_context_mod.MIN_ANALYSIS_FRAMES == 3
 
 
 def test_extract_video_frames_keeps_samples_in_memory_and_crops_at_most_the_cap(
@@ -70,6 +133,97 @@ def test_sampling_returns_a_warning_for_timeout_or_oversized_frames(tmp_path, mo
     )
     assert result["frames"] == []
     assert "transcript evidence only" in result["warning"]
+
+
+def _stub_frame_extraction(monkeypatch, calls=None):
+    def fake_run(command, **kwargs):
+        if calls is not None:
+            calls.append(command)
+        return types.SimpleNamespace(returncode=0, stdout=b"jpeg-frame", stderr=b"")
+
+    monkeypatch.setattr("autoclipper.visual_context.subprocess.run", fake_run)
+
+
+def test_short_whole_video_sampling_extracts_minimum_frames(tmp_path, monkeypatch):
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"stub")
+    calls = []
+    _stub_frame_extraction(monkeypatch, calls)
+
+    result = sample_video_frames(str(video), 90, ffmpeg_path="/fake/ffmpeg")
+
+    # A 90-second video previously yielded a single midpoint frame.
+    assert [frame["timestamp"] for frame in result["frames"]] == [22.5, 45.0, 67.5]
+    assert len(calls) == 3
+    assert result["warning"] is None
+
+
+def test_candidate_sampling_adds_context_frames_around_candidate_moments(tmp_path, monkeypatch):
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"stub")
+    _stub_frame_extraction(monkeypatch)
+    candidates = [
+        {"start": 10, "end": 20},
+        {"start": 30, "end": 50},
+        {"start": 60, "end": 64},
+    ]
+
+    result = sample_candidate_frames(str(video), candidates, ffmpeg_path="/fake/ffmpeg")
+
+    frames = result["frames"]
+    timestamps = [frame["timestamp"] for frame in frames]
+    assert len(frames) <= visual_context_mod.MAX_ANALYSIS_FRAMES
+    assert timestamps == sorted(timestamps)
+    # Every candidate midpoint is guaranteed coverage.
+    for midpoint in (15.0, 40.0, 62.0):
+        assert midpoint in timestamps
+    # Remaining budget adds 25%/75% context points around the same moments.
+    assert 12.5 in timestamps and 17.5 in timestamps
+    owners = {frame["timestamp"]: frame["candidate_index"] for frame in frames}
+    assert owners[15.0] == 0
+    assert owners[12.5] == 0
+    assert owners[40.0] == 1
+    assert owners[62.0] == 2
+    assert all(index in (0, 1, 2) for index in owners.values())
+
+
+def test_candidate_sampling_respects_explicit_frame_cap(tmp_path, monkeypatch):
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"stub")
+    calls = []
+    _stub_frame_extraction(monkeypatch, calls)
+    candidates = [
+        {"start": 10, "end": 20},
+        {"start": 30, "end": 50},
+        {"start": 60, "end": 64},
+    ]
+
+    result = sample_candidate_frames(
+        str(video), candidates, max_frames=3, ffmpeg_path="/fake/ffmpeg"
+    )
+
+    assert len(result["frames"]) == 3
+    assert len(calls) == 3
+    assert [frame["timestamp"] for frame in result["frames"]] == [15.0, 40.0, 62.0]
+
+
+def test_candidate_sampling_ignores_malformed_candidates(tmp_path, monkeypatch):
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"stub")
+    _stub_frame_extraction(monkeypatch)
+    candidates = [
+        {"start": 10, "end": 20},
+        {"start": "bad"},
+        {"start": 30, "end": 25},  # end <= start
+        None,
+    ]
+
+    result = sample_candidate_frames(str(video), candidates, ffmpeg_path="/fake/ffmpeg")
+
+    timestamps = [frame["timestamp"] for frame in result["frames"]]
+    assert 15.0 in timestamps
+    assert all(frame["candidate_index"] == 0 for frame in result["frames"] if frame["timestamp"] == 15.0)
+    assert result["warning"] is None or "partial" in result["warning"]
 
 
 def _fake_google(monkeypatch):

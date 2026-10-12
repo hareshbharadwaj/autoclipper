@@ -1,5 +1,7 @@
 export const API_URL = import.meta.env.VITE_API_URL || ''
 
+import { normalizeServerSettings } from './utils/settingsStorage.js'
+
 // --- Auth token (client-side session) ----------------------------------
 const TOKEN_KEY = 'ac_token'
 
@@ -49,7 +51,7 @@ export async function register(username, password) {
 export async function fetchSettings() {
   const res = await authFetch(`${API_URL}/api/auth/settings`)
   if (!res.ok) throw new Error('Failed to load settings')
-  return res.json()
+  return normalizeServerSettings(await res.json())
 }
 
 export async function saveSettings(settings) {
@@ -72,14 +74,7 @@ export async function saveSettings(settings) {
     throw new Error(detail || 'Failed to save settings')
   }
   const data = await res.json()
-  return {
-    groqKey: data.groq_key || '',
-    geminiKey: data.gemini_key || '',
-    youtubeApiKey: data.youtube_api_key || '',
-    geminiModel: data.gemini_model || '',
-    whisperModel: data.whisper_model || '',
-    youtubeCookies: data.youtube_cookies || '',
-  }
+  return normalizeServerSettings(data)
 }
 
 // Authenticated fetch with the bearer token; 401 triggers logout.

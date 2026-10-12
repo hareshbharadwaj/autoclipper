@@ -26,6 +26,7 @@ const DEFAULT_SETTINGS = {
   clipCount: 8,
   minClip: 15,
   maxClip: 60,
+  undecryptableFields: [],
 }
 
 function loadSettings() {
@@ -61,6 +62,7 @@ export default function App() {
           geminiModel: s.geminiModel || '',
           whisperModel: s.whisperModel || '',
           youtubeCookies: s.youtubeCookies || '',
+          undecryptableFields: s.undecryptableFields || [],
         }))
       })
       .catch(() => {})

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mergeSafeSettings, settingsForLocalStorage } from '../src/utils/settingsStorage.js'
+import { mergeSafeSettings, normalizeServerSettings, settingsForLocalStorage } from '../src/utils/settingsStorage.js'
 
 const defaults = {
   groqKey: '',
@@ -37,4 +37,45 @@ test('local settings storage retains preferences but strips every secret field',
   })
   assert.deepEqual(stored, { vertical: false, clipCount: 8 })
   assert.equal(JSON.stringify(stored).includes('secret'), false)
+})
+
+test('server settings normalize to camelCase and surface undecryptable fields', () => {
+  const normalized = normalizeServerSettings({
+    groq_key: 'gsk_from_server',
+    gemini_key: 'gemini_from_server',
+    youtube_api_key: null,
+    gemini_model: 'gemini-3.5-flash',
+    whisper_model: 'whisper-large-v3-turbo',
+    youtube_cookies: 'cookies_from_server',
+    undecryptable_fields: ['groq_key', 'youtube_token'],
+  })
+  assert.deepEqual(normalized, {
+    groqKey: 'gsk_from_server',
+    geminiKey: 'gemini_from_server',
+    youtubeApiKey: '',
+    geminiModel: 'gemini-3.5-flash',
+    whisperModel: 'whisper-large-v3-turbo',
+    youtubeCookies: 'cookies_from_server',
+    undecryptableFields: ['groq_key', 'youtube_token'],
+  })
+})
+
+test('missing or malformed undecryptable_fields degrade to an empty list', () => {
+  assert.deepEqual(normalizeServerSettings({}).undecryptableFields, [])
+  assert.deepEqual(normalizeServerSettings(null).undecryptableFields, [])
+  assert.deepEqual(
+    normalizeServerSettings({ undecryptable_fields: 'groq_key' }).undecryptableFields,
+    [],
+  )
+})
+
+test('undecryptable field notices never persist to localStorage', () => {
+  const settings = mergeSafeSettings(defaults, {
+    clipCount: 5,
+    undecryptableFields: ['groq_key'],
+  })
+  assert.deepEqual(settings.undecryptableFields, [])
+  const stored = settingsForLocalStorage({ ...settings, undecryptableFields: ['groq_key'] })
+  assert.equal('undecryptableFields' in stored, false)
+  assert.deepEqual(stored, { vertical: true, clipCount: 5 })
 })

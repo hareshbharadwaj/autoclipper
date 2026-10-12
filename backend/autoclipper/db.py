@@ -23,57 +23,98 @@ DB_PATH = os.environ.get(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "autoclipper.db")),
 )
 
+# Where the active Fernet key came from: "env_secret", "key_file_existing",
+# or "key_file_created". Set by _fernet_key() at import time; used to explain
+# upgrade behavior (see report_encryption_status).
+ENCRYPTION_KEY_SOURCE = "env_secret"
+
+# User columns that hold Fernet ciphertext. Used to tell an operator exactly
+# which credentials must be re-saved when the encryption key changed.
+ENCRYPTED_USER_FIELDS = (
+    "groq_key",
+    "gemini_key",
+    "youtube_api_key",
+    "youtube_cookies",
+    "youtube_token",
+    "facebook_token",
+)
+
 
 # --- Encryption ----------------------------------------------------------
 def _persistent_fernet_key(path: str) -> bytes:
-    """Read or atomically create a private Fernet key file for local development."""
+    """Read or atomically create a private Fernet key file for local development.
+
+    An existing but empty key file is treated as an interrupted creation (the
+    process died between creating the path and writing the key) and is
+    regenerated atomically, so the next start cannot fail on a blank file.
+    """
     path = os.path.abspath(path)
     directory = os.path.dirname(path)
     try:
         os.makedirs(directory, exist_ok=True)
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
+        with open(path, "rb") as handle:
+            existing = handle.read().strip()
+    except FileNotFoundError:
+        existing = None
+    except OSError as exc:
+        raise RuntimeError(
+            "The persistent AutoClipper encryption key file is unreadable. "
+            "Restore it or configure AUTOCLIPPER_SECRET."
+        ) from exc
+
+    if existing:
         try:
-            with open(path, "rb") as handle:
-                key = handle.read().strip()
-            Fernet(key)  # fail closed if the key file is corrupt
-            if os.name == "posix":
-                os.chmod(path, 0o600)
-            return key
-        except (OSError, ValueError, TypeError) as exc:
+            Fernet(existing)  # fail closed if the key file is corrupt
+        except (ValueError, TypeError) as exc:
             raise RuntimeError(
                 "The persistent AutoClipper encryption key file is unreadable or invalid. "
                 "Restore it or configure AUTOCLIPPER_SECRET."
             ) from exc
+        if os.name == "posix":
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        return existing
+
+    # Create (or regenerate an empty placeholder) atomically: write the key to
+    # a temp file in the same directory, fsync it, then os.replace() over the
+    # final path so readers never observe a partially written key.
+    key = Fernet.generate_key()
+    tmp_path = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp_path, "wb") as handle:
+            handle.write(key)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "posix":
+            os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
     except OSError as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
         raise RuntimeError(
             "Cannot create a persistent AutoClipper encryption key file. "
             "Configure AUTOCLIPPER_SECRET or AUTOCLIPPER_SECRET_FILE."
         ) from exc
-
-    key = Fernet.generate_key()
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(key)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except OSError as exc:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
-        raise RuntimeError("Could not persist the AutoClipper encryption key.") from exc
     return key
 
 
 def _fernet_key() -> bytes:
     """Use a stable environment secret, or a persistent private key file locally."""
+    global ENCRYPTION_KEY_SOURCE
     secret = os.environ.get("AUTOCLIPPER_SECRET")
     if secret:
+        ENCRYPTION_KEY_SOURCE = "env_secret"
         digest = hashlib.sha256(secret.encode("utf-8")).digest()
         return base64.urlsafe_b64encode(digest)
     key_path = os.environ.get("AUTOCLIPPER_SECRET_FILE") or f"{DB_PATH}.fernet-key"
-    return _persistent_fernet_key(key_path)
+    existed = os.path.isfile(key_path) and os.path.getsize(key_path) > 0
+    key = _persistent_fernet_key(key_path)
+    ENCRYPTION_KEY_SOURCE = "key_file_existing" if existed else "key_file_created"
+    return key
 
 
 _fernet = Fernet(_fernet_key())
@@ -94,6 +135,74 @@ def decrypt_value(value: Optional[str]) -> Optional[str]:
         return None
 
 
+def decrypt_value_with_status(value: Optional[str]):
+    """Return ("empty" | "ok" | "undecryptable", plaintext_or_None).
+
+    Unlike decrypt_value() this distinguishes a field that was never set from
+    ciphertext that cannot be decrypted with the active key (for example after
+    an upgrade from a build that used an ephemeral random key).
+    """
+    if not value:
+        return "empty", None
+    try:
+        return "ok", _fernet.decrypt(value.encode("utf-8")).decode("utf-8")
+    except Exception:  # noqa: BLE001 - InvalidToken and any decode failure
+        return "undecryptable", None
+
+
+def undecryptable_fields(user) -> list:
+    """Names of the user's stored credential fields that cannot be decrypted.
+
+    These are credentials saved under a previous encryption key; the values
+    are gone and must be entered again. Never returns (or logs) the values.
+    """
+    fields = []
+    for field in ENCRYPTED_USER_FIELDS:
+        status, _ = decrypt_value_with_status(getattr(user, field, None))
+        if status == "undecryptable":
+            fields.append(field)
+    return fields
+
+
+def report_encryption_status() -> dict:
+    """Log (and return) a safe summary of key provenance and migration impact.
+
+    Called from init_db() on startup. Reports which users hold credentials
+    that the active key cannot decrypt, so operators are told explicitly which
+    credentials must be re-saved instead of seeing silent empty values.
+    """
+    from .utils import logger
+
+    summary = {
+        "key_source": ENCRYPTION_KEY_SOURCE,
+        "users_with_undecryptable_credentials": [],
+        "undecryptable_field_count": 0,
+    }
+    if ENCRYPTION_KEY_SOURCE == "key_file_created":
+        logger.warning(
+            "AUTOCLIPPER_SECRET is not set; created a persistent local encryption key "
+            "file beside the database. Set AUTOCLIPPER_SECRET in production so every "
+            "restart/replica shares one stable key."
+        )
+    try:
+        with Session(engine) as session:
+            users = session.exec(select(User)).all()
+        for user in users:
+            fields = undecryptable_fields(user)
+            if fields:
+                summary["users_with_undecryptable_credentials"].append(user.username)
+                summary["undecryptable_field_count"] += len(fields)
+                logger.warning(
+                    "User '%s' has %d stored credential field(s) encrypted with a "
+                    "previous key that can no longer be decrypted: %s. They must be "
+                    "saved again in Settings; other data is unaffected.",
+                    user.username, len(fields), ", ".join(fields),
+                )
+    except Exception as exc:  # noqa: BLE001 - startup report must never crash boot
+        logger.warning("Encryption status check could not inspect the database (%s).", type(exc).__name__)
+    return summary
+
+
 # --- Engine --------------------------------------------------------------
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 
@@ -108,6 +217,9 @@ def init_db() -> None:
             conn.commit()
         except Exception:
             pass  # column already exists
+    # Surface any credentials that the active encryption key cannot decrypt
+    # (e.g. after upgrading from a build that used an ephemeral random key).
+    report_encryption_status()
 
 
 def get_session():

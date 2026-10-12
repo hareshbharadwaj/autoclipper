@@ -339,8 +339,16 @@ async def me(current: User = Depends(get_current_user)):
 
 @app.get("/api/auth/settings", response_model=None)
 async def get_settings(current: User = Depends(get_current_user)):
-    """Return the user's stored settings (keys decrypted for display)."""
-    return settings_for(current)
+    """Return the user's stored settings (keys decrypted for display).
+
+    `undecryptable_fields` lists credentials saved under a previous encryption
+    key that must be entered again; it is never populated with secret values.
+    """
+    from autoclipper.db import undecryptable_fields
+
+    payload = settings_for(current).model_dump()
+    payload["undecryptable_fields"] = undecryptable_fields(current)
+    return payload
 
 
 @app.put("/api/auth/settings", response_model=None)
@@ -349,6 +357,8 @@ async def update_settings(
     current: User = Depends(get_current_user),
 ):
     """Update the user's stored settings (keys re-encrypted at rest)."""
+    from autoclipper.db import undecryptable_fields
+
     with user_db.Session(user_db.engine) as session:
         db_user = session.get(User, current.id)
         if db_user is None:
@@ -357,7 +367,8 @@ async def update_settings(
         session.add(db_user)
         session.commit()
         session.refresh(db_user)
-        result = settings_for(db_user)
+        result = settings_for(db_user).model_dump()
+        result["undecryptable_fields"] = undecryptable_fields(db_user)
     return result
 
 

@@ -117,6 +117,94 @@ def _nonempty_file(path):
     return bool(path and os.path.isfile(path) and os.path.getsize(path) > 0)
 
 
+def _subtitle_repair_needed(qa):
+    """True when the only blocking QA problem is the requested captions."""
+    checks = qa.get("checks") or {}
+    subtitle_check = checks.get("subtitles")
+    if not isinstance(subtitle_check, dict) or subtitle_check.get("ok") is not False:
+        return False
+    required = ("file", "streams", "duration", "audio", "visual_samples")
+    return all(
+        isinstance(checks.get(name), dict) and checks[name].get("ok") is True
+        for name in required
+    )
+
+
+def _repair_subtitle_failure(clip, transcript, output_dir, qa, qa_args, fallbacks, processing_warnings):
+    """Try once to still deliver the requested captions before falling back/failing.
+
+    Returns the (possibly updated) QA report and fallback list.
+
+    - If no transcript words overlap the clip, captions are impossible; the clip
+      is an acceptable subtitle-free fallback, so the failure is downgraded to
+      an explicit warning that explains the missing feature.
+    - Otherwise retry the caption stage once on the current (otherwise verified)
+      render. If the repaired file passes QA it becomes the final render and the
+      captionless file is kept as a fallback; if not, the original QA report is
+      returned unchanged so the normal fallback/failure handling runs.
+    """
+    if not _subtitle_repair_needed(qa):
+        return qa, fallbacks
+
+    warning = clip.get("subtitle_warning") or ""
+    if warning.startswith("No transcript words overlap"):
+        remaining = [
+            error for error in qa.get("errors") or []
+            if not error.lower().startswith("requested subtitles")
+        ]
+        explanation = (
+            "Requested subtitles could not be generated because no transcript words "
+            "overlap this clip; it was delivered without captions."
+        )
+        repaired = {
+            **qa,
+            "errors": remaining,
+            "warnings": list(qa.get("warnings") or []) + [explanation],
+        }
+        repaired["status"] = "fail" if remaining else "warning"
+        return repaired, fallbacks
+
+    try:
+        base_name = clip.get("file")
+        repair_clip = {**clip}
+        repair_clip.pop("subtitled_file", None)
+        repair_clip.pop("subtitle_warning", None)
+        add_subtitles([repair_clip], transcript, output_dir, burn=True, preserve_source=True)
+        repaired_name = repair_clip.get("file")
+        if not repaired_name or repaired_name == base_name or repair_clip.get("subtitle_warning"):
+            raise RuntimeError(
+                repair_clip.get("subtitle_warning")
+                or "The caption retry did not produce a burned subtitle file."
+            )
+        repaired_path = os.path.join(output_dir, os.path.basename(repaired_name))
+        if not _nonempty_file(repaired_path):
+            raise RuntimeError("The caption retry produced an empty subtitle file.")
+        repaired_qa = verify_rendered_file(repaired_path, **{**qa_args, "clip": repair_clip})
+        if repaired_qa.get("status") == "fail":
+            raise RuntimeError("The repaired caption output failed QA verification.")
+        # Adopt the repaired render; keep the captionless file as a fallback.
+        fallbacks = list(dict.fromkeys(list(fallbacks) + [base_name]))
+        clip["file"] = repaired_name
+        clip["subtitled_file"] = repaired_name
+        if repair_clip.get("srt"):
+            clip["srt"] = repair_clip["srt"]
+        clip.pop("subtitle_warning", None)
+        repaired_qa.setdefault("warnings", []).append(
+            "Captions were re-generated and burned successfully after an initial subtitle failure."
+        )
+        processing_warnings.append(
+            "Subtitle rendering initially failed; captions were repaired on a second attempt."
+        )
+        logger.info("Subtitle repair succeeded for clip %s.", clip.get("index"))
+        return repaired_qa, fallbacks
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Subtitle repair attempt failed for clip %s (%s); continuing with fallback handling.",
+            clip.get("index"), type(exc).__name__,
+        )
+        return qa, fallbacks
+
+
 def _emit_progress(callback, stage, message, *, current=None, total=None, **details):
     if callback is None:
         return
@@ -827,6 +915,15 @@ def run(
             }
 
         fallbacks = list(clip.get("_render_fallbacks") or [])
+        if qa.get("status") == "fail" and subtitles and not is_montage_clip:
+            # Requested captions must be delivered, repaired, explicitly
+            # downgraded (impossible case), or fail — never pass silently.
+            qa, fallbacks = _repair_subtitle_failure(
+                clip, transcript, output_dir, qa, qa_args, fallbacks, processing_warnings
+            )
+            clip["_render_fallbacks"] = list(dict.fromkeys(fallbacks))
+            current_name = clip.get("file")
+            current_path = os.path.join(output_dir, current_name or "")
         if qa.get("status") == "fail":
             for fallback_name in reversed(fallbacks):
                 fallback_path = os.path.join(output_dir, os.path.basename(fallback_name))

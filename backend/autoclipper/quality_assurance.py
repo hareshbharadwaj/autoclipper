@@ -273,10 +273,22 @@ def verify_rendered_file(
         }
         report["checks"]["subtitles"] = subtitle_check
         if not captions_ok:
-            warning = clip.get("subtitle_warning") or (
-                "Caption QA could not confirm a valid in-range SRT and burned caption output."
+            # Requested captions are a required feature: a missing/invalid SRT or
+            # a missing burned output must fail QA so the pipeline can attempt a
+            # repair or fall back explicitly, never pass silently as a warning.
+            if clip.get("subtitle_warning"):
+                report["warnings"].append(clip["subtitle_warning"])
+            if not srt_check["present"]:
+                detail = "the caption sidecar (SRT) is missing"
+            elif not srt_check["valid"]:
+                detail = "the caption sidecar (SRT) is invalid or out of range"
+            elif not burned_present:
+                detail = "no burned-caption output file was produced"
+            else:
+                detail = "the caption artifacts could not be confirmed"
+            report["errors"].append(
+                f"Requested subtitles could not be verified: {detail}."
             )
-            report["warnings"].append(warning)
 
     visual_timestamps = []
     if actual_duration > 0:

@@ -2,6 +2,9 @@
 
 Frames are extracted in memory and are never written beside user media or
 included in logs. Sampling is deliberately capped by both count and wall time.
+
+Every limit is configurable through the environment but hard-bounded here so a
+misconfigured deployment can never request unbounded frames, payloads, or time.
 """
 import math
 import os
@@ -11,24 +14,89 @@ import time
 
 from .utils import logger
 
-MAX_ANALYSIS_FRAMES = 8
-MAX_FRAME_BYTES = 600_000
-MAX_TOTAL_FRAME_BYTES = 4_000_000
-MAX_SAMPLING_SECONDS = 18.0
-FRAME_TIMEOUT_SECONDS = 3.0
-MAX_FRAME_DIMENSION = 640
+
+def _bounded_int_env(name, default, low, high):
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(high, value))
 
 
-def sample_timestamps(duration, max_frames=MAX_ANALYSIS_FRAMES):
-    """Choose evenly distributed interior timestamps, with a strict frame cap."""
+def _bounded_float_env(name, default, low, high):
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    if not math.isfinite(value):
+        value = default
+    return max(low, min(high, value))
+
+
+# Frame-count limits. Short videos still receive a sensible minimum number of
+# samples so multi-scene clips are not reduced to a single midpoint frame.
+MAX_ANALYSIS_FRAMES = _bounded_int_env("AUTOCLIPPER_MAX_ANALYSIS_FRAMES", 8, 1, 16)
+MIN_ANALYSIS_FRAMES = _bounded_int_env(
+    "AUTOCLIPPER_MIN_ANALYSIS_FRAMES", min(3, MAX_ANALYSIS_FRAMES), 1, MAX_ANALYSIS_FRAMES
+)
+# One sample per this many seconds for long videos (above the minimum).
+VISUAL_SAMPLE_INTERVAL_SECONDS = _bounded_float_env(
+    "AUTOCLIPPER_VISUAL_SAMPLE_INTERVAL_SECONDS", 90.0, 5.0, 900.0
+)
+# Frames closer together than this collapse (avoids near-duplicates on very
+# short videos, which would waste payload without adding visual evidence).
+MIN_FRAME_SPACING_SECONDS = 1.0
+
+# Payload and execution-time limits (still bounded after env overrides).
+MAX_FRAME_BYTES = _bounded_int_env("AUTOCLIPPER_MAX_FRAME_BYTES", 600_000, 10_000, 2_000_000)
+MAX_TOTAL_FRAME_BYTES = _bounded_int_env(
+    "AUTOCLIPPER_MAX_TOTAL_FRAME_BYTES",
+    max(4_000_000, MAX_FRAME_BYTES),
+    max(100_000, MAX_FRAME_BYTES),
+    12_000_000,
+)
+MAX_SAMPLING_SECONDS = _bounded_float_env("AUTOCLIPPER_MAX_SAMPLING_SECONDS", 18.0, 1.0, 120.0)
+FRAME_TIMEOUT_SECONDS = _bounded_float_env("AUTOCLIPPER_FRAME_TIMEOUT_SECONDS", 3.0, 0.5, 30.0)
+MAX_FRAME_DIMENSION = _bounded_int_env("AUTOCLIPPER_MAX_FRAME_DIMENSION", 640, 128, 1920)
+
+
+def sample_timestamps(duration, max_frames=None, min_frames=None, interval=None):
+    """Choose evenly distributed interior timestamps, with a strict frame cap.
+
+    Long videos get about one frame per `interval` seconds (default 90s) up to
+    `max_frames`; short videos are lifted to at least `min_frames` samples
+    (default 3) so a sub-90s video with several scenes is not reduced to a
+    single midpoint frame. Very short videos collapse so consecutive samples
+    stay at least ~1s apart.
+    """
     try:
         duration = float(duration)
-        max_frames = int(max_frames)
     except (TypeError, ValueError):
         return []
-    if not math.isfinite(duration) or duration <= 0 or max_frames <= 0:
+    if not math.isfinite(duration) or duration <= 0:
         return []
-    count = min(max_frames, max(1, int(math.ceil(duration / 90.0))))
+    try:
+        cap = int(max_frames) if max_frames is not None else MAX_ANALYSIS_FRAMES
+    except (TypeError, ValueError):
+        cap = MAX_ANALYSIS_FRAMES
+    try:
+        floor = int(min_frames) if min_frames is not None else MIN_ANALYSIS_FRAMES
+    except (TypeError, ValueError):
+        floor = MIN_ANALYSIS_FRAMES
+    try:
+        step = float(interval) if interval is not None else VISUAL_SAMPLE_INTERVAL_SECONDS
+    except (TypeError, ValueError):
+        step = VISUAL_SAMPLE_INTERVAL_SECONDS
+    if cap <= 0:
+        return []
+    if not math.isfinite(step) or step <= 0:
+        step = VISUAL_SAMPLE_INTERVAL_SECONDS
+
+    floor = max(1, min(floor, cap))
+    # Very short videos: never sample faster than one frame per second.
+    floor = max(1, min(floor, int(duration // MIN_FRAME_SPACING_SECONDS) or 1))
+    count = int(math.ceil(duration / step))
+    count = max(floor, min(count, cap))
     # Interior points avoid title cards/black end frames while still covering
     # the full timeline, including its opening and conclusion.
     return [duration * (index + 1) / (count + 1) for index in range(count)]
@@ -132,15 +200,27 @@ def extract_video_frames(
     return {"frames": frames, "warning": warning}
 
 
-def sample_video_frames(video_path, duration, max_frames=MAX_ANALYSIS_FRAMES, **kwargs):
+def sample_video_frames(video_path, duration, max_frames=None, min_frames=None, interval=None, **kwargs):
     """Sample evenly spaced, bounded visual context from a whole video."""
-    timestamps = sample_timestamps(duration, max_frames=max_frames)
+    if max_frames is None:
+        max_frames = MAX_ANALYSIS_FRAMES
+    timestamps = sample_timestamps(
+        duration, max_frames=max_frames, min_frames=min_frames, interval=interval
+    )
     return extract_video_frames(video_path, timestamps, max_frames=max_frames, **kwargs)
 
 
-def sample_candidate_frames(video_path, candidates, max_frames=8, **kwargs):
-    """Sample a bounded, evenly distributed set of candidate midpoints."""
+def sample_candidate_frames(video_path, candidates, max_frames=None, **kwargs):
+    """Sample bounded visual evidence focused on candidate moments.
+
+    Every selected candidate contributes its midpoint first (guaranteeing
+    coverage across candidates); any remaining frame budget adds 25%/75%
+    context points around those same candidates so reviewers see how each
+    moment begins and resolves, not just its middle.
+    """
     items = list(candidates or [])
+    if max_frames is None:
+        max_frames = MAX_ANALYSIS_FRAMES
     try:
         limit = max(0, int(max_frames))
     except (TypeError, ValueError):
@@ -155,19 +235,44 @@ def sample_candidate_frames(video_path, candidates, max_frames=8, **kwargs):
     else:
         indices = sorted({round(i * (len(items) - 1) / (limit - 1)) for i in range(limit)})
 
+    def _bounds(index):
+        try:
+            start = float(items[index]["start"])
+            end = float(items[index]["end"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not (math.isfinite(start) and math.isfinite(end)) or start < 0 or end <= start:
+            return None
+        return start, end
+
     requested = []
     owner_by_time = {}
-    for index in indices:
-        try:
-            timestamp = (float(items[index]["start"]) + float(items[index]["end"])) / 2.0
-        except (KeyError, TypeError, ValueError):
-            continue
-        if not math.isfinite(timestamp) or timestamp < 0:
-            continue
+
+    def _add(timestamp, index):
+        if timestamp is None or not math.isfinite(timestamp) or timestamp < 0:
+            return
+        if len(requested) >= limit:
+            return
         rounded = round(timestamp, 3)
+        if rounded in owner_by_time:
+            return
         requested.append(rounded)
         owner_by_time[rounded] = index
 
+    # Round 1: candidate midpoints (primary visual evidence).
+    for index in indices:
+        bounds = _bounds(index)
+        if bounds:
+            _add((bounds[0] + bounds[1]) / 2.0, index)
+    # Round 2: additional context frames around the same candidate moments.
+    for index in indices:
+        bounds = _bounds(index)
+        if bounds:
+            span = bounds[1] - bounds[0]
+            _add(bounds[0] + span * 0.25, index)
+            _add(bounds[0] + span * 0.75, index)
+
+    requested.sort()
     result = extract_video_frames(
         video_path, requested, max_frames=limit, total_timeout=12.0, **kwargs
     )

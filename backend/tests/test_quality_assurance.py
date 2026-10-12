@@ -94,6 +94,7 @@ def test_qa_checks_caption_sidecar_and_burned_output_artifact(tmp_path):
     assert report["checks"]["subtitles"]["valid"] is True
     assert report["checks"]["subtitles"]["cue_count"] == 1
     assert report["checks"]["subtitles"]["ok"] is True
+    assert report["status"] == "pass"
     assert "no OCR" in report["checks"]["subtitles"]["verification_method"]
 
 
@@ -111,3 +112,59 @@ def test_qa_rejects_subtitle_blocks_with_no_caption_text(tmp_path):
     assert report["checks"]["subtitles"]["present"] is True
     assert report["checks"]["subtitles"]["valid"] is False
     assert report["checks"]["subtitles"]["ok"] is False
+    # An invalid sidecar for REQUESTED subtitles must fail QA, not just warn.
+    assert report["status"] == "fail"
+    assert any(
+        "requested subtitles" in error.lower() and "invalid" in error.lower()
+        for error in report["errors"]
+    )
+
+
+def test_qa_fails_when_requested_subtitle_sidecar_is_missing(tmp_path):
+    video = _make_video(tmp_path)
+    report = verify_rendered_file(
+        str(video),
+        expected_duration=2,
+        subtitles_requested=True,
+        clip={"subtitle_warning": "Captions were generated as SRT but could not be burned in: boom"},
+        output_dir=str(tmp_path),
+    )
+    assert report["status"] == "fail"
+    assert report["checks"]["subtitles"]["ok"] is False
+    assert any("requested subtitles" in error.lower() for error in report["errors"])
+    # The render-stage context is preserved as a warning alongside the failure.
+    assert any("could not be burned in" in warning for warning in report["warnings"])
+
+
+def test_qa_fails_when_burned_caption_output_is_missing(tmp_path):
+    video = _make_video(tmp_path)
+    srt = tmp_path / "captions.srt"
+    srt.write_text(
+        "1\n00:00:00,200 --> 00:00:01,200\nA visible caption\n",
+        encoding="utf-8",
+    )
+    report = verify_rendered_file(
+        str(video),
+        expected_duration=2,
+        subtitles_requested=True,
+        clip={"srt": srt.name, "subtitled_file": "never_created_sub.mp4"},
+        output_dir=str(tmp_path),
+    )
+    assert report["status"] == "fail"
+    assert report["checks"]["subtitles"]["burned_output_present"] is False
+    assert any(
+        "requested subtitles" in error.lower() and "burned-caption" in error.lower()
+        for error in report["errors"]
+    )
+
+
+def test_qa_without_requested_subtitles_does_not_check_captions(tmp_path):
+    video = _make_video(tmp_path)
+    report = verify_rendered_file(
+        str(video),
+        expected_duration=2,
+        subtitles_requested=False,
+        output_dir=str(tmp_path),
+    )
+    assert "subtitles" not in report["checks"]
+    assert report["status"] in {"pass", "warning"}
