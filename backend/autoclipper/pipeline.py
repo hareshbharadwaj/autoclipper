@@ -5,7 +5,10 @@ import os
 import time
 
 from . import config
+from . import grounding
 from .analyze import (
+    CandidateReviewError,
+    CandidateReviewTimeoutError,
     find_viral_clips, review_clip_candidates, rank_and_diversify_candidates,
     _filter_clips_to_bounds, _resolve_clip_bounds, _validate_clips,
 )
@@ -354,6 +357,195 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
     return chosen
 
 
+# --- Source-grounded selection helpers ------------------------------------
+def _extend_selection_to_target(candidate, transcript, target_duration, total_duration,
+                                max_extra_seconds=30.0):
+    """Extend a user-selected interval only with topically adjacent material.
+
+    A short, relevant selection is kept honest: instead of padding it with
+    unrelated footage to hit the duration target, it may only grow by adding
+    transcript segments that are directly contiguous AND topically relevant to
+    the selection's own speech. The target is a goal, never a reason to add
+    filler. Returns a new candidate dict (the input is not mutated) plus an
+    ``extension_note`` explaining any growth, or the unchanged candidate.
+    """
+    try:
+        start = float(candidate["start"])
+        end = float(candidate["end"])
+        target = float(target_duration)
+    except (KeyError, TypeError, ValueError):
+        return candidate
+    if target <= 0 or (end - start) >= target:
+        return candidate
+
+    core_text = grounding.span_text(transcript, start, end)
+    if not core_text.strip():
+        return candidate
+
+    segments = grounding.segments_in_span(transcript, 0.0, float(total_duration or 0.0) or float("inf"))
+    if not segments:
+        return candidate
+
+    hard_limit = min(
+        float(config.HARD_MAX_CLIP_SECONDS),
+        end - start + max(0.0, float(max_extra_seconds)),
+        target + 3.0,
+    )
+    new_start, new_end = start, end
+    added_texts = []
+
+    def _relevance(text):
+        return grounding.token_overlap(core_text, text)
+
+    # Grow forward first, then backward, only onto contiguous relevant speech.
+    for direction in (1, -1):
+        while (new_end - new_start) < target:
+            boundary = new_end if direction == 1 else new_start
+            adjacent = None
+            for seg in segments:
+                if direction == 1 and abs(seg["start"] - boundary) <= 1.0 and seg["end"] > boundary:
+                    adjacent = seg
+                    break
+                if direction == -1 and abs(seg["end"] - boundary) <= 1.0 and seg["start"] < boundary:
+                    adjacent = seg
+                    break
+            if adjacent is None:
+                break
+            if _relevance(adjacent["text"]) < 0.15:
+                break  # next material is off-topic: stop rather than pad
+            if direction == 1:
+                candidate_end = adjacent["end"]
+                if candidate_end - new_start > hard_limit:
+                    break
+                new_end = candidate_end
+            else:
+                candidate_start = adjacent["start"]
+                if new_end - candidate_start > hard_limit:
+                    break
+                new_start = candidate_start
+            added_texts.append(adjacent["text"])
+
+    new_start = round(max(0.0, new_start), 2)
+    new_end = round(min(float(total_duration or new_end), new_end), 2)
+    if new_start == start and new_end == end:
+        return candidate
+    extended = {**candidate, "start": new_start, "end": new_end}
+    extended["extension_note"] = (
+        f"Extended the user-selected span from {start:.1f}-{end:.1f}s to "
+        f"{new_start:.1f}-{new_end:.1f}s using only contiguous, topically "
+        "matching transcript segments."
+    )
+    return extended
+
+
+def _apply_factual_grounding(candidates, transcript, user_direction, review_status):
+    """Run deterministic factual-grounding QA over every candidate.
+
+    AI-generated candidates that fail critical grounding (fabricated evidence,
+    meaning-flipping cuts, or clear off-topic selection) are rejected; user-
+    selected candidates are retained but flagged. Every candidate carries its
+    factual record downstream so no clip is ever presented as verified when it
+    was not. Returns ``(kept, rejected)``.
+    """
+    kept = []
+    rejected = []
+    for candidate in candidates or []:
+        # Defense in depth for visual honesty: even if a review stage failed to
+        # strip a visual claim, a candidate with no sampled frames can never
+        # carry an assertion that something was seen.
+        if not candidate.get("visual_frames_attached"):
+            visual_evidence = (candidate.get("visual_evidence") or "").strip()
+            if visual_evidence and "not verifiable" not in visual_evidence.casefold():
+                candidate["visual_evidence"] = "not verifiable from sampled frames"
+        record = grounding.ground_candidate(
+            candidate,
+            transcript,
+            user_direction=user_direction,
+            review_state=review_status,
+            frames_attached=bool(candidate.get("visual_frames_attached")),
+        )
+        candidate["factual_qa"] = record
+        if record["status"] == "failed" and not candidate.get("_user_selected"):
+            rejected.append({
+                "title": candidate.get("title"),
+                "start": candidate.get("start"),
+                "end": candidate.get("end"),
+                "reasons": list(record["critical"]),
+            })
+            logger.info(
+                "Rejected candidate %.1f-%.1f on factual grounding: %s",
+                candidate.get("start", 0.0), candidate.get("end", 0.0),
+                "; ".join(record["critical"]),
+            )
+            continue
+        kept.append(candidate)
+    return kept, rejected
+
+
+def _duration_tolerance(target_duration):
+    """Documented target-duration tolerance for individual clips."""
+    return _montage_duration_tolerance(target_duration)
+
+
+def _attach_provenance(clip, transcript, target_duration):
+    """Attach source-traceability and an editorial QA record to one clip.
+
+    Adds ``source_intervals``, the exact ``transcript_span`` used, requested vs
+    planned duration with an honest note, and a deterministic editorial QA
+    record (opening/ending alignment, duration fit). Model-dependent editorial
+    judgment (relevance quality, pacing) is reported via the review/factual
+    records, never claimed here.
+    """
+    try:
+        start = float(clip["start"])
+        end = float(clip["end"])
+    except (KeyError, TypeError, ValueError):
+        return clip
+    duration = end - start
+    clip["source_intervals"] = [{"start": round(start, 2), "end": round(end, 2)}]
+    clip["transcript_span"] = grounding.span_text(transcript, start, end)[:1600]
+    clip["requested_duration"] = (
+        round(float(target_duration), 2) if target_duration is not None else None
+    )
+    clip["planned_duration"] = round(duration, 2)
+
+    alignment = grounding.boundary_alignment(transcript, start, end)
+    editorial_warnings = []
+    if not alignment["start_aligned"]:
+        editorial_warnings.append("Opening may begin mid-thought (not sentence-aligned).")
+    if not alignment["end_aligned"]:
+        editorial_warnings.append("Ending may cut a sentence (not sentence-aligned).")
+
+    duration_note = None
+    if target_duration is not None:
+        tolerance = _duration_tolerance(target_duration)
+        delta = duration - float(target_duration)
+        clip["duration_delta"] = round(delta, 2)
+        if abs(delta) > tolerance:
+            direction = "shorter" if delta < 0 else "longer"
+            duration_note = (
+                f"Planned duration is {duration:.1f}s versus the "
+                f"{float(target_duration):.0f}s target ({delta:+.1f}s, {direction}). "
+                "The source did not provide enough relevant material to match the "
+                "target without adding unrelated footage or cutting speech."
+            )
+            editorial_warnings.append(duration_note)
+
+    factual = clip.get("factual_qa") or {}
+    editorial_status = "warning" if editorial_warnings else "passed"
+    if factual.get("status") == "failed":
+        editorial_status = "failed"
+    clip["editorial_qa"] = {
+        "status": editorial_status,
+        "warnings": editorial_warnings,
+        "opening_aligned": alignment["start_aligned"],
+        "ending_aligned": alignment["end_aligned"],
+        "duration_note": duration_note,
+        "deterministic": True,
+    }
+    return clip
+
+
 def _enforce_clip_constraints(clips, min_clip, max_clip, clip_count, video_dur, trim_long=True, pad_short=True):
     """Adjust Gemini's candidates to respect the user's count and duration window."""
     cleaned = []
@@ -507,6 +699,14 @@ def run(
     candidate_warnings = []
     candidate_review = {"status": "not_run", "reviewed_count": 0, "rejected_count": 0}
 
+    # Topic direction used by deterministic grounding: the user's own words.
+    user_direction = (custom_prompt or "").strip()
+    if selected_clip and not user_direction:
+        user_direction = " ".join(
+            str(selected_clip.get(key) or "")
+            for key in ("title", "hook", "description")
+        ).strip()
+
     if montage:
         candidate_pool = _fit_montage_candidates(
             selected_clips, transcript,
@@ -514,15 +714,37 @@ def run(
             total_duration=video_dur,
         )
     elif selected_clip:
-        # Keep the selected angle as a real output when its hinted timestamps are
-        # valid. Other slots draw from an over-generated, distinct candidate pool.
+        # Keep the selected angle as a real output whenever its timestamps are
+        # valid. It is validated against timestamp integrity and the hard
+        # ceiling only — the target-duration window must never silently drop a
+        # user's explicit selection and force the generator to pad with
+        # unrelated footage (the knife-safety 91-117s -> 84-144s failure).
         selected_candidates = _validate_clips(
-            [selected_clip],
+            [{**selected_clip, "_user_selected": True}],
             total_duration=video_dur,
-            min_clip=effective_min_clip,
-            max_clip=effective_max_clip,
+            min_clip=3.0,
+            max_clip=float(config.HARD_MAX_CLIP_SECONDS),
+            exempt_user_selected=True,
         )
-        selected_candidates = [{**item, "_user_selected": True} for item in selected_candidates]
+        if selected_candidates and target_duration is not None:
+            chosen = selected_candidates[0]
+            chosen_duration = float(chosen["end"]) - float(chosen["start"])
+            if chosen_duration < float(target_duration) - _duration_tolerance(target_duration):
+                extended = _extend_selection_to_target(
+                    chosen, transcript, target_duration, video_dur
+                )
+                if extended is not chosen:
+                    selected_candidates = [extended]
+                    if extended.get("extension_note"):
+                        candidate_warnings.append(extended["extension_note"])
+                else:
+                    candidate_warnings.append(
+                        f"The selected angle spans {chosen_duration:.1f}s; the "
+                        f"{float(target_duration):.0f}s target needs more relevant "
+                        "material than the source provides around it. The shorter, "
+                        "accurate selection was kept instead of padding with "
+                        "unrelated footage."
+                    )
         if clip_count is not None and len(selected_candidates) < requested_individual_count:
             extra_prompt = (custom_prompt or "").strip()
             if selected_candidates:
@@ -534,9 +756,20 @@ def run(
                 )
             else:
                 angle_title = (selected_clip.get("title") or "").strip()
+                hint_start = selected_clip.get("start_hint") or selected_clip.get("start")
+                hint_end = selected_clip.get("end_hint") or selected_clip.get("end")
+                hint_note = ""
+                try:
+                    hint_note = (
+                        f" The original hints pointed near "
+                        f"{float(hint_start):.0f}-{float(hint_end):.0f}s."
+                    )
+                except (TypeError, ValueError):
+                    hint_note = ""
                 direction = (
                     f"Use the selected angle '{angle_title}' as creative direction "
-                    "where it fits, but return valid transcript-aligned moments."
+                    f"where it fits, but return valid transcript-aligned moments."
+                    f"{hint_note}"
                 )
             extra_prompt = f"{extra_prompt}\n\n{direction}".strip()
             generated_candidates = find_viral_clips(
@@ -592,22 +825,80 @@ def run(
                 "status": "reviewed",
                 "reviewed_count": review["reviewed_count"],
                 "rejected_count": review["rejected_count"],
+                "failure_reason": None,
             }
-        except Exception as exc:  # fall back to validated, unchanged candidates
+        except CandidateReviewTimeoutError as exc:
+            logger.warning("Independent candidate review timed out; candidates remain unreviewed.")
+            candidate_review = {
+                "status": "timed_out",
+                "reviewed_count": 0,
+                "rejected_count": 0,
+                "failure_reason": str(exc),
+            }
+            candidate_warnings.append(
+                "Independent candidate review timed out; the candidates below are UNREVIEWED. "
+                "They still passed deterministic factual checks, but no model review confirmed them."
+            )
+        except CandidateReviewError as exc:
+            status = "malformed" if exc.category in ("malformed", "invalid") else "unavailable"
             logger.warning(
-                "Independent candidate review unavailable (%s); retaining original timestamps.",
+                "Independent candidate review failed (%s: %s); candidates remain unreviewed.",
+                exc.category, exc,
+            )
+            candidate_review = {
+                "status": status,
+                "reviewed_count": 0,
+                "rejected_count": 0,
+                "failure_reason": str(exc),
+            }
+            candidate_warnings.append(
+                f"Independent candidate review could not be completed ({exc.category}); "
+                "the candidates below are UNREVIEWED. They still passed deterministic "
+                "factual checks, but no model review confirmed them."
+            )
+        except Exception as exc:  # noqa: BLE001 - unexpected provider failure
+            logger.warning(
+                "Independent candidate review unavailable (%s); candidates remain unreviewed.",
                 type(exc).__name__,
             )
             candidate_review = {
-                "status": "fallback_unreviewed",
+                "status": "unavailable",
                 "reviewed_count": 0,
                 "rejected_count": 0,
+                "failure_reason": f"{type(exc).__name__}",
             }
             candidate_warnings.append(
-                "Independent candidate review could not be completed; original transcript-validated timestamps were retained. Check provider availability and retry if needed."
+                "Independent candidate review could not be completed; the candidates "
+                "below are UNREVIEWED. They still passed deterministic factual checks."
             )
     elif candidate_pool:
-        candidate_review = {"status": "skipped_no_key", "reviewed_count": 0, "rejected_count": 0}
+        candidate_review = {
+            "status": "skipped_no_key", "reviewed_count": 0, "rejected_count": 0,
+            "failure_reason": None,
+        }
+
+    # Deterministic factual grounding runs ALWAYS, reviewed or not. "Review
+    # unavailable" is never equivalent to "review passed": unreviewed candidates
+    # must still prove their evidence quotes, boundaries, and topic relevance.
+    if candidate_pool:
+        review_state_for_grounding = candidate_review.get("status", "not_run")
+        grounded_pool, rejected_candidates = _apply_factual_grounding(
+            candidate_pool,
+            transcript,
+            user_direction=user_direction if not montage else None,
+            review_status=review_state_for_grounding,
+        )
+        if rejected_candidates:
+            candidate_review["grounding_rejected"] = rejected_candidates
+            logger.info(
+                "Deterministic grounding rejected %d candidate(s) before rendering.",
+                len(rejected_candidates),
+            )
+        candidate_pool = grounded_pool
+
+    # Collect user-visible warnings from here on (candidate review, grounding,
+    # duration deviations, render/QA stages).
+    processing_warnings = list(candidate_warnings)
 
     _emit_progress(
         on_progress,
@@ -638,16 +929,54 @@ def run(
             trim_long=False, pad_short=False,
         )
         if not montage:
-            clip_candidates = _filter_clips_to_bounds(
-                clip_candidates,
+            # User-selected moments are exempt from the duration window: a
+            # shorter accurate selection beats a padded one (RC1/RC2).
+            exempt = [c for c in clip_candidates if c.get("_user_selected")]
+            filterable = [c for c in clip_candidates if not c.get("_user_selected")]
+            filtered = _filter_clips_to_bounds(
+                filterable,
                 min_clip=effective_min_clip,
                 max_clip=effective_max_clip,
                 min_tolerance=0.0 if target_duration is not None else 2.0,
                 max_tolerance=0.0 if target_duration is not None else 3.0,
             )
+            if not filtered and filterable:
+                # The strict window rejected every generated candidate. Rather
+                # than returning nothing, keep the best candidate that fits the
+                # hard ceiling and report the deviation honestly.
+                within_hard_max = [
+                    c for c in filterable
+                    if float(c["end"]) - float(c["start"]) <= float(config.HARD_MAX_CLIP_SECONDS)
+                ]
+                if within_hard_max:
+                    filtered = sorted(
+                        within_hard_max,
+                        key=lambda c: -float(c.get("quality_score", c.get("candidate_score", 0.0))),
+                    )[:requested_individual_count]
+                    processing_warnings.append(
+                        "No generated candidate matched the requested duration window; "
+                        "the closest transcript-grounded candidate was kept and the "
+                        "duration deviation is reported per clip."
+                    )
+            clip_candidates = exempt + filtered
+            clip_candidates.sort(key=lambda c: float(c.get("start", 0.0)))
         logger.info("After enforcement: %d clip(s)", len(clip_candidates))
     if not clip_candidates:
         logger.warning("No viral clips detected.")
+
+    # Attach source provenance + deterministic editorial QA to every planned
+    # clip BEFORE rendering, so timestamp traceability can never be lost
+    # between analysis and the final file.
+    for candidate in clip_candidates:
+        _attach_provenance(
+            candidate, transcript,
+            None if montage else target_duration,
+        )
+        if candidate.get("_user_selected"):
+            candidate["user_selected"] = True
+            candidate.pop("_user_selected", None)
+        if candidate.get("editorial_qa", {}).get("duration_note"):
+            processing_warnings.append(candidate["editorial_qa"]["duration_note"])
 
     # 4. Cut clips (FFmpeg)
     _emit_progress(
@@ -664,7 +993,6 @@ def run(
     # Process each clip one-by-one so partial results can stream to the UI.
     # Keep earlier stages until post-render QA confirms the final file is usable.
     processed = []
-    processing_warnings = list(candidate_warnings)
     for idx, clip in enumerate(clips):
         fallbacks = []
 
@@ -737,33 +1065,48 @@ def run(
             if clip.get("subtitle_warning"):
                 _add_render_warning(clip, clip["subtitle_warning"], processing_warnings)
 
-        # 6b. Burn the hook banner only if a complete output is produced.
+        # 6b. Burn the hook banner only if a complete output is produced and the
+        #     hook text is actually grounded in this clip's transcript span.
+        #     A fabricated quotation must never be burned onto the footage.
         if add_hook and clip.get("hook"):
-            prior_name = clip["file"]
-            src = os.path.join(output_dir, prior_name)
-            h_name = prior_name.rsplit(".", 1)[0] + "_hook.mp4"
-            h_path = os.path.join(output_dir, h_name)
-            try:
-                if not _nonempty_file(src):
-                    raise RuntimeError("The source clip is missing or empty.")
-                from .hooks import add_hook_to_video
-                add_hook_to_video(src, clip["hook"], h_path, position="top", duration=4.0)
-                if not _nonempty_file(h_path):
-                    raise RuntimeError("No non-empty hook-overlay file was created.")
-                fallbacks.append(prior_name)
-                clip["file"] = h_name
-                clip["hook_file"] = h_name
-            except Exception as exc:  # noqa: BLE001
+            hook_check = grounding.check_generated_text(
+                clip["hook"], transcript, clip.get("start"), clip.get("end")
+            )
+            if hook_check["status"] == "failed":
                 _add_render_warning(
                     clip,
-                    f"Hook overlay was skipped ({type(exc).__name__}); the prior clip was retained.",
+                    "Hook overlay was skipped: the generated hook text is not "
+                    "supported by this clip's transcript ("
+                    + "; ".join(hook_check["notes"][:1]) + ").",
                     processing_warnings,
                 )
+                clip["hook_skipped_ungrounded"] = True
+            else:
+                prior_name = clip["file"]
+                src = os.path.join(output_dir, prior_name)
+                h_name = prior_name.rsplit(".", 1)[0] + "_hook.mp4"
+                h_path = os.path.join(output_dir, h_name)
                 try:
-                    if os.path.exists(h_path):
-                        os.remove(h_path)
-                except OSError:
-                    pass
+                    if not _nonempty_file(src):
+                        raise RuntimeError("The source clip is missing or empty.")
+                    from .hooks import add_hook_to_video
+                    add_hook_to_video(src, clip["hook"], h_path, position="top", duration=4.0)
+                    if not _nonempty_file(h_path):
+                        raise RuntimeError("No non-empty hook-overlay file was created.")
+                    fallbacks.append(prior_name)
+                    clip["file"] = h_name
+                    clip["hook_file"] = h_name
+                except Exception as exc:  # noqa: BLE001
+                    _add_render_warning(
+                        clip,
+                        f"Hook overlay was skipped ({type(exc).__name__}); the prior clip was retained.",
+                        processing_warnings,
+                    )
+                    try:
+                        if os.path.exists(h_path):
+                            os.remove(h_path)
+                    except OSError:
+                        pass
 
         clip["_render_fallbacks"] = list(dict.fromkeys(fallbacks))
         processed.append(clip)
@@ -813,6 +1156,38 @@ def run(
                     "were preserved; meeting the target would require cutting speech or "
                     "reusing footage."
                 )
+            montage_segments = [
+                {
+                    "order": position + 1,
+                    "file": item.get("file"),
+                    "source_start": item.get("start"),
+                    "source_end": item.get("end"),
+                    "title": item.get("title"),
+                }
+                for position, item in enumerate(processed)
+                if not item.get("is_montage")
+            ]
+            # Stitching creates a NEW editorial sequence: the shots are not
+            # continuous in the source and must never be presented as one event.
+            montage_gaps = []
+            for previous, following in zip(montage_segments, montage_segments[1:]):
+                try:
+                    gap = float(following["source_start"]) - float(previous["source_end"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if gap > 1.0:
+                    montage_gaps.append(round(gap, 1))
+            montage_editorial = {
+                "status": "warning" if montage_gaps else "passed",
+                "warnings": (
+                    [
+                        "The montage stitches separate source moments "
+                        f"(gaps of {', '.join(str(g) + 's' for g in montage_gaps)}); "
+                        "they are not continuous in the original video."
+                    ] if montage_gaps else []
+                ),
+                "deterministic": True,
+            }
             processed.append({
                 "index": len(processed) + 1,
                 "file": montage_name,
@@ -823,6 +1198,8 @@ def run(
                 "target_duration": float(target_duration or 40),
                 "duration_delta": round(duration_delta, 2),
                 "is_montage": True,
+                "source_segments": montage_segments,
+                "editorial_qa": montage_editorial,
                 "reason": "Stitched from selected complementary moments with video/audio crossfades.",
             })
         except Exception as exc:
@@ -1115,6 +1492,58 @@ def run(
         video_info = probe_video_info(video_path)
     except Exception:  # noqa: BLE001
         video_info = {}
+
+    # Source-of-truth record: every editing decision must be traceable back to
+    # this asset and its transcript.
+    transcript_words = transcript.get("words") or []
+    source_asset = {
+        "file": os.path.basename(video_path),
+        "title": title,
+        "duration": video_info.get("duration") or transcript.get("duration"),
+        "width": video_info.get("width"),
+        "height": video_info.get("height"),
+        "has_audio": bool(video_info.get("has_audio")),
+        "probe_status": "probed" if video_info.get("width") else "probe_failed",
+        "transcript": {
+            "language": transcript.get("language"),
+            "segment_count": len(transcript.get("segments") or []),
+            "word_count": len(transcript_words),
+            "provider_confidence_available": any(
+                isinstance(word, dict) and word.get("probability") is not None
+                for word in transcript_words
+            ),
+            "cached": bool(cached_transcript_path),
+        },
+    }
+
+    # Three independent validation tracks. A technical pass never implies an
+    # editorial or factual pass; each track reports its own status and reasons.
+    def _aggregate_validation(track):
+        statuses = []
+        for clip in processed:
+            record = clip.get(track)
+            if isinstance(record, dict) and record.get("status"):
+                statuses.append(record["status"])
+        if not statuses:
+            return "not_run"
+        if any(status == "failed" for status in statuses):
+            return "fail"
+        if any(status == "warning" for status in statuses):
+            return "warning"
+        return "pass"
+
+    validation_summary = {
+        "technical": qa_status,
+        "editorial": _aggregate_validation("editorial_qa"),
+        "factual": _aggregate_validation("factual_qa"),
+        "note": (
+            "technical = rendered file checks; editorial = structure/duration/"
+            "boundary checks (deterministic); factual = source-grounding checks "
+            "(deterministic) plus any independent model review. A pass in one "
+            "track does not imply a pass in the others."
+        ),
+    }
+
     result = {
         "title": title,
         "source": source,
@@ -1123,6 +1552,7 @@ def run(
         "language": transcript.get("language"),
         "duration": transcript.get("duration"),
         "video_info": video_info,
+        "source_asset": source_asset,
         "aspect_ratio": aspect_key or ("16:9" if target_aspect is None else "9:16"),
         "clips": processed,
         "requested_clip_count": requested_individual_count,
@@ -1130,6 +1560,7 @@ def run(
         "montage_file": next((item["file"] for item in processed if item.get("is_montage")), None),
         "candidate_review": candidate_review,
         "quality_assurance": quality_assurance,
+        "validation_summary": validation_summary,
         "processing_warnings": list(dict.fromkeys(processing_warnings)),
         "elapsed_seconds": round(time.time() - start_time, 1),
     }

@@ -7,6 +7,55 @@ from . import config
 from .utils import logger
 
 
+class CandidateReviewError(ValueError):
+    """A classified independent-review failure.
+
+    ``category`` distinguishes failure modes so the pipeline never collapses
+    "review unavailable", "review malformed", and "review timed out" into a
+    single silent fallback:
+
+    - ``malformed``   — the model answered but the payload is unusable.
+    - ``invalid``     — a review row contradicts transcript evidence.
+    - ``timed_out``   — the provider did not answer in time.
+    - ``client_error``/``server_error``/``unavailable`` — provider failures.
+    """
+
+    def __init__(self, message, category="unavailable"):
+        super().__init__(message)
+        self.category = category
+
+
+class CandidateReviewTimeoutError(CandidateReviewError):
+    def __init__(self, message):
+        super().__init__(message, "timed_out")
+
+
+def _classify_review_exception(exc):
+    """Map a provider exception to a CandidateReviewError with a category."""
+    name = type(exc).__name__
+    detail = str(exc or "")
+    lowered = detail.lower()
+    if "timeout" in name.lower() or "deadline" in name.lower() or (
+        "timeout" in lowered or "timed out" in lowered or "deadline" in lowered
+    ):
+        return CandidateReviewTimeoutError(
+            f"Independent candidate review timed out ({name})."
+        )
+    category = "unavailable"
+    try:
+        from google.api_core import exceptions as gexc
+
+        if isinstance(exc, gexc.ClientError):
+            category = "client_error"
+        elif isinstance(exc, gexc.ServerError):
+            category = "server_error"
+    except Exception:  # noqa: BLE001 - classification is best-effort
+        pass
+    return CandidateReviewError(
+        f"Independent candidate review was unavailable ({name}).", category
+    )
+
+
 def _repair_json(text: str) -> str:
     """Fix common Gemini JSON issues: missing commas between array elements."""
     # Insert missing comma between } and { (objects in an array)
@@ -50,6 +99,8 @@ Rules:
 - Prioritize coherent standalone stories over isolated shocking lines. Include enough context for a viewer who has not seen the source.
 - Keep the opening hook within the first 1–3 seconds of the selected moment. End immediately after the conclusion, punchline, or useful takeaway.
 - Do not invent speech or infer words not present in the transcript.
+- Title and hook must describe what the selected footage actually delivers. Never fabricate a quotation: write a quoted phrase ONLY if those exact words appear in the transcript. Never promise a number of items ("3 rules") the selected span does not contain.
+- A duration target is a goal, not permission to include unrelated material: prefer a shorter, coherent, on-topic interval over a longer padded one.
 - Content focus: {focus}
 - Do not overlap clips. Use timestamps that exist in the transcript.
 - "start" and "end" are in seconds (numbers).
@@ -498,8 +549,46 @@ def find_viral_clips(transcript: dict, api_key: str = None, model: str = None,
         min_clip=min_s,
         max_clip=max_s,
     )
+    clips = _verify_evidence_quotes(transcript, clips)
     logger.info("Found %d viral clip candidate(s)", len(clips))
     return clips
+
+
+def _verify_evidence_quotes(transcript, clips):
+    """Verify each candidate's claimed evidence quote against the transcript.
+
+    A candidate whose evidence quote does not exist in the source is making an
+    unfounded claim of support and is dropped with a logged reason. Candidates
+    without a quote are kept but marked unverified; the deterministic
+    grounding stage (and any independent review) decides their fate.
+    """
+    from . import grounding
+
+    verified = []
+    for candidate in clips:
+        quote = (candidate.get("evidence_quote") or "").strip()
+        if not quote:
+            candidate["evidence_quote_verified"] = False
+            verified.append(candidate)
+            continue
+        check = grounding.verify_quote(
+            transcript, quote, candidate.get("start"), candidate.get("end")
+        )
+        if not check["verified"]:
+            logger.info(
+                "Dropped candidate %.1f-%.1f (%s): its evidence quote does not "
+                "appear in the transcript.",
+                candidate.get("start", 0.0), candidate.get("end", 0.0),
+                candidate.get("title", ""),
+            )
+            continue
+        candidate["evidence_quote_verified"] = True
+        if not check["in_span"]:
+            candidate.setdefault(
+                "grounding_notes", []
+            ).append("The evidence quote lies outside the candidate interval.")
+        verified.append(candidate)
+    return verified
 
 
 def _load_json(raw: str):
@@ -541,7 +630,16 @@ def _parse_clips(raw: str) -> list:
 
 
 def _validate_clips(clips: list, total_duration: float,
-                    min_clip: float = None, max_clip: float = None) -> list:
+                    min_clip: float = None, max_clip: float = None,
+                    exempt_user_selected: bool = False) -> list:
+    """Normalize and validate model/user-proposed clip intervals.
+
+    When ``exempt_user_selected`` is true, candidates carrying
+    ``_user_selected`` are validated against timestamp integrity and the hard
+    ceiling only — never against the target-duration window. Dropping a user's
+    explicit selection because it is shorter than the requested duration is
+    what previously forced the generator to pad with unrelated footage.
+    """
     valid = []
     for c in clips:
         try:
@@ -556,31 +654,38 @@ def _validate_clips(clips: list, total_duration: float,
             end = min(end, total_duration)
         if end <= start:
             continue
-        length = end - start
-        lower = (min_clip if min_clip is not None else config.MIN_CLIP_SECONDS) - 2
-        upper = (max_clip if max_clip is not None else config.MAX_CLIP_SECONDS) + 3
-        upper = min(upper, config.HARD_MAX_CLIP_SECONDS + 3)
-        if length < max(3.0, lower) or length > upper:
-            continue
+        user_selected = bool(c.get("_user_selected"))
+        if user_selected and exempt_user_selected:
+            # Keep the user's span; only enforce the absolute product limits.
+            if start < 0 or end - start > config.HARD_MAX_CLIP_SECONDS + 3:
+                continue
+        else:
+            length = end - start
+            lower = (min_clip if min_clip is not None else config.MIN_CLIP_SECONDS) - 2
+            upper = (max_clip if max_clip is not None else config.MAX_CLIP_SECONDS) + 3
+            upper = min(upper, config.HARD_MAX_CLIP_SECONDS + 3)
+            if length < max(3.0, lower) or length > upper:
+                continue
         try:
-            candidate_score = float(c.get("score", 50))
+            candidate_score = float(c.get("score", c.get("candidate_score", 50)))
             if not math.isfinite(candidate_score):
                 candidate_score = 50.0
         except (TypeError, ValueError):
             candidate_score = 50.0
-        valid.append(
-            {
-                "start": round(start, 2),
-                "end": round(end, 2),
-                "title": (c.get("title") or "Untitled Clip").strip()[:80],
-                "description": (c.get("description") or "").strip()[:220],
-                "hook": (c.get("hook") or "").strip()[:120],
-                "reason": (c.get("reason") or "").strip()[:500],
-                "story_arc": (c.get("story_arc") or "").strip()[:300],
-                "candidate_score": round(max(0.0, min(100.0, candidate_score)), 2),
-                "evidence_quote": (c.get("evidence_quote") or "").strip()[:320],
-            }
-        )
+        entry = {
+            "start": round(start, 2),
+            "end": round(end, 2),
+            "title": (c.get("title") or "Untitled Clip").strip()[:80],
+            "description": (c.get("description") or "").strip()[:220],
+            "hook": (c.get("hook") or "").strip()[:120],
+            "reason": (c.get("reason") or "").strip()[:500],
+            "story_arc": (c.get("story_arc") or "").strip()[:300],
+            "candidate_score": round(max(0.0, min(100.0, candidate_score)), 2),
+            "evidence_quote": (c.get("evidence_quote") or "").strip()[:320],
+        }
+        if user_selected:
+            entry["_user_selected"] = True
+        valid.append(entry)
     valid.sort(key=lambda x: x["start"])
     return valid
 
@@ -702,11 +807,24 @@ def review_clip_candidates(
     )
     client = genai.Client(api_key=api_key)
     contents = _review_frame_contents(genai, prompt, visual_samples)
-    response = config.gemini_generate(client, model, contents)
-    data = _load_json((response.text or "").strip())
+    try:
+        response = config.gemini_generate(client, model, contents)
+    except Exception as exc:  # classify provider failures explicitly
+        if isinstance(exc, CandidateReviewError):
+            raise
+        raise _classify_review_exception(exc) from exc
+    try:
+        data = _load_json((response.text or "").strip())
+    except RuntimeError as exc:
+        raise CandidateReviewError(
+            f"Independent candidate review returned unparseable output ({exc}).",
+            "malformed",
+        ) from exc
     rows = data.get("reviews") if isinstance(data, dict) else None
     if not isinstance(rows, list):
-        raise ValueError("Independent candidate review returned no reviews array.")
+        raise CandidateReviewError(
+            "Independent candidate review returned no reviews array.", "malformed"
+        )
 
     by_index = {}
     for row in rows:
@@ -719,7 +837,23 @@ def review_clip_candidates(
         if 0 <= index < len(candidates) and index not in by_index:
             by_index[index] = row
     if len(by_index) != len(candidates):
-        raise ValueError("Independent candidate review was incomplete; original timestamps were retained.")
+        raise CandidateReviewError(
+            "Independent candidate review was incomplete; original timestamps were retained.",
+            "malformed",
+        )
+
+    # Which candidates genuinely received sampled visual evidence. A transcript-
+    # only review must never be reported as visual verification downstream.
+    frames_by_candidate = {}
+    for sample in visual_samples or []:
+        if not isinstance(sample, dict):
+            continue
+        try:
+            sample_index = int(sample.get("candidate_index", -1))
+        except (TypeError, ValueError):
+            continue
+        if sample_index >= 0:
+            frames_by_candidate[sample_index] = frames_by_candidate.get(sample_index, 0) + 1
 
     accepted = []
     rejected_count = 0
@@ -727,17 +861,27 @@ def review_clip_candidates(
         row = by_index[index]
         decision = (row.get("decision") or "").strip().lower()
         if decision not in {"accept", "accepted", "keep", "approve", "approved", "reject", "rejected"}:
-            raise ValueError(f"Independent candidate review returned an invalid decision for candidate {index}.")
+            raise CandidateReviewError(
+                f"Independent candidate review returned an invalid decision for candidate {index}.",
+                "invalid",
+            )
         evidence = (row.get("transcript_evidence") or "").strip()
         excerpt = _candidate_transcript_excerpt(transcript, candidate)
         if not evidence or _normalize_quote(evidence) not in _normalize_quote(excerpt):
-            raise ValueError(f"Candidate {index} review did not provide a verifiable transcript quote.")
+            raise CandidateReviewError(
+                f"Candidate {index} review did not provide a verifiable transcript quote.",
+                "invalid",
+            )
         try:
             score = float(row.get("score"))
         except (TypeError, ValueError):
-            raise ValueError(f"Candidate {index} review score was invalid.")
+            raise CandidateReviewError(
+                f"Candidate {index} review score was invalid.", "invalid"
+            )
         if not math.isfinite(score):
-            raise ValueError(f"Candidate {index} review score was invalid.")
+            raise CandidateReviewError(
+                f"Candidate {index} review score was invalid.", "invalid"
+            )
         score = max(0.0, min(100.0, score))
 
         is_rejected = decision in {"reject", "rejected"}
@@ -745,13 +889,29 @@ def review_clip_candidates(
             rejected_count += 1
             continue
 
+        # Visual honesty: model-written visual_evidence is only retained when
+        # frames for THIS candidate were actually sampled and attached. The
+        # reviewer's words are still model claims, but they can no longer
+        # masquerade as visual verification of footage that was never shown.
+        visual_evidence = (row.get("visual_evidence") or "").strip()[:320]
+        frames_attached = frames_by_candidate.get(index, 0) > 0
+        if not frames_attached and visual_evidence and (
+            "not verifiable" not in visual_evidence.casefold()
+        ):
+            logger.info(
+                "Discarding unverifiable visual claim for candidate %d; no frames were sampled for it.",
+                index,
+            )
+            visual_evidence = "not verifiable from sampled frames"
+
         reviewed = {
             **candidate,
             "review_status": "flagged_user_selected" if is_rejected else "accepted",
             "review_score": round(score, 2),
             "review_reason": (row.get("reason") or "").strip()[:500],
             "review_evidence": evidence[:320],
-            "visual_evidence": (row.get("visual_evidence") or "").strip()[:320],
+            "visual_evidence": visual_evidence,
+            "visual_frames_attached": frames_attached,
         }
         if is_rejected:
             reviewed["review_warning"] = "The independent reviewer flagged this user-selected moment; it was retained for user review."
@@ -865,7 +1025,8 @@ def rank_and_diversify_candidates(candidates, target_count):
         ):
             continue
         candidate = {**candidate, "candidate_rank": len(selected) + 1}
-        candidate.pop("_user_selected", None)
+        # Keep the _user_selected flag through ranking: the pipeline still needs
+        # it to exempt the user's moment from duration-window filtering.
         selected.append(candidate)
         if len(selected) >= limit:
             break

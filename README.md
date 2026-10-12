@@ -317,10 +317,14 @@ backend/
     ingest.py          # yt-dlp download / local file
     audio.py           # audio extraction + chunking
     transcribe.py      # Groq Whisper transcription (cloud, chunked)
-    analyze.py         # Gemini viral moment detection (content-type aware)
+    analyze.py         # Gemini viral moment detection + grounded independent review
+    grounding.py       # Deterministic source-grounding & factual QA (no model calls)
     clip.py            # FFmpeg clip cutting (CRF 18, medium preset)
     reframe.py         # Optimized 9:16 vertical AI reframing (face/speaker tracking)
     subtitles.py       # SRT generation + burned-in caption rendering
+    montage.py         # Multi-shot montage stitching with crossfades
+    quality_assurance.py # Post-render technical QA on the real output file
+    visual_context.py  # Bounded visual frame sampling for multimodal review
     hooks.py           # hook text overlay rendering
     trending_youtube.py# real YouTube trending (mostPopular + category filter)
     youtube_uploader.py# YouTube OAuth upload
@@ -344,6 +348,29 @@ docker-compose.yml     # Local orchestration for backend + frontend
 railway.json           # Railway deployment configuration
 RAILWAY_DEPLOY.md      # Step-by-step Railway deployment guide
 ```
+
+## Source grounding & hallucination safeguards
+
+Every clip is traceable back to the source video. The pipeline enforces three
+independent validation tracks and never treats a technically successful render
+as proof that a clip is accurate or relevant:
+
+- **Factual grounding** (`grounding.py`, deterministic): evidence quotes must
+  exist verbatim in the transcript; titles/hooks are checked for fabricated
+  quotations and undeliverable count claims ("3 rules"); cuts are screened for
+  stripped negations/qualifiers/safety statements; off-topic AI candidates are
+  rejected; transcript-only analysis is never reported as visual verification.
+- **Editorial QA**: opening/ending sentence alignment, honest duration vs.
+  target, montage stitching gaps. A short, accurate clip is preferred over a
+  padded one — the duration target never justifies adding unrelated footage.
+- **Technical QA** (`quality_assurance.py`): streams, duration, aspect ratio,
+  audio, caption artifacts, and decodable frames are verified on the real
+  rendered file.
+
+Each track reports `pass` / `warning` / `fail` separately, and failed or
+skipped checks are disclosed rather than presented as passes. See
+`backend/GROUNDING_AND_QA.md` for the evidence hierarchy and failure states,
+and `backend/AUDIT_ROOT_CAUSES.md` for the knife-safety root-cause analysis.
 
 ## Roadmap
 
