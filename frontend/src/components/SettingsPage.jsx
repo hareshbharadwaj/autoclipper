@@ -151,11 +151,6 @@ export default function SettingsPage({ settings, setSettings }) {
               onChange={(v) => setSettings((s) => ({ ...s, useYolo: v }))}
             />
             <ToggleRow
-              label="Burn subtitle tracks"
-              checked={settings.subtitles}
-              onChange={(v) => setSettings((s) => ({ ...s, subtitles: v }))}
-            />
-            <ToggleRow
               label="Force HD download (≥720p)"
               checked={settings.forceHd}
               onChange={(v) => setSettings((s) => ({ ...s, forceHd: v }))}

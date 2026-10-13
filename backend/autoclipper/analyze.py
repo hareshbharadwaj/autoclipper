@@ -568,19 +568,26 @@ def _validate_clips(clips: list, total_duration: float,
                 candidate_score = 50.0
         except (TypeError, ValueError):
             candidate_score = 50.0
-        valid.append(
-            {
-                "start": round(start, 2),
-                "end": round(end, 2),
-                "title": (c.get("title") or "Untitled Clip").strip()[:80],
-                "description": (c.get("description") or "").strip()[:220],
-                "hook": (c.get("hook") or "").strip()[:120],
-                "reason": (c.get("reason") or "").strip()[:500],
-                "story_arc": (c.get("story_arc") or "").strip()[:300],
-                "candidate_score": round(max(0.0, min(100.0, candidate_score)), 2),
-                "evidence_quote": (c.get("evidence_quote") or "").strip()[:320],
-            }
-        )
+        entry = {
+            "start": round(start, 2),
+            "end": round(end, 2),
+            "title": (c.get("title") or "Untitled Clip").strip()[:80],
+            "description": (c.get("description") or "").strip()[:220],
+            "hook": (c.get("hook") or "").strip()[:120],
+            "reason": (c.get("reason") or "").strip()[:500],
+            "story_arc": (c.get("story_arc") or "").strip()[:300],
+            "candidate_score": round(max(0.0, min(100.0, candidate_score)), 2),
+            "evidence_quote": (c.get("evidence_quote") or "").strip()[:320],
+        }
+        # Preserve a per-moment duration target (analysis angles) so each clip
+        # can be planned against its own requested length.
+        try:
+            moment_target = float(c.get("target_duration"))
+            if math.isfinite(moment_target) and 5.0 <= moment_target <= config.HARD_MAX_CLIP_SECONDS:
+                entry["target_duration"] = round(moment_target, 2)
+        except (TypeError, ValueError):
+            pass
+        valid.append(entry)
     valid.sort(key=lambda x: x["start"])
     return valid
 

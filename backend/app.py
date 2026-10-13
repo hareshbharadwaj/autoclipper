@@ -395,7 +395,6 @@ async def process(
     gemini_model: str = Form(None),
     vertical: bool = Form(True),
     use_yolo: bool = Form(True),
-    subtitles: bool = Form(True),
     split_screen: bool = Form(False),
     force_hd: bool = Form(False),
     youtube_cookies: str = Form(None),
@@ -418,10 +417,17 @@ async def process(
     background_music_file: UploadFile = File(None),
     music_volume: float = Form(0.18),
     content_type: str = Form("general"),
+    generation_mode: str = Form("source_only"),
     current: User = Depends(get_current_user),
 ):
     try:
         clip_count = pipeline._normalize_clip_count(clip_count)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        from autoclipper.edit_planner import normalize_generation_mode
+
+        generation_mode = normalize_generation_mode(generation_mode)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     ensure_ffmpeg()
@@ -517,7 +523,6 @@ async def process(
         "gemini_model": gemini_model,
         "vertical": vertical,
         "use_yolo": use_yolo,
-        "subtitles": subtitles,
         "split_screen": split_screen,
         "force_hd": force_hd,
         "cookies_text": youtube_cookies,
@@ -527,6 +532,7 @@ async def process(
         "min_clip": min_clip,
         "max_clip": max_clip,
         "target_duration": target_duration,
+        "generation_mode": generation_mode,
         "custom_prompt": custom_prompt,
         "selected_clip": json.loads(selected_clip) if selected_clip else None,
         "selected_clips": selected_clips_data,

@@ -128,22 +128,29 @@ def _break_long_word(draw, word, font, emoji_font, max_width):
 
 
 def download_font_if_needed():
-    """Downloads a serif font for the hook text if not present."""
-    if not os.path.exists(FONT_DIR):
-        os.makedirs(FONT_DIR)
-    if not os.path.exists(FONT_PATH):
-        print(f"⚠️ Downloading font from {FONT_URL}...")
-        try:
-            # Add user agent to avoid 403s slightly
-            req = urllib.request.Request(
-                FONT_URL,
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
-            with urllib.request.urlopen(req) as response, open(FONT_PATH, 'wb') as out_file:
-                out_file.write(response.read())
-            print("✅ Font downloaded.")
-        except Exception as e:
-            print(f"⚠️ Failed to download font: {e}")
+    """Downloads a serif font for the hook text if not present.
+
+    Never fatal: on read-only or missing font directories the loader falls
+    back to Pillow's bundled default font so hook rendering still works.
+    """
+    try:
+        if not os.path.exists(FONT_DIR):
+            os.makedirs(FONT_DIR)
+        if not os.path.exists(FONT_PATH):
+            print(f"⚠️ Downloading font from {FONT_URL}...")
+            try:
+                # Add user agent to avoid 403s slightly
+                req = urllib.request.Request(
+                    FONT_URL,
+                    headers={'User-Agent': 'Mozilla/5.0'}
+                )
+                with urllib.request.urlopen(req) as response, open(FONT_PATH, 'wb') as out_file:
+                    out_file.write(response.read())
+                print("✅ Font downloaded.")
+            except Exception as e:
+                print(f"⚠️ Failed to download font: {e}")
+    except OSError as e:
+        print(f"⚠️ Font directory {FONT_DIR} is not writable ({e}); using default font.")
 
 
 # Hook visual styles. Each maps to box fill (RGBA, alpha 0 = no box), text
