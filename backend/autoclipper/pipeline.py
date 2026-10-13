@@ -1057,6 +1057,10 @@ def run(
             else:
                 raise RuntimeError("Audio mix did not produce a non-empty output file.")
         except Exception as exc:
+            # The unmixed clip is delivered: clear metadata that only describes
+            # the discarded mix so the clip never claims audio it does not have.
+            audio_target.pop("audio_mixed", None)
+            audio_target.pop("voiceover_duration", None)
             warning = f"Voiceover/music mixing failed ({type(exc).__name__}); the unmixed clip was retained."
             processing_warnings.append(warning)
             logger.exception("Voiceover/music mixing failed")
@@ -1181,6 +1185,17 @@ def run(
                             "The AI narration card was dropped with the failed "
                             "final render; delivering the verified source-only "
                             "clip."
+                        )
+                    if clip.get("audio_mixed"):
+                        # Every earlier render predates the music/voiceover mix
+                        # (the mixed render itself is what failed QA): clear
+                        # the mix-only metadata for whichever fallback ships.
+                        clip.pop("audio_mixed", None)
+                        clip.pop("voiceover_duration", None)
+                        fallback_qa.setdefault("warnings", []).append(
+                            "The music/voiceover mix was dropped with the "
+                            "failed final render; delivering a clip without "
+                            "that audio mix."
                         )
                     if fallback_qa.get("status") == "fail":
                         tolerated = list(fallback_qa.get("errors") or [])

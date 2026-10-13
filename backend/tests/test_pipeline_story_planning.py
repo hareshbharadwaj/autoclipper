@@ -704,3 +704,175 @@ def test_narrated_render_fails_qa_and_source_only_fallback_is_verified_correctly
     warnings = " ".join(result["processing_warnings"]).lower()
     assert "narration card was dropped" in warnings
     assert "source-only" in warnings
+
+
+def _mock_narration_and_audio(monkeypatch, tmp_path, mix_impl=None):
+    """Mock narration TTS/rendering and audio mixing for pipeline tests."""
+    import autoclipper.voiceover as voiceover_mod
+    import autoclipper.audio_mix as audio_mix_mod
+
+    def fake_generate_voiceover(text, out_path, engine="auto", voice=None, gemini_key=None):
+        with open(out_path, "wb") as handle:
+            handle.write(b"wav-bytes")
+        return out_path
+
+    def fake_build_intro(video_in, wav_in, out_path, hook_text="", **kwargs):
+        with open(out_path, "wb") as handle:
+            handle.write(b"card-bytes")
+        return out_path
+
+    def fake_concat(a, b, out_path):
+        with open(out_path, "wb") as handle:
+            handle.write(b"final-bytes")
+        return out_path
+
+    def fake_mix(video_in, video_out, **kwargs):
+        with open(video_out, "wb") as handle:
+            handle.write(b"mixed-bytes")
+        return video_out
+
+    monkeypatch.setattr(voiceover_mod, "generate_voiceover", fake_generate_voiceover)
+    monkeypatch.setattr(voiceover_mod, "build_intro", fake_build_intro)
+    monkeypatch.setattr(voiceover_mod, "concat_videos", fake_concat)
+    monkeypatch.setattr(voiceover_mod, "wav_duration", lambda _p: 6.5)
+    monkeypatch.setattr(audio_mix_mod, "mix_audio_layers", mix_impl or fake_mix)
+    monkeypatch.setattr(
+        pipeline, "probe_duration",
+        lambda path: 4.0 if str(path).endswith(".wav") else 5.0,
+    )
+
+
+def test_chained_failure_restores_source_only_clip_with_clean_audio_and_narration_metadata(
+    tmp_path, monkeypatch
+):
+    """Review edge case: mixed render fails QA, the narrated render also fails,
+    and the source-only clip is restored — audio-mix metadata (audio_mixed,
+    voiceover_duration) must not survive to claim a mix the delivered file
+    never had."""
+    transcript = _stub_transcript()
+    _patch_common(monkeypatch, tmp_path, transcript, [_short_candidate()])
+    monkeypatch.setattr(pipeline, "cut_all", _fake_cut_all_factory(tmp_path))
+    _mock_narration_and_audio(monkeypatch, tmp_path)
+
+    qa_calls = []
+
+    def qa_fail_mixed_and_narrated(path, **kwargs):
+        name = os.path.basename(path)
+        qa_calls.append((name, kwargs.get("expected_duration")))
+        if name.endswith("_audio.mp4") or name.endswith("_ainarr.mp4"):
+            return {
+                "status": "fail", "file": name,
+                "checks": {"streams": {"ok": True}},
+                "warnings": [],
+                "errors": [f"Synthetic QA failure for {name}."],
+            }
+        return {
+            "status": "pass", "file": name,
+            "checks": {"duration": {"ok": True, "actual_seconds": 5.0}},
+            "warnings": [], "errors": [],
+        }
+
+    monkeypatch.setattr(pipeline, "verify_rendered_file", qa_fail_mixed_and_narrated)
+    result = pipeline.run(
+        "stub", output_dir=str(tmp_path / "job"),
+        clip_count=1, target_duration=40, generation_mode="ai_expanded",
+        voiceover_text="Some user voiceover script",
+        vertical=False, subtitles=False,
+    )
+    clip = result["clips"][0]
+    assert clip["file"] == "clip_1.mp4"
+    assert clip["qa_status"] == "warning"
+    assert clip["quality_assurance"]["fallback_used"] is True
+    # Audio-mix metadata must be gone: the delivered file has no mix.
+    assert clip.get("audio_mixed") is None
+    assert clip.get("voiceover_duration") is None
+    # Narration metadata is gone too (source-only file ships).
+    assert clip.get("ai_narration") is None
+    assert clip["edit_plan"]["narration"] is None
+    assert clip["edit_plan"].get("narration_failed", {}).get("script")
+    assert clip.get("planned_rendered_duration") is None
+    # The restored fallback was verified against the source-only duration.
+    fallback_calls = [call for call in qa_calls if call[0] == "clip_1.mp4"]
+    assert fallback_calls and fallback_calls[-1][1] == pytest.approx(5.0, abs=0.05)
+    warnings = " ".join(result["processing_warnings"]).lower()
+    assert "narration card was dropped" in warnings
+    assert "music/voiceover mix was dropped" in warnings
+
+
+def test_mixed_render_failure_keeps_narration_but_clears_audio_metadata(
+    tmp_path, monkeypatch
+):
+    """When only the mixed render fails and the narrated render is restored,
+    the narration ships (metadata kept) but the audio mix does not (metadata
+    cleared)."""
+    transcript = _stub_transcript()
+    _patch_common(monkeypatch, tmp_path, transcript, [_short_candidate()])
+    monkeypatch.setattr(pipeline, "cut_all", _fake_cut_all_factory(tmp_path))
+    _mock_narration_and_audio(monkeypatch, tmp_path)
+
+    def qa_fail_mixed_only(path, **kwargs):
+        name = os.path.basename(path)
+        if name.endswith("_audio.mp4"):
+            return {
+                "status": "fail", "file": name,
+                "checks": {"streams": {"ok": True}},
+                "warnings": [],
+                "errors": ["Synthetic mixed-render QA failure."],
+            }
+        return {
+            "status": "pass", "file": name,
+            "checks": {"duration": {"ok": True, "actual_seconds": 11.5}},
+            "warnings": [], "errors": [],
+        }
+
+    monkeypatch.setattr(pipeline, "verify_rendered_file", qa_fail_mixed_only)
+    result = pipeline.run(
+        "stub", output_dir=str(tmp_path / "job"),
+        clip_count=1, target_duration=40, generation_mode="ai_expanded",
+        voiceover_text="Some user voiceover script",
+        vertical=False, subtitles=False,
+    )
+    clip = result["clips"][0]
+    assert clip["file"] == "clip_1_ainarr.mp4"
+    # The narration card ships with this fallback, so its metadata stays.
+    assert clip.get("ai_narration", {}).get("file") == "clip_1_ainarr.mp4"
+    assert clip["edit_plan"]["narration"] is not None
+    # The audio mix does not ship — its metadata must be cleared.
+    assert clip.get("audio_mixed") is None
+    assert clip.get("voiceover_duration") is None
+    warnings = " ".join(result["processing_warnings"]).lower()
+    assert "music/voiceover mix was dropped" in warnings
+    assert "narration card was dropped" not in warnings
+
+
+def test_failed_audio_mix_leaves_no_audio_metadata(tmp_path, monkeypatch):
+    """If the mix stage itself fails, the retained unmixed clip must not carry
+    audio_mixed/voiceover_duration metadata."""
+    transcript = _stub_transcript()
+    _patch_common(monkeypatch, tmp_path, transcript, [_short_candidate()])
+    monkeypatch.setattr(pipeline, "cut_all", _fake_cut_all_factory(tmp_path))
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("mixer unavailable")
+
+    _mock_narration_and_audio(monkeypatch, tmp_path, mix_impl=boom)
+
+    def qa_pass(path, **_kwargs):
+        return {"status": "pass", "file": os.path.basename(path), "checks": {
+            "duration": {"ok": True, "actual_seconds": 5.0},
+        }, "warnings": [], "errors": []}
+
+    monkeypatch.setattr(pipeline, "verify_rendered_file", qa_pass)
+    result = pipeline.run(
+        "stub", output_dir=str(tmp_path / "job"),
+        clip_count=1, target_duration=15, generation_mode="source_only",
+        voiceover_text="Some user voiceover script",
+        vertical=False, subtitles=False,
+    )
+    clip = result["clips"][0]
+    assert clip["file"] == "clip_1.mp4"
+    assert clip.get("audio_mixed") is None
+    assert clip.get("voiceover_duration") is None
+    assert any(
+        "mixing failed" in warning.lower() for warning in result["processing_warnings"]
+    )
