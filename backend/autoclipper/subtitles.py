@@ -5,6 +5,7 @@ final clip with ffmpeg's subtitles filter (libass). Word-by-word timing gives
 the classic short-form caption look.
 """
 import os
+import re
 import subprocess
 import textwrap
 
@@ -213,6 +214,55 @@ def cues_to_srt(cues: list) -> str:
     for idx, (start, end, text) in enumerate(blocks, start=1):
         lines.append(f"{idx}\n{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n{text}\n")
     return "\n".join(lines)
+
+
+_SRT_TIME_RE = re.compile(
+    r"^(\d+):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d+):(\d{2}):(\d{2}),(\d{3})$"
+)
+
+
+def parse_srt(text: str) -> list:
+    """Parse SRT content into [{"start","end","text"}] cue dicts (seconds)."""
+    cues = []
+    for block in re.split(r"\n\s*\n", (text or "").strip()):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        time_index = next(
+            (i for i, line in enumerate(lines) if _SRT_TIME_RE.match(line)), None
+        )
+        if time_index is None:
+            continue
+        match = _SRT_TIME_RE.match(lines[time_index])
+        h1, m1, s1, ms1, h2, m2, s2, ms2 = match.groups()
+        start = int(h1) * 3600 + int(m1) * 60 + int(s1) + int(ms1) / 1000.0
+        end = int(h2) * 3600 + int(m2) * 60 + int(s2) + int(ms2) / 1000.0
+        body = " ".join(lines[time_index + 1:]).strip()
+        if body and end > start:
+            cues.append({"start": start, "end": end, "text": body})
+    return cues
+
+
+def rebase_srt_file(srt_path: str, plan: dict, clip_source_start: float = 0.0,
+                    out_path: str = None) -> str:
+    """Rewrite an SRT sidecar onto a clip's edit timeline.
+
+    Clip-relative cue times are mapped through the edit plan's source->edit
+    segments (see ``edit_planner.rebase_cues``) so captions stay aligned when a
+    narration card is prepended or passages are re-ordered. Cues that would
+    cross a planned segment boundary are clipped to it.
+    """
+    from .edit_planner import rebase_cues
+
+    if not srt_path or not os.path.isfile(srt_path):
+        return srt_path
+    with open(srt_path, "r", encoding="utf-8-sig") as handle:
+        cues = parse_srt(handle.read())
+    rebased = rebase_cues(cues, plan, clip_source_start=clip_source_start)
+    if not rebased:
+        return srt_path
+    destination = out_path or srt_path
+    with open(destination, "w", encoding="utf-8") as handle:
+        handle.write(cues_to_srt(rebased))
+    return destination
 
 
 def _escape_filter_path(path: str) -> str:

@@ -123,6 +123,7 @@ export default function App() {
     if (payload.minClip) opts.min_clip = payload.minClip
     if (payload.maxClip) opts.max_clip = payload.maxClip
     if (payload.targetDuration) opts.target_duration = payload.targetDuration
+    if (payload.generationMode) opts.generation_mode = payload.generationMode
     if (payload.customPrompt) opts.custom_prompt = payload.customPrompt
     if (payload.selectedClip) opts.selected_clip = JSON.stringify(payload.selectedClip)
     if (payload.selectedClips) opts.selected_clips = JSON.stringify(payload.selectedClips)

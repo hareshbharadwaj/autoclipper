@@ -10,6 +10,13 @@ from .analyze import (
     _filter_clips_to_bounds, _resolve_clip_bounds, _validate_clips,
 )
 from .clip import cut_all
+from .edit_planner import (
+    build_edit_plan,
+    duration_mismatch_warning,
+    finalize_narration_timing,
+    normalize_generation_mode,
+)
+from .editorial_qa import editorial_summary, review_edit_plan
 from .ingest import ingest
 from .reframe import VERTICAL_ASPECT, reframe_clip
 from .subtitles import add_subtitles
@@ -395,6 +402,176 @@ def _enforce_clip_constraints(clips, min_clip, max_clip, clip_count, video_dur, 
     return cleaned
 
 
+def _plan_clip_edits(candidates, transcript, video_dur, target_duration,
+                     generation_mode, custom_prompt, processing_warnings):
+    """Shape each candidate into a complete, standalone planned edit.
+
+    The edit planner — not a blind segment-extension rule — decides the final
+    source bounds: it repairs the opening and conclusion at sentence
+    boundaries, expands with relevant context (or trims the front of the body)
+    toward the requested duration when the story allows it, and reports any
+    shortfall explicitly instead of padding with unrelated material.
+    """
+    planned = []
+    for candidate in candidates or []:
+        try:
+            plan = build_edit_plan(
+                transcript,
+                candidate,
+                target_duration=target_duration,
+                generation_mode=generation_mode,
+                custom_prompt=custom_prompt,
+                total_duration=video_dur,
+            )
+            editorial = review_edit_plan(plan, transcript)
+        except Exception as exc:  # noqa: BLE001 — keep the candidate, explain why
+            logger.warning(
+                "Edit planning failed (%s); keeping original candidate bounds.",
+                type(exc).__name__,
+            )
+            _add_render_warning(
+                candidate,
+                f"Edit planning could not run ({type(exc).__name__}); the "
+                "original candidate timestamps were kept without story "
+                "structure checks.",
+                processing_warnings,
+            )
+            planned.append(candidate)
+            continue
+        shaped = {
+            **candidate,
+            "start": plan["source_start"],
+            "end": plan["source_end"],
+            "edit_plan": plan,
+            "editorial_qa": editorial,
+        }
+        if plan.get("target_duration") is not None:
+            shaped["target_duration"] = plan["target_duration"]
+            shaped["duration_delta"] = round(
+                plan["estimated_duration"] - plan["target_duration"], 2
+            )
+        planned.append(shaped)
+        for warning in plan.get("warnings", []):
+            _add_render_warning(shaped, warning, processing_warnings)
+        if editorial.get("status") == "fail":
+            detail = "; ".join(editorial.get("errors") or ["story structure check failed"])
+            _add_render_warning(
+                shaped, f"Editorial QA failed: {detail}", processing_warnings
+            )
+    return planned
+
+
+def _apply_ai_narration(clip, plan, output_dir, base_name, voiceover_engine,
+                        voiceover_voice, gemini_key, processing_warnings):
+    """Prepend a clearly labelled, transcript-grounded AI narration card.
+
+    Used only in AI-expanded mode when the source is too short for the
+    requested duration. The card is a frozen frame carrying generated speech
+    built from verbatim transcript quotes; the original speaker's clip and
+    words are untouched. On failure the source-only clip is delivered with an
+    explicit warning.
+    """
+    narration = (plan or {}).get("narration") or {}
+    script = (narration.get("script") or "").strip()
+    if not script or clip.get("is_montage"):
+        return False
+    prior_name = clip.get("file")
+    src = os.path.join(output_dir, prior_name or "")
+    if not _nonempty_file(src):
+        return False
+    try:
+        from .voiceover import build_intro, concat_videos, generate_voiceover, wav_duration
+
+        wav_path = os.path.join(
+            output_dir, f"{base_name}_narration_{clip.get('index', 0)}.wav"
+        )
+        generate_voiceover(
+            script,
+            wav_path,
+            engine=voiceover_engine or "auto",
+            voice=voiceover_voice,
+            gemini_key=gemini_key,
+        )
+        if not _nonempty_file(wav_path):
+            raise RuntimeError("Narration synthesis produced no audio.")
+        actual = wav_duration(wav_path)
+        if actual <= 0:
+            raise RuntimeError("Narration audio duration could not be verified.")
+        finalize_narration_timing(plan, actual)
+
+        card_name = prior_name.rsplit(".", 1)[0] + "_narrationcard.mp4"
+        card_path = os.path.join(output_dir, card_name)
+        build_intro(
+            src,
+            wav_path,
+            card_path,
+            hook_text=narration.get("label") or "AI narration",
+            duration=actual,
+        )
+        final_name = prior_name.rsplit(".", 1)[0] + "_ainarr.mp4"
+        final_path = os.path.join(output_dir, final_name)
+        concat_videos(card_path, src, final_path)
+        if not _nonempty_file(final_path):
+            raise RuntimeError("Narration concat produced no output.")
+
+        # Captions: burned ones ride inside the source segment; the SRT sidecar
+        # is rebased onto the edit timeline (narration card first).
+        if clip.get("srt"):
+            try:
+                from .subtitles import rebase_srt_file
+
+                rebase_srt_file(
+                    os.path.join(output_dir, clip["srt"]),
+                    plan,
+                    clip_source_start=float(clip.get("start", 0.0)),
+                )
+            except Exception as exc:  # noqa: BLE001
+                _add_render_warning(
+                    clip,
+                    f"Caption sidecar could not be rebased after the narration "
+                    f"card ({type(exc).__name__}); burned-in captions remain "
+                    "correct.",
+                    processing_warnings,
+                )
+
+        clip.setdefault("_render_fallbacks", []).append(prior_name)
+        clip["file"] = final_name
+        clip["ai_narration"] = {
+            "script": script[:2000],
+            "label": narration.get("label"),
+            "estimated_duration": narration.get("estimated_duration"),
+            "actual_duration": narration.get("actual_duration"),
+            "position": narration.get("position"),
+            "origin": "ai",
+            "grounding_quotes": list(narration.get("grounding_quotes") or []),
+        }
+        clip["planned_rendered_duration"] = plan.get("estimated_duration")
+        try:
+            if os.path.isfile(card_path):
+                os.remove(card_path)
+        except OSError:
+            pass
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _add_render_warning(
+            clip,
+            f"AI-expanded narration could not be generated ({type(exc).__name__}); "
+            "delivering the source-only clip. "
+            + str((plan or {}).get("duration_explanation") or ""),
+            processing_warnings,
+        )
+        try:
+            card_path = os.path.join(
+                output_dir, (clip.get("file") or prior_name or "").rsplit(".", 1)[0] + "_narrationcard.mp4"
+            )
+            if os.path.isfile(card_path):
+                os.remove(card_path)
+        except OSError:
+            pass
+        clip["file"] = prior_name
+        return False
+
+
 def run(
     source: str,
     output_dir: str = "output",
@@ -413,6 +590,7 @@ def run(
     max_clip: float = None,
     content_type: str = None,
     target_duration: float = None,
+    generation_mode: str = "source_only",
     custom_prompt: str = None,
     selected_clip: dict = None,
     aspect_ratio: str = None,
@@ -436,6 +614,7 @@ def run(
     """
     # Clamp oversized requests and validate count before any ingest/model work.
     target_duration = _normalize_target_duration(target_duration)
+    generation_mode = normalize_generation_mode(generation_mode)
     clip_count = _normalize_clip_count(clip_count)
     if montage:
         if not selected_clips or not 2 <= len(selected_clips) <= 3:
@@ -628,24 +807,40 @@ def run(
         requested_individual_count, min_clip, max_clip, len(candidate_pool), len(clip_candidates),
     )
 
-    # Apply hard duration bounds without blindly padding with unrelated footage or
-    # truncating a sentence/payoff. Candidate selection should respect the bounds.
-    if effective_min_clip is not None or effective_max_clip is not None or requested_individual_count:
-        constraint_count = len(clip_candidates) if montage else requested_individual_count
-        clip_candidates = _enforce_clip_constraints(
-            clip_candidates, effective_min_clip, effective_max_clip,
-            constraint_count, video_dur,
-            trim_long=False, pad_short=False,
+    # Story planning replaces blind duration enforcement. Each candidate is
+    # shaped into a complete standalone edit (opening -> body -> conclusion)
+    # before rendering: the planner repairs mid-thought boundaries at sentence
+    # edges, expands with relevant context or trims toward the requested
+    # duration when the story allows, and reports any mismatch explicitly
+    # instead of silently dropping clips or padding with unrelated material.
+    if montage:
+        if effective_min_clip is not None or effective_max_clip is not None or requested_individual_count:
+            clip_candidates = _enforce_clip_constraints(
+                clip_candidates, effective_min_clip, effective_max_clip,
+                len(clip_candidates), video_dur,
+                trim_long=False, pad_short=False,
+            )
+    elif clip_candidates:
+        clip_candidates = _plan_clip_edits(
+            clip_candidates, transcript, video_dur, target_duration,
+            generation_mode, custom_prompt, candidate_warnings,
         )
-        if not montage:
+        if target_duration is None:
+            # Legacy min/max mode keeps its established bounds check; the
+            # target-duration path never silently drops a planned story.
             clip_candidates = _filter_clips_to_bounds(
                 clip_candidates,
                 min_clip=effective_min_clip,
                 max_clip=effective_max_clip,
-                min_tolerance=0.0 if target_duration is not None else 2.0,
-                max_tolerance=0.0 if target_duration is not None else 3.0,
+                min_tolerance=2.0,
+                max_tolerance=3.0,
             )
-        logger.info("After enforcement: %d clip(s)", len(clip_candidates))
+        clip_candidates = _enforce_clip_constraints(
+            clip_candidates, effective_min_clip, effective_max_clip,
+            requested_individual_count, video_dur,
+            trim_long=False, pad_short=False,
+        )
+        logger.info("After planning: %d clip(s)", len(clip_candidates))
     if not clip_candidates:
         logger.warning("No viral clips detected.")
 
@@ -766,6 +961,36 @@ def run(
                     pass
 
         clip["_render_fallbacks"] = list(dict.fromkeys(fallbacks))
+
+        # 6c. AI-expanded mode: when the source story alone cannot reach the
+        #     requested duration, prepend a clearly labelled narration card
+        #     built from verbatim transcript quotes. Source-only mode never
+        #     generates speech; the original speaker's clip is untouched.
+        if (
+            generation_mode == "ai_expanded"
+            and not montage
+            and (clip.get("edit_plan") or {}).get("narration")
+        ):
+            if _apply_ai_narration(
+                clip,
+                clip["edit_plan"],
+                output_dir,
+                base_name,
+                voiceover_engine,
+                voiceover_voice,
+                gemini_key,
+                processing_warnings,
+            ):
+                _emit_progress(
+                    on_progress,
+                    "rendering",
+                    f"Clip {idx + 1}: labelled AI narration card added "
+                    "(transcript-grounded).",
+                    current=idx + 1,
+                    total=total_clips,
+                    candidate_review=candidate_review,
+                )
+
         processed.append(clip)
         _emit_progress(
             on_progress,
@@ -909,13 +1134,25 @@ def run(
     quality_reports = []
     failed_outputs = []
     verified_clips = []
+    editorial_reviews = []
     for clip in list(processed):
         is_montage_clip = bool(clip.get("is_montage"))
         try:
-            expected_duration = (
-                float(clip.get("duration")) if is_montage_clip
-                else float(clip.get("end", 0.0)) - float(clip.get("start", 0.0))
-            )
+            if is_montage_clip:
+                expected_duration = float(clip.get("duration"))
+            else:
+                # Expect the edit-timeline length (source passages plus any
+                # measured narration card), never a bare transcript guess.
+                planned_rendered = clip.get("planned_rendered_duration")
+                if planned_rendered is None:
+                    edit_plan = clip.get("edit_plan") or {}
+                    if edit_plan.get("estimated_duration") is not None:
+                        planned_rendered = edit_plan.get("estimated_duration")
+                        clip["planned_rendered_duration"] = planned_rendered
+                expected_duration = (
+                    float(planned_rendered) if planned_rendered is not None
+                    else float(clip.get("end", 0.0)) - float(clip.get("start", 0.0))
+                )
         except (TypeError, ValueError):
             expected_duration = None
         expected_audio = (
@@ -1011,6 +1248,29 @@ def run(
         clip["quality_assurance"] = qa
         clip["qa_status"] = qa.get("status", "fail")
         checks = qa.get("checks") or {}
+        # Editorial QA is tracked separately from the render verdict: a clip
+        # that fails technical QA still keeps its story review (and vice versa
+        # a technical pass is never an editorial pass).
+        if clip.get("editorial_qa"):
+            editorial_reviews.append({
+                "index": clip.get("index"),
+                "file": clip.get("file"),
+                **clip.get("editorial_qa"),
+            })
+        # Never silently miss the requested duration: compare the rendered
+        # length against the planning target and explain any mismatch.
+        rendered_duration = (checks.get("duration") or {}).get("actual_seconds")
+        plan_target = (clip.get("edit_plan") or {}).get("target_duration")
+        if plan_target is None:
+            plan_target = target_duration
+        if rendered_duration and plan_target:
+            mismatch = duration_mismatch_warning(
+                plan_target,
+                rendered_duration,
+                context=f"Clip {clip.get('index', '?')}",
+            )
+            if mismatch:
+                _add_render_warning(clip, mismatch, processing_warnings)
         if clip.get("vertical_file") in fallbacks:
             if (checks.get("aspect_ratio") or {}).get("ok"):
                 clip["vertical_file"] = clip["file"]
@@ -1053,6 +1313,7 @@ def run(
                 "title": clip.get("title"),
                 "file": clip.get("file"),
                 "quality_assurance": qa,
+                "editorial_qa": clip.get("editorial_qa"),
             })
             clip.pop("_render_fallbacks", None)
             continue
@@ -1130,6 +1391,8 @@ def run(
         "montage_file": next((item["file"] for item in processed if item.get("is_montage")), None),
         "candidate_review": candidate_review,
         "quality_assurance": quality_assurance,
+        "editorial_qa": editorial_summary(editorial_reviews),
+        "generation_mode": generation_mode,
         "processing_warnings": list(dict.fromkeys(processing_warnings)),
         "elapsed_seconds": round(time.time() - start_time, 1),
     }
