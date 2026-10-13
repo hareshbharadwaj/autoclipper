@@ -623,3 +623,84 @@ def test_pipeline_marks_clip_unreviewed_when_edit_planning_fails(tmp_path, monke
     assert result["editorial_qa"]["status"] == "warning"
     assert result["editorial_qa"]["unchecked_clip_count"] == 1
     assert any("unreviewed" in w.lower() for w in result["processing_warnings"])
+
+
+def test_narrated_render_fails_qa_and_source_only_fallback_is_verified_correctly(
+    tmp_path, monkeypatch
+):
+    """Review edge case: when the narrated final render fails QA, the restored
+    source-only fallback must be verified against the source-only edit
+    duration — not the narrated total — and its metadata must drop the
+    narration that no longer ships."""
+    transcript = _stub_transcript()
+    _patch_common(monkeypatch, tmp_path, transcript, [_short_candidate()])
+    monkeypatch.setattr(pipeline, "cut_all", _fake_cut_all_factory(tmp_path))
+
+    import autoclipper.voiceover as voiceover_mod
+
+    def fake_generate_voiceover(text, out_path, engine="auto", voice=None, gemini_key=None):
+        with open(out_path, "wb") as handle:
+            handle.write(b"wav-bytes")
+        return out_path
+
+    def fake_build_intro(video_in, wav_in, out_path, hook_text="", **kwargs):
+        with open(out_path, "wb") as handle:
+            handle.write(b"card-bytes")
+        return out_path
+
+    def fake_concat(a, b, out_path):
+        with open(out_path, "wb") as handle:
+            handle.write(b"final-bytes")
+        return out_path
+
+    monkeypatch.setattr(voiceover_mod, "generate_voiceover", fake_generate_voiceover)
+    monkeypatch.setattr(voiceover_mod, "build_intro", fake_build_intro)
+    monkeypatch.setattr(voiceover_mod, "concat_videos", fake_concat)
+    monkeypatch.setattr(voiceover_mod, "wav_duration", lambda _p: 6.5)
+
+    qa_calls = []
+
+    def qa_fail_narrated_only(path, **kwargs):
+        name = os.path.basename(path)
+        qa_calls.append((name, kwargs.get("expected_duration")))
+        if name.endswith("_ainarr.mp4"):
+            return {
+                "status": "fail", "file": name,
+                "checks": {"streams": {"ok": True}},
+                "warnings": [],
+                "errors": ["Synthetic narrated-render verification failure."],
+            }
+        return {
+            "status": "pass", "file": name,
+            "checks": {"duration": {"ok": True, "actual_seconds": 5.0}},
+            "warnings": [], "errors": [],
+        }
+
+    monkeypatch.setattr(pipeline, "verify_rendered_file", qa_fail_narrated_only)
+    result = pipeline.run(
+        "stub", output_dir=str(tmp_path / "job"),
+        clip_count=1, target_duration=40, generation_mode="ai_expanded",
+        vertical=False, subtitles=False,
+    )
+    clip = result["clips"][0]
+    # The verified source-only render is restored…
+    assert clip["file"] == "clip_1.mp4"
+    assert clip["qa_status"] == "warning"
+    assert clip["quality_assurance"]["fallback_used"] is True
+    # …and was verified against the source-only edit duration (5s), not the
+    # narrated total (~11.5s) the failed final render was measured against.
+    fallback_calls = [call for call in qa_calls if call[0] == "clip_1.mp4"]
+    assert fallback_calls, "the fallback render must be QA-verified"
+    assert fallback_calls[-1][1] == pytest.approx(5.0, abs=0.05)
+    # Narration metadata is dropped along with the failed narrated render.
+    assert clip.get("ai_narration") is None
+    assert clip["edit_plan"]["narration"] is None
+    assert clip["edit_plan"].get("narration_failed", {}).get("script")
+    assert not any(seg.get("origin") == "ai" for seg in clip["edit_plan"]["segments"])
+    assert clip["edit_plan"]["estimated_duration"] == pytest.approx(
+        clip["edit_plan"]["source_duration"], abs=0.05
+    )
+    assert clip.get("planned_rendered_duration") is None
+    warnings = " ".join(result["processing_warnings"]).lower()
+    assert "narration card was dropped" in warnings
+    assert "source-only" in warnings

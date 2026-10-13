@@ -467,6 +467,7 @@ def _apply_ai_narration(clip, plan, output_dir, base_name, voiceover_engine,
         clip.setdefault("_render_fallbacks", []).append(prior_name)
         clip["file"] = final_name
         clip["ai_narration"] = {
+            "file": final_name,
             "script": script[:2000],
             "label": narration.get("label"),
             "estimated_duration": narration.get("estimated_duration"),
@@ -1095,6 +1096,22 @@ def run(
                 )
         except (TypeError, ValueError):
             expected_duration = None
+        # Fallback renders produced before the narration card are source-only.
+        # When QA falls back to one of them, it must be verified against the
+        # source-only edit duration — never the narrated total.
+        try:
+            edit_plan = clip.get("edit_plan") or {}
+            if edit_plan.get("source_duration") is not None:
+                source_only_duration = float(edit_plan["source_duration"])
+            else:
+                source_only_duration = (
+                    float(clip.get("end", 0.0)) - float(clip.get("start", 0.0))
+                )
+        except (TypeError, ValueError):
+            source_only_duration = None
+        narrated_file = os.path.basename(
+            (clip.get("ai_narration") or {}).get("file") or ""
+        )
         expected_audio = (
             True if is_montage_clip or clip.get("audio_mixed")
             else bool(video_info.get("has_audio"))
@@ -1122,9 +1139,21 @@ def run(
         fallbacks = list(clip.get("_render_fallbacks") or [])
         if qa.get("status") == "fail":
             for fallback_name in reversed(fallbacks):
-                fallback_path = os.path.join(output_dir, os.path.basename(fallback_name))
-                fallback_clip = {**clip, "file": os.path.basename(fallback_name)}
-                fallback_args = {**qa_args, "clip": fallback_clip}
+                fallback_base = os.path.basename(fallback_name)
+                fallback_path = os.path.join(output_dir, fallback_base)
+                fallback_clip = {**clip, "file": fallback_base}
+                # A render that predates the narration card is source-only:
+                # verify it against the source-only edit duration, not the
+                # narrated total the failed final render was measured against.
+                is_source_only_render = bool(narrated_file) and fallback_base != narrated_file
+                fallback_expected = expected_duration
+                if is_source_only_render and source_only_duration is not None:
+                    fallback_expected = source_only_duration
+                fallback_args = {
+                    **qa_args,
+                    "clip": fallback_clip,
+                    "expected_duration": fallback_expected,
+                }
                 try:
                     fallback_qa = verify_rendered_file(fallback_path, **fallback_args)
                 except Exception:
@@ -1139,6 +1168,20 @@ def run(
                     clip["file"] = fallback_clip["file"]
                     if clip.get("hook_file") != clip["file"]:
                         clip.pop("hook_file", None)
+                    if is_source_only_render and clip.get("ai_narration"):
+                        # The narrated render failed QA and the source-only
+                        # clip is being delivered instead: drop the narration
+                        # metadata too, so duration/plan data describes the
+                        # file that actually ships.
+                        if clip.get("edit_plan"):
+                            drop_narration(clip["edit_plan"])
+                        clip.pop("ai_narration", None)
+                        clip.pop("planned_rendered_duration", None)
+                        fallback_qa.setdefault("warnings", []).append(
+                            "The AI narration card was dropped with the failed "
+                            "final render; delivering the verified source-only "
+                            "clip."
+                        )
                     if fallback_qa.get("status") == "fail":
                         tolerated = list(fallback_qa.get("errors") or [])
                         fallback_qa["tolerated_failures"] = tolerated
