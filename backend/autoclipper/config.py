@@ -18,42 +18,79 @@ YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 
 # --- Models ---
 GROQ_WHISPER_MODEL = os.environ.get("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-# Fallback models tried in order when the primary is overloaded (503).
+# Fallback models tried in order when the primary is overloaded (503 / 429).
 GEMINI_FALLBACK_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-flash-latest",
+    "gemini-3.5-flash",
 ]
 
 
+def _is_transient_gemini_error(err: Exception) -> bool:
+    """Return True if an exception represents a retryable transient failure."""
+    code = getattr(err, "code", None) or getattr(err, "status_code", None)
+    if code in (429, 500, 502, 503, 504):
+        return True
+
+    err_str = f"{type(err).__name__}: {err}".lower()
+    transient_cues = (
+        "503",
+        "429",
+        "unavailable",
+        "high demand",
+        "resource_exhausted",
+        "resourceexhausted",
+        "serviceunavailable",
+        "rate limit",
+        "spikes in demand",
+        "temporarily unavailable",
+        "try again later",
+        "overloaded",
+    )
+    return any(cue in err_str for cue in transient_cues)
+
+
 def gemini_generate(client, model: str, contents, max_retries: int = 2, **kwargs):
-    """Call Gemini with automatic retry + fallback on 503 overload.
+    """Call Gemini with automatic retry + fallback on 503/429 overload.
 
-    Tries the primary model up to max_retries times, then falls through
-    to GEMINI_FALLBACK_MODELS (one attempt each).
+    Tries the requested model up to max_retries times with backoff, then falls through
+    to GEMINI_FALLBACK_MODELS.
     """
-    from google.api_core import exceptions as gexc  # noqa: E402
+    from .utils import logger
 
-    models_to_try = [model] + GEMINI_FALLBACK_MODELS
+    # Build unique, ordered list of models to try
+    models_to_try = []
+    for m in [model] + GEMINI_FALLBACK_MODELS:
+        if m and m not in models_to_try:
+            models_to_try.append(m)
+
     last_err = None
     for m in models_to_try:
         for attempt in range(max_retries + 1):
             try:
                 return client.models.generate_content(model=m, contents=contents, **kwargs)
-            except (gexc.ServiceUnavailable, gexc.ResourceExhausted) as e:
-                last_err = e
-                if attempt < max_retries:
-                    wait = 2 ** attempt
-                    from .utils import logger
-                    logger.warning("Gemini 503 on %s (attempt %d); retrying in %ds", m, attempt + 1, wait)
-                    time.sleep(wait)
+            except Exception as e:
+                if _is_transient_gemini_error(e):
+                    last_err = e
+                    if attempt < max_retries:
+                        wait = (2 ** attempt) + 1
+                        logger.warning(
+                            "Gemini transient error on %s (attempt %d/%d); retrying in %ds: %s",
+                            m, attempt + 1, max_retries + 1, wait, e,
+                        )
+                        time.sleep(wait)
+                        continue
+                    else:
+                        logger.warning(
+                            "Gemini %s exhausted all retries; falling back to next available model",
+                            m,
+                        )
+                        break
                 else:
-                    from .utils import logger
-                    logger.warning("Gemini %s exhausted retries; trying next fallback", m)
-                break
-            except Exception:
-                raise  # non-transient errors propagate immediately
+                    raise  # non-transient errors propagate immediately
     raise last_err or RuntimeError("All Gemini models failed")
 
 # --- Content-type analysis modes ---

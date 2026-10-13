@@ -43,7 +43,6 @@ export default function SettingsPanel({ settings, setSettings, alwaysOpen = fals
   const apiKeys = [
     { key: 'groqKey', label: 'Groq API Key', placeholder: 'gsk_…', required: true, docs: 'https://console.groq.com/keys' },
     { key: 'geminiKey', label: 'Gemini API Key', placeholder: 'AIza…', required: true, docs: 'https://aistudio.google.com/apikey' },
-    { key: 'youtubeApiKey', label: 'YouTube Data API Key', placeholder: 'AIza… (for Explore)', required: false, docs: 'https://console.cloud.google.com' },
   ]
 
   return (

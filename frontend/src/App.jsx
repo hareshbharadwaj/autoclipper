@@ -1,12 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
-import { LayoutDashboard, FolderOpen, Scissors, Flame, LogOut } from 'lucide-react'
+import { LayoutDashboard, FolderOpen, Scissors, LogOut } from 'lucide-react'
 import { submitJob, getStatus, isLoggedIn, setToken, fetchSettings } from './api.js'
 import SubmitForm from './components/SubmitForm.jsx'
 import LogConsole from './components/LogConsole.jsx'
 import ClipGrid from './components/ClipGrid.jsx'
 import JobProgress from './components/JobProgress.jsx'
 import Library from './components/Library.jsx'
-import TrendingPage from './components/TrendingPage.jsx'
 import AuthPage from './components/AuthPage.jsx'
 import { withClipCountOption } from './utils/clipCount.js'
 import { mergeSafeSettings, settingsForLocalStorage } from './utils/settingsStorage.js'
@@ -215,13 +214,6 @@ export default function App() {
           >
             Saved Library
           </SidebarButton>
-          <SidebarButton
-            active={tab === 'trending'}
-            onClick={() => setTab('trending')}
-            icon={Flame}
-          >
-            Trending Ideas
-          </SidebarButton>
         </nav>
 
         <div className="p-4 border-t border-white/5">
@@ -288,10 +280,8 @@ export default function App() {
                 <ClipGrid jobId={job.job_id} clips={clips} onApply={applyEditedClip} />
               )}
             </>
-           ) : tab === 'library' ? (
+           ) : (
             <Library />
-          ) : (
-            <TrendingPage settings={settings} />
           )}
         </div>
       </main>
