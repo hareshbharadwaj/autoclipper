@@ -272,6 +272,11 @@ def test_editorial_summary_aggregates_statuses():
     assert summary["failed_clip_count"] == 1
     empty = editorial_summary([])
     assert empty["status"] == "not_run"
+    # An unreviewed clip is never counted as a passed review.
+    mixed = editorial_summary([{"status": "pass"}, {"status": "not_run"}])
+    assert mixed["status"] == "warning"
+    assert mixed["unchecked_clip_count"] == 1
+    assert mixed["checked_clip_count"] == 1
 
 
 def test_empty_plan_fails_editorial_review():

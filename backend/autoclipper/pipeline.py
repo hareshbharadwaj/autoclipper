@@ -12,6 +12,7 @@ from .analyze import (
 from .clip import cut_all
 from .edit_planner import (
     build_edit_plan,
+    drop_narration,
     duration_mismatch_warning,
     finalize_narration_timing,
     normalize_generation_mode,
@@ -19,7 +20,6 @@ from .edit_planner import (
 from .editorial_qa import editorial_summary, review_edit_plan
 from .ingest import ingest
 from .reframe import VERTICAL_ASPECT, reframe_clip
-from .subtitles import add_subtitles
 from .quality_assurance import verify_rendered_file
 from .transcribe import transcribe
 from .utils import (
@@ -124,19 +124,6 @@ def _nonempty_file(path):
     return bool(path and os.path.isfile(path) and os.path.getsize(path) > 0)
 
 
-def _subtitle_repair_needed(qa):
-    """True when the only blocking QA problem is the requested captions."""
-    checks = qa.get("checks") or {}
-    subtitle_check = checks.get("subtitles")
-    if not isinstance(subtitle_check, dict) or subtitle_check.get("ok") is not False:
-        return False
-    required = ("file", "streams", "duration", "audio", "visual_samples")
-    return all(
-        isinstance(checks.get(name), dict) and checks[name].get("ok") is True
-        for name in required
-    )
-
-
 def _rank_montage_candidates(candidates):
     """Order user-selected montage moments chronologically without de-duplication.
 
@@ -158,81 +145,6 @@ def _rank_montage_candidates(candidates):
         item.pop("_user_selected", None)
         ranked.append(item)
     return ranked
-
-
-def _repair_subtitle_failure(clip, transcript, output_dir, qa, qa_args, fallbacks, processing_warnings):
-    """Try once to still deliver the requested captions before falling back/failing.
-
-    Returns the (possibly updated) QA report and fallback list.
-
-    - If no transcript words overlap the clip, captions are impossible; the clip
-      is an acceptable subtitle-free fallback, so the failure is downgraded to
-      an explicit warning that explains the missing feature.
-    - Otherwise retry the caption stage once on the current (otherwise verified)
-      render. If the repaired file passes QA it becomes the final render and the
-      captionless file is kept as a fallback; if not, the original QA report is
-      returned unchanged so the normal fallback/failure handling runs.
-    """
-    if not _subtitle_repair_needed(qa):
-        return qa, fallbacks
-
-    warning = clip.get("subtitle_warning") or ""
-    if warning.startswith("No transcript words overlap"):
-        remaining = [
-            error for error in qa.get("errors") or []
-            if not error.lower().startswith("requested subtitles")
-        ]
-        explanation = (
-            "Requested subtitles could not be generated because no transcript words "
-            "overlap this clip; it was delivered without captions."
-        )
-        repaired = {
-            **qa,
-            "errors": remaining,
-            "warnings": list(qa.get("warnings") or []) + [explanation],
-        }
-        repaired["status"] = "fail" if remaining else "warning"
-        return repaired, fallbacks
-
-    try:
-        base_name = clip.get("file")
-        repair_clip = {**clip}
-        repair_clip.pop("subtitled_file", None)
-        repair_clip.pop("subtitle_warning", None)
-        add_subtitles([repair_clip], transcript, output_dir, burn=True, preserve_source=True)
-        repaired_name = repair_clip.get("file")
-        if not repaired_name or repaired_name == base_name or repair_clip.get("subtitle_warning"):
-            raise RuntimeError(
-                repair_clip.get("subtitle_warning")
-                or "The caption retry did not produce a burned subtitle file."
-            )
-        repaired_path = os.path.join(output_dir, os.path.basename(repaired_name))
-        if not _nonempty_file(repaired_path):
-            raise RuntimeError("The caption retry produced an empty subtitle file.")
-        repaired_qa = verify_rendered_file(repaired_path, **{**qa_args, "clip": repair_clip})
-        if repaired_qa.get("status") == "fail":
-            raise RuntimeError("The repaired caption output failed QA verification.")
-        # Adopt the repaired render; keep the captionless file as a fallback.
-        fallbacks = list(dict.fromkeys(list(fallbacks) + [base_name]))
-        clip["file"] = repaired_name
-        clip["subtitled_file"] = repaired_name
-        if repair_clip.get("srt"):
-            clip["srt"] = repair_clip["srt"]
-        clip.pop("subtitle_warning", None)
-        repaired_qa.setdefault("warnings", []).append(
-            "Captions were re-generated and burned successfully after an initial subtitle failure."
-        )
-        processing_warnings.append(
-            "Subtitle rendering initially failed; captions were repaired on a second attempt."
-        )
-        logger.info("Subtitle repair succeeded for clip %s.", clip.get("index"))
-        return repaired_qa, fallbacks
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Subtitle repair attempt failed for clip %s (%s); continuing with fallback handling.",
-            clip.get("index"), type(exc).__name__,
-        )
-        return qa, fallbacks
 
 
 def _emit_progress(callback, stage, message, *, current=None, total=None, **details):
@@ -433,10 +345,23 @@ def _plan_clip_edits(candidates, transcript, video_dur, target_duration,
                 candidate,
                 f"Edit planning could not run ({type(exc).__name__}); the "
                 "original candidate timestamps were kept without story "
-                "structure checks.",
+                "structure checks. Treat this clip as unreviewed output.",
                 processing_warnings,
             )
-            planned.append(candidate)
+            planned.append({
+                **candidate,
+                "planning_failed": True,
+                "edit_plan": None,
+                "editorial_qa": {
+                    "status": "not_run",
+                    "checks": {},
+                    "warnings": [
+                        "Editorial QA did not run because edit planning "
+                        "failed; this clip is unreviewed as a standalone story."
+                    ],
+                    "errors": [],
+                },
+            })
             continue
         shaped = {
             **candidate,
@@ -497,7 +422,6 @@ def _apply_ai_narration(clip, plan, output_dir, base_name, voiceover_engine,
         actual = wav_duration(wav_path)
         if actual <= 0:
             raise RuntimeError("Narration audio duration could not be verified.")
-        finalize_narration_timing(plan, actual)
 
         card_name = prior_name.rsplit(".", 1)[0] + "_narrationcard.mp4"
         card_path = os.path.join(output_dir, card_name)
@@ -514,6 +438,11 @@ def _apply_ai_narration(clip, plan, output_dir, base_name, voiceover_engine,
         if not _nonempty_file(final_path):
             raise RuntimeError("Narration concat produced no output.")
 
+        # Only now that the narrated render exists on disk does the edit plan
+        # adopt the measured narration length (source/edit/rendered timelines
+        # stay consistent with what is actually delivered).
+        finalize_narration_timing(plan, actual)
+
         # Captions: burned ones ride inside the source segment; the SRT sidecar
         # is rebased onto the edit timeline (narration card first).
         if clip.get("srt"):
@@ -528,9 +457,10 @@ def _apply_ai_narration(clip, plan, output_dir, base_name, voiceover_engine,
             except Exception as exc:  # noqa: BLE001
                 _add_render_warning(
                     clip,
-                    f"Caption sidecar could not be rebased after the narration "
-                    f"card ({type(exc).__name__}); burned-in captions remain "
-                    "correct.",
+                    f"Caption sidecar could not be rebased onto the final edit "
+                    f"timeline ({type(exc).__name__}); the delivered .srt does "
+                    "not match the final video and should be regenerated from "
+                    "the clip editor.",
                     processing_warnings,
                 )
 
@@ -553,6 +483,14 @@ def _apply_ai_narration(clip, plan, output_dir, base_name, voiceover_engine,
             pass
         return True
     except Exception as exc:  # noqa: BLE001
+        # The delivered clip is the untouched source-only render: restore the
+        # plan's timeline so duration metadata never includes narration that
+        # was planned but never produced.
+        try:
+            drop_narration(plan)
+        except Exception:  # noqa: BLE001
+            pass
+        clip.pop("planned_rendered_duration", None)
         _add_render_warning(
             clip,
             f"AI-expanded narration could not be generated ({type(exc).__name__}); "
@@ -581,7 +519,10 @@ def run(
     gemini_model: str = None,
     vertical: bool = True,
     use_yolo: bool = True,
-    subtitles: bool = True,
+    # Deprecated and ignored: captions are no longer generated or burned during
+    # clip generation/reframing. Users add captions later from the clip editor.
+    # Kept only so older clients passing ``subtitles=`` keep working.
+    subtitles: bool = False,
     split_screen: bool = False,
     force_hd: bool = False,
     cookies_text: str = None,
@@ -611,6 +552,10 @@ def run(
     If *on_clip* is provided it will be called with ``(clip_dict, index, total)``
     after each clip has been rendered, before final QA. *on_progress*, when set,
     receives structured stage and per-clip QA events for progress polling.
+
+    Captions are intentionally not generated here (the ``subtitles`` argument is
+    deprecated and ignored): the render flow produces a clean clip, and users
+    add captions afterwards from the clip editor whenever they want.
     """
     # Clamp oversized requests and validate count before any ingest/model work.
     target_duration = _normalize_target_duration(target_duration)
@@ -923,14 +868,9 @@ def run(
                 except OSError:
                     pass
 
-        # 6. Generate/burn captions. Preserve the uncaptained video for fallback.
-        if subtitles:
-            prior_name = clip["file"]
-            add_subtitles([clip], transcript, output_dir, burn=True, preserve_source=True)
-            if clip.get("file") != prior_name:
-                fallbacks.append(prior_name)
-            if clip.get("subtitle_warning"):
-                _add_render_warning(clip, clip["subtitle_warning"], processing_warnings)
+        # 6. Captions are intentionally NOT generated or burned during clip
+        #    generation/reframing. The user can add captions later from the
+        #    clip editor (subtitle editing endpoints) whenever they want.
 
         # 6b. Burn the hook banner only if a complete output is produced.
         if add_hook and clip.get("hook"):
@@ -1163,7 +1103,6 @@ def run(
             "expected_duration": expected_duration,
             "expected_aspect": target_aspect,
             "expected_audio": expected_audio,
-            "subtitles_requested": bool(subtitles and not is_montage_clip),
             "clip": clip,
             "output_dir": output_dir,
         }
@@ -1181,21 +1120,10 @@ def run(
             }
 
         fallbacks = list(clip.get("_render_fallbacks") or [])
-        if qa.get("status") == "fail" and subtitles and not is_montage_clip:
-            # Requested captions must be delivered, repaired, explicitly
-            # downgraded (impossible case), or fail — never pass silently.
-            qa, fallbacks = _repair_subtitle_failure(
-                clip, transcript, output_dir, qa, qa_args, fallbacks, processing_warnings
-            )
-            clip["_render_fallbacks"] = list(dict.fromkeys(fallbacks))
-            current_name = clip.get("file")
-            current_path = os.path.join(output_dir, current_name or "")
         if qa.get("status") == "fail":
             for fallback_name in reversed(fallbacks):
                 fallback_path = os.path.join(output_dir, os.path.basename(fallback_name))
                 fallback_clip = {**clip, "file": os.path.basename(fallback_name)}
-                if fallback_clip.get("subtitled_file") != fallback_clip["file"]:
-                    fallback_clip.pop("subtitled_file", None)
                 fallback_args = {**qa_args, "clip": fallback_clip}
                 try:
                     fallback_qa = verify_rendered_file(fallback_path, **fallback_args)
@@ -1211,10 +1139,6 @@ def run(
                     clip["file"] = fallback_clip["file"]
                     if clip.get("hook_file") != clip["file"]:
                         clip.pop("hook_file", None)
-                    if fallback_clip.get("subtitled_file") == clip["file"]:
-                        clip["subtitled_file"] = clip["file"]
-                    elif not (fallback_qa.get("checks", {}).get("subtitles") or {}).get("ok"):
-                        clip.pop("subtitled_file", None)
                     if fallback_qa.get("status") == "fail":
                         tolerated = list(fallback_qa.get("errors") or [])
                         fallback_qa["tolerated_failures"] = tolerated
@@ -1278,10 +1202,6 @@ def run(
                 clip.pop("vertical_file", None)
         if clip.get("hook_file") != clip.get("file"):
             clip.pop("hook_file", None)
-        if (checks.get("subtitles") or {}).get("ok"):
-            clip["subtitled_file"] = clip["file"]
-        elif clip.get("subtitled_file") in fallbacks and clip.get("subtitled_file") != clip.get("file"):
-            clip.pop("subtitled_file", None)
         quality_reports.append({
             "index": clip.get("index"),
             "file": clip.get("file"),

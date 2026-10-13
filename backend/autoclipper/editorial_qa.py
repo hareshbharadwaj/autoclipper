@@ -351,21 +351,37 @@ def review_edit_plan(plan, transcript=None):
 
 
 def editorial_summary(clip_reviews):
-    """Aggregate per-clip editorial reviews into one report for job results."""
+    """Aggregate per-clip editorial reviews into one report for job results.
+
+    Clips without a completed review (``not_run``) are counted separately and
+    never look like a passed review: an unreviewed clip cannot make the job
+    summary "pass".
+    """
     reviews = list(clip_reviews or [])
     if not reviews:
-        return {"status": "not_run", "checked_clip_count": 0, "failed_clip_count": 0, "reports": []}
+        return {
+            "status": "not_run",
+            "checked_clip_count": 0,
+            "failed_clip_count": 0,
+            "unchecked_clip_count": 0,
+            "reports": [],
+        }
     failed = sum(1 for review in reviews if review.get("status") == "fail")
     warned = sum(1 for review in reviews if review.get("status") == "warning")
+    unchecked = sum(
+        1 for review in reviews
+        if review.get("status") not in {"pass", "warning", "fail"}
+    )
     if failed:
         status = "fail"
-    elif warned:
+    elif warned or unchecked:
         status = "warning"
     else:
         status = "pass"
     return {
         "status": status,
-        "checked_clip_count": len(reviews),
+        "checked_clip_count": len(reviews) - unchecked,
         "failed_clip_count": failed,
+        "unchecked_clip_count": unchecked,
         "reports": reviews,
     }

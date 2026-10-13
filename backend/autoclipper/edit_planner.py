@@ -425,6 +425,45 @@ def finalize_narration_timing(plan, actual_duration):
     return plan
 
 
+def drop_narration(plan):
+    """Restore a plan to its source-only timeline after a failed narration render.
+
+    Removes the AI narration segment and re-times the edit timeline so
+    duration metadata and caption rebasing always describe what is actually
+    delivered (the untouched source clip) — never narration that was planned
+    but never rendered. The narration script is preserved under
+    ``narration_failed`` for reporting. Idempotent.
+    """
+    narration = plan.get("narration")
+    has_ai_segments = any(
+        segment.get("origin") == "ai" for segment in plan.get("segments", []) or []
+    )
+    if not narration and not has_ai_segments:
+        return plan
+
+    plan["narration_failed"] = dict(narration or {})
+    plan["narration"] = None
+    plan["segments"] = [
+        segment
+        for segment in plan.get("segments", []) or []
+        if segment.get("origin") != "ai"
+    ]
+    cursor = 0.0
+    for segment in plan["segments"]:
+        try:
+            old_start = float(segment.get("edit_start", 0.0))
+            old_end = float(segment.get("edit_end", 0.0))
+        except (TypeError, ValueError):
+            old_start, old_end = 0.0, 0.0
+        duration = max(0.0, old_end - old_start)
+        segment["edit_start"] = round(cursor, 3)
+        segment["edit_end"] = round(cursor + duration, 3)
+        cursor += duration
+    plan["estimated_duration"] = round(cursor, 2)
+    plan["source_duration"] = round(cursor, 2)
+    return plan
+
+
 def rebase_cues(cues, plan, clip_source_start=0.0):
     """Rebase clip-relative caption cues onto the edit timeline.
 

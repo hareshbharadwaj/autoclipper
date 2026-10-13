@@ -20,7 +20,6 @@ const DEFAULT_SETTINGS = {
   geminiModel: '',
   vertical: true,
   useYolo: true,
-  subtitles: true,
   forceHd: false,
   youtubeCookies: '',
   clipCount: 8,
@@ -112,7 +111,6 @@ export default function App() {
     const opts = {
       vertical: settings.vertical,
       use_yolo: settings.useYolo,
-      subtitles: settings.subtitles,
       force_hd: settings.forceHd,
       groq_key: settings.groqKey || undefined,
       gemini_key: settings.geminiKey || undefined,
@@ -143,9 +141,6 @@ export default function App() {
     if (payload.analyzed) {
       delete opts.min_clip
       delete opts.max_clip
-      // The analysis-first UI promises burned-in captions; don't let a legacy
-      // preference silently contradict that guarantee.
-      opts.subtitles = true
     }
 
     const file = payload.file || null

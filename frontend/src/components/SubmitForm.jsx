@@ -869,20 +869,10 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
                 </div>
               </div>
               <div className="space-y-2">
-                <label className="flex items-start gap-2 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked
-                    readOnly
-                    className="accent-cyan-400 mt-0.5"
-                  />
-                  <span className="text-xs text-zinc-300">
-                    Burn animated captions
-                    <span className="block text-[11px] text-zinc-500">
-                      Always on — word-level, synced to the speaker’s real voice (perfect lip sync).
-                    </span>
-                  </span>
-                </label>
+                <p className="text-xs text-zinc-400">
+                  No captions are burned in during generation — you can add
+                  captions to any clip later from the clip editor, whenever you want.
+                </p>
                 <label className="flex items-start gap-2 cursor-pointer select-none">
                   <input
                     type="checkbox"

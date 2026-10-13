@@ -390,3 +390,236 @@ def test_real_render_matches_planned_edit_timeline(tmp_path):
         clip_source_start=plan["source_start"],
     )
     assert rebased[0]["start"] == pytest.approx(cues[0]["start"], abs=0.1)
+
+
+# --- Review regressions: failure paths must keep metadata honest ------------
+
+def _short_candidate():
+    return {
+        "start": 12.0, "end": 17.0,
+        "title": "Friends make you happy", "hook": "Friends and happiness",
+        "description": "A short remark about friends and happiness",
+        "reason": "Cute one-liner", "story_arc": "one line about friends",
+        "candidate_score": 90,
+    }
+
+
+def test_pipeline_never_generates_captions_during_render(tmp_path, monkeypatch):
+    """Captions are not generated or burned during generation/reframing.
+
+    The legacy ``subtitles=`` argument is accepted but ignored; users add
+    captions later from the clip editor.
+    """
+    transcript = _stub_transcript()
+    _patch_common(monkeypatch, tmp_path, transcript, [_short_candidate()])
+    monkeypatch.setattr(pipeline, "cut_all", _fake_cut_all_factory(tmp_path))
+
+    def qa_pass(path, **kwargs):
+        assert "subtitles_requested" not in kwargs
+        return {"status": "pass", "file": os.path.basename(path), "checks": {
+            "duration": {"ok": True, "actual_seconds": 5.0},
+        }, "warnings": [], "errors": []}
+
+    monkeypatch.setattr(pipeline, "verify_rendered_file", qa_pass)
+    result = pipeline.run(
+        "stub", output_dir=str(tmp_path / "job"),
+        clip_count=1, target_duration=15, generation_mode="source_only",
+        vertical=False, subtitles=True,  # legacy kwarg must be a no-op
+    )
+    clip = result["clips"][0]
+    assert "srt" not in clip
+    assert "subtitled_file" not in clip
+    job_dir = tmp_path / "job"
+    assert not list(job_dir.glob("*.srt"))
+    assert not [name for name in os.listdir(job_dir) if "sub" in name.lower()]
+
+
+@pytest.mark.parametrize("failing_stage", ["build_intro", "concat_videos"])
+def test_narration_render_failure_restores_source_only_timing(
+    tmp_path, monkeypatch, failing_stage
+):
+    """Review issue 1: when narration rendering fails, the delivered clip is
+    source-only and the plan's duration metadata must say so — never include
+    narration that was planned but never produced."""
+    transcript = _stub_transcript()
+    _patch_common(monkeypatch, tmp_path, transcript, [_short_candidate()])
+    monkeypatch.setattr(pipeline, "cut_all", _fake_cut_all_factory(tmp_path))
+
+    import autoclipper.voiceover as voiceover_mod
+
+    def fake_generate_voiceover(text, out_path, engine="auto", voice=None, gemini_key=None):
+        with open(out_path, "wb") as handle:
+            handle.write(b"wav-bytes")
+        return out_path
+
+    def fake_build_intro(video_in, wav_in, out_path, hook_text="", **kwargs):
+        with open(out_path, "wb") as handle:
+            handle.write(b"card-bytes")
+        return out_path
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("narration render failed")
+
+    monkeypatch.setattr(voiceover_mod, "generate_voiceover", fake_generate_voiceover)
+    monkeypatch.setattr(voiceover_mod, "wav_duration", lambda _p: 6.5)
+    if failing_stage == "build_intro":
+        monkeypatch.setattr(voiceover_mod, "build_intro", boom)
+    else:
+        monkeypatch.setattr(voiceover_mod, "build_intro", fake_build_intro)
+        monkeypatch.setattr(voiceover_mod, "concat_videos", boom)
+
+    captured = {}
+
+    def qa_pass(path, **kwargs):
+        captured.setdefault("expected_duration", kwargs.get("expected_duration"))
+        return {"status": "pass", "file": os.path.basename(path), "checks": {
+            "duration": {"ok": True, "actual_seconds": 5.0},
+        }, "warnings": [], "errors": []}
+
+    monkeypatch.setattr(pipeline, "verify_rendered_file", qa_pass)
+    result = pipeline.run(
+        "stub", output_dir=str(tmp_path / "job"),
+        clip_count=1, target_duration=40, generation_mode="ai_expanded",
+        vertical=False, subtitles=False,
+    )
+    clip = result["clips"][0]
+    plan = clip["edit_plan"]
+    # The plan is back on the source-only timeline.
+    assert plan["narration"] is None
+    assert plan.get("narration_failed", {}).get("script")
+    assert not any(seg.get("origin") == "ai" for seg in plan["segments"])
+    assert plan["estimated_duration"] == pytest.approx(plan["source_duration"], abs=0.05)
+    # No inflated rendered-duration expectation survives the failure: any
+    # recorded duration matches the source-only clip that was actually kept.
+    planned = clip.get("planned_rendered_duration")
+    assert planned is None or planned == pytest.approx(plan["source_duration"], abs=0.05)
+    assert captured["expected_duration"] == pytest.approx(plan["source_duration"], abs=0.05)
+    # The untouched source clip is delivered with an explicit warning.
+    assert clip["file"] == "clip_1.mp4"
+    warnings = " ".join(result["processing_warnings"]).lower()
+    assert "ai-expanded narration could not be generated" in warnings
+    assert "source-only" in warnings
+
+
+def test_rebase_srt_file_fails_loudly_when_captions_cannot_rebase(tmp_path):
+    """Review issue 2: an unmappable or missing caption sidecar must raise,
+    never silently return mistimed captions as if they were rebased."""
+    plan = build_edit_plan(
+        {
+            "duration": 40, "language": "English",
+            "segments": [
+                {"start": 0, "end": 8, "text": "The weather has been rainy."},
+                {"start": 8, "end": 12, "text": "Traffic was awful."},
+                {"start": 12, "end": 17, "text": "Your friends make you happy."},
+            ],
+        },
+        {
+            "start": 12.0, "end": 17.0,
+            "title": "Friends make you happy", "hook": "Friends",
+            "description": "one line", "reason": "short", "story_arc": "one line",
+        },
+        target_duration=15,
+        generation_mode="source_only",
+    )
+    with pytest.raises(ValueError, match="missing"):
+        rebase_srt_file(str(tmp_path / "nope.srt"), plan, clip_source_start=12.0)
+
+    unmappable = tmp_path / "unmappable.srt"
+    unmappable.write_text(
+        "1\n00:01:20,000 --> 00:01:22,000\nway outside\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="No caption cues could be mapped"):
+        rebase_srt_file(str(unmappable), plan, clip_source_start=12.0)
+
+    empty = tmp_path / "empty.srt"
+    empty.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="no parseable cues"):
+        rebase_srt_file(str(empty), plan, clip_source_start=12.0)
+
+
+def test_pipeline_warns_when_caption_sidecar_cannot_rebase(tmp_path, monkeypatch):
+    """Review issue 2 at pipeline level: the mismatch is surfaced as a warning
+    instead of passing stale captions off as correct."""
+    transcript = _stub_transcript()
+    _patch_common(monkeypatch, tmp_path, transcript, [_short_candidate()])
+
+    def cut_all_with_srt(_video, clips, out_dir, _title):
+        os.makedirs(out_dir, exist_ok=True)
+        results = []
+        for i, candidate in enumerate(clips, start=1):
+            name = f"clip_{i}.mp4"
+            with open(os.path.join(out_dir, name), "wb") as handle:
+                handle.write(b"rendered clip bytes")
+            srt_name = f"clip_{i}.srt"
+            with open(os.path.join(out_dir, srt_name), "w", encoding="utf-8") as handle:
+                handle.write("1\n00:01:20,000 --> 00:01:22,000\nway outside\n")
+            results.append({"index": i, "file": name, "srt": srt_name, **candidate})
+        return results
+
+    monkeypatch.setattr(pipeline, "cut_all", cut_all_with_srt)
+
+    import autoclipper.voiceover as voiceover_mod
+
+    def fake_generate_voiceover(text, out_path, engine="auto", voice=None, gemini_key=None):
+        with open(out_path, "wb") as handle:
+            handle.write(b"wav-bytes")
+        return out_path
+
+    def fake_build_intro(video_in, wav_in, out_path, hook_text="", **kwargs):
+        with open(out_path, "wb") as handle:
+            handle.write(b"card-bytes")
+        return out_path
+
+    def fake_concat(a, b, out_path):
+        with open(out_path, "wb") as handle:
+            handle.write(b"final-bytes")
+        return out_path
+
+    monkeypatch.setattr(voiceover_mod, "generate_voiceover", fake_generate_voiceover)
+    monkeypatch.setattr(voiceover_mod, "build_intro", fake_build_intro)
+    monkeypatch.setattr(voiceover_mod, "concat_videos", fake_concat)
+    monkeypatch.setattr(voiceover_mod, "wav_duration", lambda _p: 6.5)
+
+    def qa_pass(path, **_kwargs):
+        return {"status": "pass", "file": os.path.basename(path), "checks": {
+            "duration": {"ok": True, "actual_seconds": 11.5},
+        }, "warnings": [], "errors": []}
+
+    monkeypatch.setattr(pipeline, "verify_rendered_file", qa_pass)
+    result = pipeline.run(
+        "stub", output_dir=str(tmp_path / "job"),
+        clip_count=1, target_duration=40, generation_mode="ai_expanded",
+        vertical=False, subtitles=False,
+    )
+    warnings = " ".join(result["processing_warnings"]).lower()
+    assert "caption sidecar could not be rebased" in warnings
+    assert "does not match the final video" in warnings
+
+
+def test_pipeline_marks_clip_unreviewed_when_edit_planning_fails(tmp_path, monkeypatch):
+    """Review issue 3: a planning failure is marked and can never look like a
+    passed editorial review."""
+    transcript = {"duration": 20, "language": "English", "segments": [], "words": []}
+    _patch_common(monkeypatch, tmp_path, transcript, [_short_candidate()])
+    monkeypatch.setattr(pipeline, "cut_all", _fake_cut_all_factory(tmp_path))
+
+    def qa_pass(path, **_kwargs):
+        return {"status": "pass", "file": os.path.basename(path), "checks": {
+            "duration": {"ok": True, "actual_seconds": 5.0},
+        }, "warnings": [], "errors": []}
+
+    monkeypatch.setattr(pipeline, "verify_rendered_file", qa_pass)
+    result = pipeline.run(
+        "stub", output_dir=str(tmp_path / "job"),
+        clip_count=1, target_duration=15, generation_mode="source_only",
+        vertical=False, subtitles=False,
+    )
+    clip = result["clips"][0]
+    assert clip.get("planning_failed") is True
+    assert clip.get("edit_plan") is None
+    assert clip["editorial_qa"]["status"] == "not_run"
+    # Job summary must not read as a successful review.
+    assert result["editorial_qa"]["status"] == "warning"
+    assert result["editorial_qa"]["unchecked_clip_count"] == 1
+    assert any("unreviewed" in w.lower() for w in result["processing_warnings"])

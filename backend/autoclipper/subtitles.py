@@ -249,16 +249,26 @@ def rebase_srt_file(srt_path: str, plan: dict, clip_source_start: float = 0.0,
     segments (see ``edit_planner.rebase_cues``) so captions stay aligned when a
     narration card is prepended or passages are re-ordered. Cues that would
     cross a planned segment boundary are clipped to it.
+
+    Fails loudly instead of silently returning mistimed captions: if the
+    sidecar is missing, unparsable, or no cue maps onto the edit timeline, a
+    ``ValueError`` is raised so callers can warn that the delivered captions
+    are not synced to the final video.
     """
     from .edit_planner import rebase_cues
 
     if not srt_path or not os.path.isfile(srt_path):
-        return srt_path
+        raise ValueError("Caption sidecar is missing; cannot rebase it onto the edit timeline.")
     with open(srt_path, "r", encoding="utf-8-sig") as handle:
         cues = parse_srt(handle.read())
+    if not cues:
+        raise ValueError("Caption sidecar contains no parseable cues to rebase.")
     rebased = rebase_cues(cues, plan, clip_source_start=clip_source_start)
     if not rebased:
-        return srt_path
+        raise ValueError(
+            "No caption cues could be mapped onto the edit timeline; the "
+            "delivered sidecar would not match the final video."
+        )
     destination = out_path or srt_path
     with open(destination, "w", encoding="utf-8") as handle:
         handle.write(cues_to_srt(rebased))
