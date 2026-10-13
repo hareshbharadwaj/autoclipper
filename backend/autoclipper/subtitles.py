@@ -326,6 +326,24 @@ def add_subtitles(clips, transcript, output_dir, burn=True, preserve_source=Fals
     is true, the pre-subtitle render remains available as a safe fallback.
     """
     words = transcript.get("words", [])
+    if not words and transcript.get("segments"):
+        words = []
+        for seg in transcript["segments"]:
+            try:
+                s_start = float(seg.get("start", 0))
+                s_end = float(seg.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            seg_text = (seg.get("text") or "").strip().split()
+            if not seg_text or s_end <= s_start:
+                continue
+            w_dur = (s_end - s_start) / len(seg_text)
+            for i, w in enumerate(seg_text):
+                words.append({
+                    "word": w,
+                    "start": round(s_start + i * w_dur, 2),
+                    "end": round(s_start + (i + 1) * w_dur, 2),
+                })
     for clip in clips:
         cs, ce = clip.get("start"), clip.get("end")
         if cs is None or ce is None:

@@ -209,8 +209,8 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
     chosen = []
     for angle in candidates:
         try:
-            hint_start = float(angle.get("start", angle.get("start_hint")))
-            hint_end = float(angle.get("end", angle.get("end_hint")))
+            hint_start = float(angle.get("start", angle.get("start_hint", 0)))
+            hint_end = float(angle.get("end", angle.get("end_hint", 0)))
         except (TypeError, ValueError):
             continue
         if hint_end <= hint_start:
@@ -220,6 +220,11 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
             hint_end = max(0.0, min(hint_end, float(total_duration)))
         if hint_end <= hint_start:
             continue
+
+        # If hint_start falls inside an already chosen moment, shift it past it
+        for item in chosen:
+            if item["start"] <= hint_start < item["end"]:
+                hint_start = item["end"]
 
         # Start on the complete transcript segment containing the angle's opening
         # hint; otherwise use the nearest boundary. This includes the opening setup.
@@ -232,21 +237,50 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
         )
         shot_start = segments[start_idx]["start"]
 
-        # Do not silently trim off the selected angle's hinted ending. The nearest
-        # eligible complete boundary is chosen, with the overall hard cap preserved.
-        minimum_end_idx = next(
-            (i for i in range(start_idx, len(segments)) if segments[i]["end"] >= hint_end),
-            len(segments) - 1,
-        )
+        # Ensure shot_start does not start inside an existing chosen moment
+        while any(item["start"] <= shot_start < item["end"] for item in chosen) and start_idx + 1 < len(segments):
+            start_idx += 1
+            shot_start = segments[start_idx]["start"]
+
+        # If the hinted duration fits within hard_per_shot, honor the hinted end as a minimum.
+        # Otherwise, the angle is longer than the montage shot limit; fit to desired_per_shot within hard_per_shot.
+        minimum_end_idx = start_idx
+        if (hint_end - shot_start) <= hard_per_shot:
+            minimum_end_idx = next(
+                (i for i in range(start_idx, len(segments)) if segments[i]["end"] >= hint_end),
+                len(segments) - 1,
+            )
+
         possible_ends = []
         for end_idx in range(minimum_end_idx, len(segments)):
             shot_end = segments[end_idx]["end"]
             shot_duration = shot_end - shot_start
-            if shot_duration <= 0:
+            if shot_duration < 3.0:
                 continue
             if shot_duration > hard_per_shot:
                 break
+            if any(shot_start < item["end"] and shot_end > item["start"] for item in chosen):
+                continue
             possible_ends.append((shot_duration, shot_end))
+
+        # Fallback: if no end >= minimum_end_idx was <= hard_per_shot, search from start_idx
+        if not possible_ends:
+            for end_idx in range(start_idx, len(segments)):
+                shot_end = segments[end_idx]["end"]
+                shot_duration = shot_end - shot_start
+                if shot_duration < 3.0:
+                    continue
+                if shot_duration > hard_per_shot:
+                    break
+                if any(shot_start < item["end"] and shot_end > item["start"] for item in chosen):
+                    continue
+                possible_ends.append((shot_duration, shot_end))
+
+        if not possible_ends:
+            fallback_end = min(shot_start + hard_per_shot, float(total_duration or (shot_start + hard_per_shot)))
+            if fallback_end - shot_start >= 3.0 and not any(shot_start < item["end"] and fallback_end > item["start"] for item in chosen):
+                possible_ends.append((fallback_end - shot_start, fallback_end))
+
         if not possible_ends:
             continue
 
@@ -254,8 +288,6 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
             possible_ends,
             key=lambda item: (abs(item[0] - desired_per_shot), item[0] > desired_per_shot),
         )
-        if any(shot_start < item["end"] and shot_end > item["start"] for item in chosen):
-            continue
         chosen.append({
             "start": round(shot_start, 2),
             "end": round(shot_end, 2),
@@ -266,6 +298,26 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
             "story_arc": "Selected angle; transcript-aligned montage segment",
             "_user_selected": True,
         })
+
+    # If fewer than 2 distinct moments were selected, pick non-overlapping fallback segments
+    if len(chosen) < 2 and segments:
+        for seg in segments:
+            s_start, s_end = seg["start"], seg["end"]
+            if s_end - s_start < 3.0:
+                continue
+            if not any(s_start < item["end"] and s_end > item["start"] for item in chosen):
+                chosen.append({
+                    "start": round(s_start, 2),
+                    "end": round(min(s_start + desired_per_shot, s_end), 2),
+                    "title": "Montage moment",
+                    "description": "",
+                    "hook": "",
+                    "reason": "Selected from transcript to fulfill montage moment count",
+                    "story_arc": "Transcript-aligned montage segment",
+                    "_user_selected": False,
+                })
+                if len(chosen) >= 2:
+                    break
 
     chosen.sort(key=lambda item: item["start"])
     if not 2 <= len(chosen) <= 3:
@@ -869,9 +921,13 @@ def run(
                 except OSError:
                     pass
 
-        # 6. Captions are intentionally NOT generated or burned during clip
-        #    generation/reframing. The user can add captions later from the
-        #    clip editor (subtitle editing endpoints) whenever they want.
+        # 6. Generate the SRT sidecar for the clip (unburned) so captions can be edited
+        #    and burned later from the clip editor whenever desired.
+        try:
+            from .subtitles import add_subtitles
+            add_subtitles([clip], transcript, output_dir, burn=False, preserve_source=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not generate SRT sidecar for clip %s: %s", clip.get("index"), exc)
 
         # 6b. Burn the hook banner only if a complete output is produced.
         if add_hook and clip.get("hook"):
@@ -979,7 +1035,7 @@ def run(
                     "were preserved; meeting the target would require cutting speech or "
                     "reusing footage."
                 )
-            processed.append({
+            montage_clip_dict = {
                 "index": len(processed) + 1,
                 "file": montage_name,
                 "title": f"{title} — Montage",
@@ -990,7 +1046,39 @@ def run(
                 "duration_delta": round(duration_delta, 2),
                 "is_montage": True,
                 "reason": "Stitched from selected complementary moments with video/audio crossfades.",
-            })
+            }
+            # Generate SRT sidecar for the stitched montage clip
+            try:
+                from .subtitles import cues_to_srt, parse_srt
+                montage_cues = []
+                current_offset = 0.0
+                fade = 0.25
+                for p_clip in processed:
+                    if p_clip.get("is_montage"):
+                        continue
+                    if p_clip.get("srt"):
+                        p_srt_path = os.path.join(output_dir, p_clip["srt"])
+                        if os.path.isfile(p_srt_path):
+                            with open(p_srt_path, "r", encoding="utf-8") as _f:
+                                p_cues = parse_srt(_f.read())
+                            shot_dur = p_clip.get("duration") or (p_clip["end"] - p_clip["start"])
+                            for cue in p_cues:
+                                montage_cues.append({
+                                    "start": round(cue["start"] + current_offset, 2),
+                                    "end": round(cue["end"] + current_offset, 2),
+                                    "text": cue["text"],
+                                })
+                            current_offset += max(0.0, shot_dur - fade)
+                if montage_cues:
+                    montage_srt_name = f"{base_name}_montage.srt"
+                    montage_srt_path = os.path.join(output_dir, montage_srt_name)
+                    with open(montage_srt_path, "w", encoding="utf-8") as _f:
+                        _f.write(cues_to_srt(montage_cues))
+                    montage_clip_dict["srt"] = montage_srt_name
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not generate montage SRT sidecar: %s", exc)
+
+            processed.append(montage_clip_dict)
         except Exception as exc:
             processing_warnings.append(f"Montage stitching failed: {exc}")
             logger.exception("Montage stitching failed")

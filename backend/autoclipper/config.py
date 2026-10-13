@@ -134,7 +134,9 @@ YOUTUBE_REGION = os.environ.get("YOUTUBE_REGION", "ID")
 
 # --- Backend job queue ---
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "2"))
-OUTPUT_ROOT = os.environ.get("OUTPUT_ROOT", "output")
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_DEFAULT_OUTPUT = os.path.join(_REPO_ROOT, "output") if os.path.isdir(os.path.join(_REPO_ROOT, "output")) else "output"
+OUTPUT_ROOT = os.environ.get("OUTPUT_ROOT", _DEFAULT_OUTPUT)
 
 # --- Burned-in subtitles ---
 SUBTITLE_FONT = os.environ.get("SUBTITLE_FONT", "Arial")

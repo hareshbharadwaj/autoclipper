@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo } from 'react'
+import { useEffect, useState, useMemo, useRef } from 'react'
 import { X, Type, Loader2 } from 'lucide-react'
 import { getSrt, parseSrt, applySubtitles, fileUrl, libraryFileUrl } from '../api.js'
 
@@ -81,23 +81,36 @@ export default function SubtitleEditor({ jobId, clip, onApply, onClose, srtUrl, 
   const [loaded, setLoaded] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [videoSize, setVideoSize] = useState({ width: 1080, height: 1920 })
+  const videoRef = useRef(null)
 
   useEffect(() => {
-    const url = srtUrl || (clip.srt ? getSrt(jobId, clip.srt) : null)
+    let cancelled = false
+    const srtFileName = clip?.srt || (clip?.file ? clip.file.replace(/\.[^.]+$/, '') + '.srt' : null)
+    const url = srtUrl || (jobId && srtFileName ? fileUrl(jobId, srtFileName) : null)
     if (!url) {
-      setError('No subtitle track for this clip.')
+      setError('No subtitle track for this clip. You can type subtitle text below.')
       setLoaded(true)
       return
     }
-    const p = typeof url === 'string' ? fetch(url).then((r) => r.text()) : url
+    const p = typeof url === 'string'
+      ? fetch(url).then(async (r) => {
+          if (!r.ok) throw new Error(`Could not load subtitles (${r.status})`)
+          return r.text()
+        })
+      : url
     p.then((text) => {
-      setCues(parseSrt(text))
+      if (cancelled) return
+      const parsed = parseSrt(text)
+      setCues(parsed)
+      setError('')
       setLoaded(true)
     }).catch((e) => {
+      if (cancelled) return
       setError(e.message)
       setLoaded(true)
     })
-  }, [jobId, clip])
+    return () => { cancelled = true }
+  }, [jobId, clip, srtUrl])
 
   function setStyleKey(key, value) {
     setStyle((s) => ({ ...s, [key]: value }))
@@ -123,11 +136,15 @@ export default function SubtitleEditor({ jobId, clip, onApply, onClose, srtUrl, 
   function buildCuesFromText(text) {
     const newWords = text.split(/\s+/).filter(Boolean)
     if (newWords.length === 0) return []
-    if (cues.length === 0) return newWords.map((w) => ({ start: 0, end: 1, text: w }))
+    const totalDuration = (cues.length > 0 && (cues[cues.length - 1].end - cues[0].start))
+      || (videoRef.current?.duration || 10)
+    const startMs = (cues.length > 0 && cues[0].start) || 0
+    if (cues.length === 0) {
+      const wordDur = Math.max(0.1, totalDuration / newWords.length)
+      return newWords.map((w, i) => ({ start: i * wordDur, end: (i + 1) * wordDur, text: w }))
+    }
     // Group words into phrases like the backend build_srt (max 20 chars)
     const MAX_CHARS = 20
-    const totalDuration = cues[cues.length - 1].end - cues[0].start
-    const startMs = cues[0].start
     const phrases = []
     let phraseWords = []
     let phraseLen = 0
@@ -155,13 +172,19 @@ export default function SubtitleEditor({ jobId, clip, onApply, onClose, srtUrl, 
   }
 
   async function handleGenerate() {
-    if (!clip.srt && !name) return
-    const editedCues = buildCuesFromText(fullText)
+    if (!clip?.file && !name) return
+    const cuesToApply = (fullText === originalText && cues.length > 0)
+      ? cues
+      : buildCuesFromText(fullText)
+    if (!cuesToApply || cuesToApply.length === 0) {
+      setError('No subtitles to apply. Enter some subtitle text.')
+      return
+    }
     setBusy(true)
     setError('')
     try {
-      const res = await applySubtitles({ jobId, filename: clip.file, cues: editedCues, style, name })
-      onApply(clip.index, res.filename, res.srt)
+      const res = await applySubtitles({ jobId, filename: clip.file, cues: cuesToApply, style, name })
+      if (onApply) onApply(clip.index, res.filename, res.srt)
       onClose()
     } catch (e) {
       setError(e.message)
@@ -187,6 +210,7 @@ export default function SubtitleEditor({ jobId, clip, onApply, onClose, srtUrl, 
         >
           <div className="relative w-full h-full">
             <video
+              ref={videoRef}
               src={name ? libraryFileUrl(name, clip.file) : fileUrl(jobId, clip.file)}
               controls
               playsInline
@@ -502,7 +526,7 @@ export default function SubtitleEditor({ jobId, clip, onApply, onClose, srtUrl, 
 
           <button
             onClick={handleGenerate}
-            disabled={busy || cues.length === 0}
+            disabled={busy || (!fullText.trim() && cues.length === 0)}
             className="w-full py-3 mt-4 bg-gradient-to-r from-yellow-500 to-orange-500 hover:from-yellow-400 hover:to-orange-400 text-black font-bold rounded-xl shadow-lg transition-all active:scale-[0.98] flex items-center justify-center gap-2 shrink-0 disabled:opacity-50"
           >
             {busy ? <Loader2 size={20} className="animate-spin" /> : <Type size={20} />}

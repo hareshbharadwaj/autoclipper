@@ -909,10 +909,95 @@ async def list_jobs():
     ]
 
 
+def _generate_missing_srt(job_id: str, filename: str) -> bool:
+    """Generate a missing .srt sidecar on demand for job clips if transcript is available."""
+    job_dir = os.path.join(config.OUTPUT_ROOT, job_id)
+    if not os.path.isdir(job_dir):
+        return False
+    target_path = os.path.join(job_dir, filename)
+    if os.path.isfile(target_path):
+        return True
+
+    meta = None
+    if job_id in jobs and jobs[job_id].get("result"):
+        meta = jobs[job_id]["result"]
+    else:
+        for f in os.listdir(job_dir):
+            if f.endswith("_metadata.json"):
+                try:
+                    with open(os.path.join(job_dir, f), "r", encoding="utf-8") as mf:
+                        meta = json.load(mf)
+                    break
+                except Exception:
+                    pass
+
+    if not meta:
+        return False
+
+    transcript = meta.get("transcript") or {}
+    words = transcript.get("words") or []
+    if not words and transcript.get("segments"):
+        words = []
+        for seg in transcript["segments"]:
+            try:
+                s_start = float(seg.get("start", 0))
+                s_end = float(seg.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            seg_text = (seg.get("text") or "").strip().split()
+            if not seg_text or s_end <= s_start:
+                continue
+            w_dur = (s_end - s_start) / len(seg_text)
+            for i, w in enumerate(seg_text):
+                words.append({
+                    "word": w,
+                    "start": round(s_start + i * w_dur, 2),
+                    "end": round(s_start + (i + 1) * w_dur, 2),
+                })
+
+    if not words:
+        return False
+
+    base = os.path.splitext(filename)[0]
+    matched_clip = None
+    clips = meta.get("clips") or []
+    for c in clips:
+        c_file = c.get("file", "")
+        c_base = os.path.splitext(c_file)[0]
+        if c_base == base or c_file == f"{base}.mp4" or f"clip_{c.get('index')}" in base:
+            matched_clip = c
+            break
+
+    if not matched_clip and len(clips) == 1:
+        matched_clip = clips[0]
+
+    if not matched_clip:
+        return False
+
+    start = float(matched_clip.get("start", 0.0))
+    end = float(matched_clip.get("end", 0.0))
+    if end <= start:
+        return False
+
+    from autoclipper.subtitles import build_srt
+    srt_content = build_srt(words, start, end)
+    if not srt_content:
+        return False
+
+    try:
+        with open(target_path, "w", encoding="utf-8") as sf:
+            sf.write(srt_content)
+        return True
+    except OSError:
+        return False
+
+
 @app.get("/api/files/{job_id}/{filename}")
 async def get_file(job_id: str, filename: str):
     path = os.path.join(config.OUTPUT_ROOT, job_id, filename)
     if not os.path.isfile(path):
+        if filename.endswith(".srt") and _generate_missing_srt(job_id, filename):
+            return FileResponse(path)
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path)
 
@@ -1131,6 +1216,34 @@ async def subtitle(req: SubtitleRequest):
                 if not found:
                     manifest.setdefault("clips", []).append(edited_entry)
                 write_json(manifest_path, manifest)
+
+    elif req.job_id:
+        if req.job_id in jobs and jobs[req.job_id].get("result"):
+            for c in jobs[req.job_id]["result"].get("clips", []):
+                if c.get("file") == req.filename:
+                    c["file"] = out_name
+                    c["subtitled_file"] = out_name
+                    if edited_srt_name:
+                        c["srt"] = edited_srt_name
+                    break
+        for f in os.listdir(output_dir):
+            if f.endswith("_metadata.json"):
+                meta_path = os.path.join(output_dir, f)
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as mf:
+                        meta_data = json.load(mf)
+                    for c in meta_data.get("clips", []):
+                        if c.get("file") == req.filename:
+                            c["file"] = out_name
+                            c["subtitled_file"] = out_name
+                            if edited_srt_name:
+                                c["srt"] = edited_srt_name
+                            break
+                    from autoclipper.utils import write_json
+                    write_json(meta_path, meta_data)
+                    break
+                except Exception:
+                    pass
 
     return {"filename": out_name, "srt": edited_srt_name}
 
