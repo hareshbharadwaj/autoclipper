@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { LayoutDashboard, FolderOpen, Scissors, Settings as SettingsIcon, Flame, LogOut } from 'lucide-react'
+import { LayoutDashboard, FolderOpen, Scissors, Settings as SettingsIcon, LogOut } from 'lucide-react'
 import { submitJob, getStatus, isLoggedIn, setToken, fetchSettings } from './api.js'
 import SubmitForm from './components/SubmitForm.jsx'
 import LogConsole from './components/LogConsole.jsx'
@@ -7,7 +7,6 @@ import ClipGrid from './components/ClipGrid.jsx'
 import JobProgress from './components/JobProgress.jsx'
 import Library from './components/Library.jsx'
 import SettingsPage from './components/SettingsPage.jsx'
-import TrendingPage from './components/TrendingPage.jsx'
 import AuthPage from './components/AuthPage.jsx'
 import { withClipCountOption } from './utils/clipCount.js'
 import { mergeSafeSettings, settingsForLocalStorage } from './utils/settingsStorage.js'
@@ -212,13 +211,6 @@ export default function App() {
           >
             Saved Library
           </SidebarButton>
-          <SidebarButton
-            active={tab === 'trending'}
-            onClick={() => setTab('trending')}
-            icon={Flame}
-          >
-            Trending Ideas
-          </SidebarButton>
         </nav>
 
         <div className="px-4 pb-4">
@@ -293,8 +285,6 @@ export default function App() {
             </>
            ) : tab === 'library' ? (
             <Library />
-          ) : tab === 'trending' ? (
-            <TrendingPage settings={settings} />
           ) : (
             <SettingsPage settings={settings} setSettings={setSettings} />
           )}
