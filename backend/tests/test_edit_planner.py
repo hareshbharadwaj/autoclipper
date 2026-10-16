@@ -218,7 +218,7 @@ def test_short_topic_reports_shortfall_in_source_only_mode():
     joined = " ".join(plan["warnings"])
     assert "40s" in joined  # reports the requested target explicitly
     assert "source-only" in joined.lower() or "source only" in joined.lower()
-    assert "AI-expanded" in joined or "ai_expanded" in joined.lower()
+    assert "never generates narration" in joined.lower() or "keeps source audio" in joined.lower()
     # Unrelated neighbours were not used as padding.
     assert all(seg["text"] == "Your friends make you happy." for seg in plan["segments"])
 
