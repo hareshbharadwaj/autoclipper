@@ -210,6 +210,59 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
         desired_per_shot + max(3.0, desired_per_shot * 0.25),
     )
 
+    # Whisper segment timestamps can be much coarser than the requested shot
+    # length (for example, a 15-second segment for a 5-second shot). Use the
+    # word timestamps already returned by Whisper to create short, word-aligned
+    # fallback units for those long segments. Prefer sentence punctuation; only
+    # split inside a sentence when its duration otherwise makes short montages
+    # impossible. This is deterministic and does not invent timestamps.
+    word_items = []
+    for word in transcript.get("words", []) or []:
+        if not isinstance(word, dict):
+            continue
+        try:
+            word_start, word_end = float(word["start"]), float(word["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        word_text = str(word.get("word") or word.get("text") or "").strip()
+        if word_text and word_end > word_start:
+            word_items.append({"start": word_start, "end": word_end, "text": word_text})
+    if word_items:
+        refined = []
+        for segment in segments:
+            duration = segment["end"] - segment["start"]
+            overlapping_words = [
+                word for word in word_items
+                if word["start"] < segment["end"] and word["end"] > segment["start"]
+            ]
+            if duration <= max_per_shot or len(overlapping_words) < 2:
+                refined.append(segment)
+                continue
+            chunk = []
+            chunk_start = None
+            chunk_end = None
+            for word in overlapping_words:
+                if chunk_start is None:
+                    chunk_start = word["start"]
+                chunk.append(word["text"])
+                chunk_end = word["end"]
+                chunk_duration = chunk_end - chunk_start
+                sentence_end = bool(__import__("re").search(r"[.!?…][\\"'”’)]*$", word["text"]))
+                if sentence_end and chunk_duration >= desired_per_shot * 0.70:
+                    refined.append({
+                        "start": chunk_start, "end": chunk_end, "text": " ".join(chunk)
+                    })
+                    chunk, chunk_start, chunk_end = [], None, None
+                elif chunk_duration >= desired_per_shot:
+                    refined.append({
+                        "start": chunk_start, "end": chunk_end, "text": " ".join(chunk)
+                    })
+                    chunk, chunk_start, chunk_end = [], None, None
+            if chunk and chunk_start is not None and chunk_end is not None:
+                refined.append({"start": chunk_start, "end": chunk_end, "text": " ".join(chunk)})
+        if refined:
+            segments = sorted(refined, key=lambda item: (item["start"], item["end"]))
+
     def _expanded_terms(text):
         terms = set(content_words(text))
         # Small deterministic morphology expansion handles common transcript
@@ -225,16 +278,6 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
                 terms.add(term[:-3] + "y")
             if term.endswith("s") and not term.endswith("ss") and len(term) > 4:
                 terms.add(term[:-1])
-        synonym_groups = (
-            {"veggie", "veggies", "vegetable", "vegetables"},
-            {"roll", "rolling", "rolled", "rolls"},
-            {"knife", "knives"},
-            {"chop", "chopping", "chopped", "chops"},
-            {"slice", "slicing", "sliced", "slices"},
-        )
-        for group in synonym_groups:
-            if terms & group:
-                terms.update(group)
         return terms
 
     chosen = []
@@ -1073,31 +1116,6 @@ def run(
                     clip["file"] = fallback_clip["file"]
                     if clip.get("hook_file") != clip["file"]:
                         clip.pop("hook_file", None)
-                    if is_source_only_render and clip.get("ai_narration"):
-                        # The narrated render failed QA and the source-only
-                        # clip is being delivered instead: drop the narration
-                        # metadata too, so duration/plan data describes the
-                        # file that actually ships.
-                        if clip.get("edit_plan"):
-                            drop_narration(clip["edit_plan"])
-                        clip.pop("ai_narration", None)
-                        clip.pop("planned_rendered_duration", None)
-                        fallback_qa.setdefault("warnings", []).append(
-                            "The AI narration card was dropped with the failed "
-                            "final render; delivering the verified source-only "
-                            "clip."
-                        )
-                    if clip.get("audio_mixed"):
-                        # Every earlier render predates the music/voiceover mix
-                        # (the mixed render itself is what failed QA): clear
-                        # the mix-only metadata for whichever fallback ships.
-                        clip.pop("audio_mixed", None)
-                        clip.pop("voiceover_duration", None)
-                        fallback_qa.setdefault("warnings", []).append(
-                            "The music/voiceover mix was dropped with the "
-                            "failed final render; delivering a clip without "
-                            "that audio mix."
-                        )
                     if fallback_qa.get("status") == "fail":
                         tolerated = list(fallback_qa.get("errors") or [])
                         fallback_qa["tolerated_failures"] = tolerated
