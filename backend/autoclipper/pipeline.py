@@ -6,15 +6,30 @@ import time
 
 from . import config
 from .analyze import (
-    find_viral_clips, review_clip_candidates, rank_and_diversify_candidates,
+    find_viral_clips, review_clip_candidates,
     _filter_clips_to_bounds, _resolve_clip_bounds, _validate_clips,
 )
 from .clip import cut_all
+from .duration_policy import (
+    QA_PASS,
+    QA_SHORTFALL,
+    DurationPolicy,
+    STATUS_OVERLONG,
+    STATUS_SHORTFALL,
+)
 from .edit_planner import (
     build_edit_plan,
     duration_mismatch_warning,
     normalize_generation_mode,
 )
+from .selection import select_distinct_candidates, validate_candidates_against_prompt
+from .source_profile import (
+    MODE_SPEECH,
+    MODE_VISUAL_ONLY,
+    classify_source,
+    measure_audio_activity,
+)
+from .visual_analysis import find_visual_candidates
 from .editorial_qa import editorial_summary, review_edit_plan
 from .ingest import ingest
 from .reframe import VERTICAL_ASPECT, reframe_clip
@@ -115,7 +130,13 @@ def _add_render_warning(clip, warning, warnings):
     clip.setdefault("render_warnings", []).append(warning)
     if warning not in warnings:
         warnings.append(warning)
-    logger.warning("Clip %s: %s", clip.get("index", "?"), warning)
+    index = clip.get("index", "?")
+    # Some warnings already carry their own "Clip N:" prefix (the duration
+    # policy builds them that way for the user-facing list); do not repeat it.
+    if str(warning).startswith(f"Clip {index}:"):
+        logger.warning("%s", warning)
+    else:
+        logger.warning("Clip %s: %s", index, warning)
 
 
 def _nonempty_file(path):
@@ -493,13 +514,402 @@ def _plan_clip_edits(candidates, transcript, video_dur, target_duration,
             )
         planned.append(shaped)
         for warning in plan.get("warnings", []):
-            _add_render_warning(shaped, warning, processing_warnings)
+            # Planner advisories ("not enough source material for the requested
+            # duration") describe the job, not one rendered clip, so they are
+            # recorded without a misleading "Clip ?" label.
+            if warning not in processing_warnings:
+                processing_warnings.append(warning)
+            shaped.setdefault("render_warnings", []).append(warning)
         if editorial.get("status") == "fail":
             detail = "; ".join(editorial.get("errors") or ["story structure check failed"])
             _add_render_warning(
                 shaped, f"Editorial QA failed: {detail}", processing_warnings
             )
     return planned
+
+
+def _verify_montage_output(
+    *,
+    clip: dict,
+    output_dir: str,
+    target_seconds,
+    expected_aspect,
+) -> dict:
+    """Run post-render QA on the stitched montage as its own deliverable.
+
+    The montage is verified separately from the individual clips so its own
+    playability/duration verdict can never be confused with — or counted as —
+    one of the requested clip verdicts.
+    """
+    path = os.path.join(output_dir, clip.get("file") or "")
+    try:
+        qa = verify_rendered_file(
+            path,
+            expected_duration=clip.get("duration"),
+            expected_aspect=expected_aspect,
+            expected_audio=True,  # stitching always leaves an audio stream
+            clip=clip,
+            output_dir=output_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 - report the failure, keep the file
+        qa = {
+            "status": "fail",
+            "file": clip.get("file"),
+            "checks": {},
+            "warnings": [],
+            "errors": [
+                f"Montage QA could not inspect this file ({type(exc).__name__})."
+            ],
+        }
+    checks = qa.get("checks") or {}
+    measured = (checks.get("duration") or {}).get("actual_seconds")
+    if measured in (None, ""):
+        # Fall back to the length probed right after stitching.
+        measured = clip.get("duration")
+    clip["quality_assurance"] = qa
+    clip["qa_status"] = qa.get("status", "fail")
+    try:
+        clip["actual_duration"] = round(float(measured), 2) if measured else None
+    except (TypeError, ValueError):
+        clip["actual_duration"] = None
+
+    montage_policy = DurationPolicy.from_request(target_seconds)
+    if montage_policy.enabled and clip.get("actual_duration"):
+        status, verdict = montage_policy.qa_status(
+            clip["actual_duration"], context="Montage"
+        )
+        clip["duration_verdict"] = verdict.to_dict()
+        if status == QA_SHORTFALL:
+            # The montage report already explains an off-target stitched
+            # length; record the verdict without duplicating the warning.
+            clip["duration_shortfall"] = True
+    return qa
+
+
+def _assess_request_compliance(
+    *,
+    quality_reports,
+    requested_count: int,
+    delivered_count: int,
+    policy: DurationPolicy,
+    processed,
+    prompt,
+    montage_requested: bool,
+    montage_report: dict,
+    source_profile,
+    selection_report: dict,
+) -> dict:
+    """Answer "did this job actually do what the user asked for?".
+
+    A playable file is not sufficient. This aggregates the four things the
+    request implies — the exact number of individual clips, their measured
+    durations against the requested target, their relevance to the prompt, and
+    the montage's separate accounting — into one verdict the job status and UI
+    can report from.
+    """
+    reports = list(quality_reports or [])
+    failures = [r for r in reports if r.get("status") == "fail"]
+    shortfalls = [r for r in reports if r.get("status") == QA_SHORTFALL]
+
+    relevance = validate_candidates_against_prompt(processed, prompt=prompt)
+    count_ok = delivered_count >= requested_count
+
+    # Duplicate/overlap re-check on the delivered clips: selection already
+    # rejected duplicates, but a failed render can promote a fallback, so the
+    # delivered set is verified rather than assumed.
+    delivered = [c for c in (processed or []) if not c.get("is_montage")]
+    duplicate_pairs = []
+    for index, left in enumerate(delivered):
+        for right in delivered[index + 1:]:
+            try:
+                l_start, l_end = float(left.get("start")), float(left.get("end"))
+                r_start, r_end = float(right.get("start")), float(right.get("end"))
+            except (TypeError, ValueError):
+                continue
+            overlap = max(0.0, min(l_end, r_end) - max(l_start, r_start))
+            shorter = min(l_end - l_start, r_end - r_start)
+            if shorter > 0 and overlap / shorter >= 0.35:
+                duplicate_pairs.append({
+                    "left": left.get("file"), "right": right.get("file"),
+                    "overlap_ratio": round(overlap / shorter, 3),
+                })
+
+    failures_detail = []
+    if not count_ok:
+        failures_detail.append(
+            f"{requested_count - delivered_count} of {requested_count} requested "
+            "individual clip(s) were not delivered."
+        )
+    if shortfalls:
+        failures_detail.append(
+            f"{len(shortfalls)} clip(s) are shorter than the requested duration: "
+            + ", ".join(
+                f"{r.get('file')} ({r.get('duration_verdict', {}).get('actual_seconds')}s vs "
+                f"{policy.target_seconds:.0f}s target)"
+                for r in shortfalls[:5]
+            )
+        )
+    if failures:
+        failures_detail.append(
+            f"{len(failures)} clip(s) failed render QA: "
+            + ", ".join(str(r.get("file")) for r in failures[:5])
+        )
+    if duplicate_pairs:
+        failures_detail.append(
+            f"{len(duplicate_pairs)} delivered clip pair(s) reuse the same footage."
+        )
+    if montage_requested and montage_report.get("status") not in ("delivered", "not_requested"):
+        failures_detail.append(
+            "The montage was requested but not delivered: "
+            + str(montage_report.get("reason") or montage_report.get("status"))
+        )
+
+    satisfied = (
+        count_ok and not failures and not shortfalls and not duplicate_pairs
+        and (not montage_requested or montage_report.get("status") == "delivered")
+    )
+    return {
+        "satisfied": satisfied,
+        "requested_individual_clips": requested_count,
+        "delivered_individual_clips": delivered_count,
+        "count_satisfied": count_ok,
+        "duration_shortfall_clips": len(shortfalls),
+        "failed_clips": len(failures),
+        "duplicate_pairs": duplicate_pairs,
+        "relevance": relevance,
+        "analysis_mode": source_profile.analysis_mode,
+        "analysis_mode_summary": source_profile.summary(),
+        "montage_requested": montage_requested,
+        "montage_status": montage_report.get("status"),
+        "selection": selection_report,
+        "duration_policy": policy.to_dict(),
+        "failures": failures_detail,
+    }
+
+
+def _montage_shot_sources(processed, *, max_shots: int = 3) -> list:
+    """Pick which verified individual clips the montage is built from.
+
+    The montage is *derived* from the best individual clips, so it inherits
+    their editorial quality, but it is rendered and counted separately.
+    """
+    usable = []
+    for clip in processed or []:
+        if clip.get("is_montage"):
+            continue
+        try:
+            start, end = float(clip.get("start", 0.0)), float(clip.get("end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(start) and math.isfinite(end)) or end <= start:
+            continue
+        usable.append(clip)
+
+    def _rank(clip):
+        try:
+            rank = int(clip.get("candidate_rank") or 0)
+        except (TypeError, ValueError):
+            rank = 0
+        # Prefer higher-ranked (lower rank number) clips; fall back to order.
+        return (rank if rank > 0 else 10_000, clip.get("index") or 0)
+
+    usable.sort(key=_rank)
+    return usable[:max(2, int(max_shots))]
+
+
+def _build_montage(
+    *,
+    video_path: str,
+    output_dir: str,
+    base_name: str,
+    title: str,
+    transcript: dict,
+    video_dur: float,
+    montage_target: float,
+    processed: list,
+    preferred_moments: list,
+    generation_mode: str,
+    custom_prompt: str,
+    processing_warnings: list,
+    use_yolo: bool,
+    target_aspect,
+    uses_transcript: bool,
+    on_progress=None,
+    candidate_review=None,
+) -> tuple:
+    """Render the montage as its own output, budgeted independently.
+
+    Returns ``(montage_clip_dict_or_None, report_dict)``. The montage shots are
+    rendered into a private sub-directory, stitched, and then removed, so the
+    job's individual-clip outputs are never confused with montage material.
+    """
+    candidates = []
+
+    if uses_transcript and preferred_moments:
+        # The user picked specific angles for the montage: ground them in the
+        # transcript and share the montage budget between them.
+        candidates = _fit_montage_candidates(
+            preferred_moments, transcript,
+            target_duration=montage_target or 40.0,
+            total_duration=video_dur,
+        )
+    else:
+        sources = _montage_shot_sources(processed)
+        if len(sources) < 2:
+            return None, {
+                "status": "skipped",
+                "reason": (
+                    "A montage needs at least two verified clips to stitch, but "
+                    f"only {len(sources)} clip(s) passed QA."
+                ),
+            }
+        shot_count = len(sources)
+        per_shot = max(3.0, float(montage_target or 40.0) / shot_count)
+        for clip in sources:
+            candidate = {
+                "title": clip.get("title") or f"Montage shot {clip.get('index')}",
+                "description": clip.get("description") or "",
+                "hook": clip.get("hook") or "",
+                "reason": clip.get("reason") or "",
+                "start": float(clip.get("start") or 0.0),
+                "end": float(clip.get("end") or 0.0),
+                "_montage_shot_from": clip.get("file"),
+            }
+            if uses_transcript:
+                try:
+                    candidate = build_edit_plan(
+                        transcript, candidate,
+                        target_duration=per_shot,
+                        generation_mode=generation_mode,
+                        custom_prompt=custom_prompt,
+                        total_duration=video_dur,
+                    )
+                    candidate = dict(candidate)
+                    candidate.setdefault("title", clip.get("title"))
+                except Exception as exc:  # noqa: BLE001 - fall back to raw bounds
+                    logger.warning(
+                        "Montage shot planning failed (%s); using the clip's own bounds.",
+                        type(exc).__name__,
+                    )
+            else:
+                candidate["end"] = min(
+                    float(video_dur or candidate["end"]),
+                    candidate["start"] + per_shot,
+                )
+            candidates.append(candidate)
+
+    if not 2 <= len(candidates) <= 3:
+        return None, {
+            "status": "skipped",
+            "reason": "A montage needs 2 or 3 planned shots; "
+                      f"{len(candidates)} were available.",
+        }
+
+    shots_dir = os.path.join(output_dir, "montage_shots")
+    os.makedirs(shots_dir, exist_ok=True)
+    montage_name = f"{base_name}_montage.mp4"
+    montage_path = os.path.join(output_dir, montage_name)
+    shot_paths = []
+    try:
+        _emit_progress(on_progress, "montage", "Rendering montage shots.")
+        rendered = cut_all(video_path, candidates, shots_dir, f"{base_name}_montage")
+        for shot in rendered:
+            shot_path = os.path.join(shots_dir, shot["file"])
+            if target_aspect is not None:
+                framed_name = shot["file"].rsplit(".", 1)[0] + "_framed.mp4"
+                framed_path = os.path.join(shots_dir, framed_name)
+                try:
+                    if reframe_clip(shot_path, framed_path, use_yolo=use_yolo,
+                                    aspect=target_aspect) and _nonempty_file(framed_path):
+                        shot_path = framed_path
+                except Exception as exc:  # noqa: BLE001 - keep the unframed shot
+                    logger.warning(
+                        "Montage shot reframing failed (%s); using the original framing.",
+                        type(exc).__name__,
+                    )
+            if _nonempty_file(shot_path):
+                shot_paths.append(shot_path)
+
+        if len(shot_paths) < 2:
+            raise RuntimeError(
+                f"Only {len(shot_paths)} montage shot(s) rendered; a montage needs at least 2."
+            )
+
+        _emit_progress(on_progress, "montage", "Stitching the montage.")
+        from .montage import stitch_montage
+
+        stitch_montage(shot_paths, montage_path)
+        montage_duration = probe_duration(montage_path)
+        if montage_duration > float(config.HARD_MAX_CLIP_SECONDS) + 0.25:
+            raise RuntimeError(
+                f"Montage duration {montage_duration:.1f}s exceeds the hard "
+                f"{config.HARD_MAX_CLIP_SECONDS:.0f}s limit; choose fewer/shorter moments."
+            )
+
+        target = float(montage_target or 40.0)
+        tolerance = _montage_duration_tolerance(target)
+        delta = montage_duration - target
+        if delta > tolerance:
+            try:
+                if os.path.isfile(montage_path):
+                    os.remove(montage_path)
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"Montage would exceed the requested {target:.0f}s target by "
+                f"{delta:.1f}s (tolerance ±{tolerance:.1f}s); the overlong montage "
+                "was not delivered. Shorten the target or choose angles with shorter "
+                "complete passages."
+            )
+
+        report = {
+            "status": "delivered",
+            "file": montage_name,
+            "target_seconds": round(target, 2),
+            "actual_seconds": round(montage_duration, 2),
+            "delta_seconds": round(delta, 2),
+            "tolerance_seconds": round(tolerance, 2),
+            "shot_count": len(shot_paths),
+            "within_tolerance": abs(delta) <= tolerance,
+        }
+        if abs(delta) > tolerance:
+            warning = (
+                f"Montage actual duration is {montage_duration:.2f}s versus the "
+                f"{target:.0f}s target ({delta:+.2f}s; tolerance ±{tolerance:.1f}s). "
+                "Complete transcript boundaries were preserved; meeting the target "
+                "would require cutting speech or reusing footage."
+            )
+            if warning not in processing_warnings:
+                processing_warnings.append(warning)
+
+        montage_clip_dict = {
+            "index": None,
+            "file": montage_name,
+            "title": f"{title} — Montage",
+            "start": 0.0,
+            "end": round(montage_duration, 2),
+            "duration": round(montage_duration, 2),
+            "target_duration": round(target, 2),
+            "duration_delta": round(delta, 2),
+            "is_montage": True,
+            "reason": (
+                "Stitched from the highest-ranked verified clips with video/audio "
+                "crossfades. Counted separately from the individual clips."
+            ),
+        }
+        return montage_clip_dict, report
+    except Exception as exc:  # noqa: BLE001 - the individual clips still ship
+        processing_warnings.append(f"Montage stitching failed: {exc}")
+        logger.exception("Montage stitching failed")
+        return None, {"status": "failed", "reason": str(exc)[:400]}
+    finally:
+        # The shots are intermediate material: the montage is the deliverable.
+        try:
+            import shutil as _shutil
+
+            _shutil.rmtree(shots_dir, ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def run(
@@ -530,6 +940,7 @@ def run(
     add_hook: bool = False,
     montage: bool = False,
     selected_clips: list = None,
+    montage_target_duration: float = None,
     cached_transcript_path: str = None,
     on_clip=None,
     on_progress=None,
@@ -552,19 +963,38 @@ def run(
     if generation_mode == "ai_expanded":
         generation_mode = "source_only"
     clip_count = _normalize_clip_count(clip_count)
-    if montage:
-        if not selected_clips or not 2 <= len(selected_clips) <= 3:
-            raise ValueError("Montage mode requires 2 or 3 selected video moments.")
-        requested_individual_count = len(selected_clips)
-        effective_min_clip, effective_max_clip = 3.0, float(config.HARD_MAX_CLIP_SECONDS)
+
+    # The requested clip count always means "independent individual clips".
+    # Montage is an *additional* output and can never reduce this number: a
+    # request for 8 clips plus a montage yields 8 clips and 1 montage, not 3
+    # clips and 1 montage.
+    if clip_count is not None:
+        requested_individual_count = clip_count
+    elif selected_clip:
+        requested_individual_count = 1
+    elif montage and selected_clips:
+        # Legacy montage-only clients sent 2-3 angles and no clip count; keep
+        # producing that many clips for them, but now at the full requested
+        # duration rather than a share of it.
+        requested_individual_count = min(3, max(1, len(selected_clips)))
     else:
-        requested_individual_count = (
-            clip_count if clip_count is not None
-            else (1 if selected_clip else config.TARGET_CLIP_COUNT)
-        )
-        effective_min_clip, effective_max_clip = _resolve_clip_bounds(
-            min_clip, max_clip, target_duration
-        )
+        requested_individual_count = config.TARGET_CLIP_COUNT
+
+    montage_requested = bool(montage)
+    montage_preferred_moments = list(selected_clips or []) if montage_requested else []
+
+    # One duration contract for the whole job: candidate selection, the edit
+    # planner, render QA and the job summary all read the same numbers.
+    duration_policy = DurationPolicy.from_request(target_duration)
+    try:
+        montage_target = float(montage_target_duration or target_duration or 0.0)
+    except (TypeError, ValueError):
+        montage_target = float(target_duration or 0.0)
+    montage_target = min(max(0.0, montage_target), float(config.HARD_MAX_CLIP_SECONDS))
+
+    effective_min_clip, effective_max_clip = _resolve_clip_bounds(
+        min_clip, max_clip, target_duration
+    )
     if max_clip is not None:
         try:
             max_clip = min(float(max_clip), float(config.HARD_MAX_CLIP_SECONDS))
@@ -600,15 +1030,43 @@ def run(
     else:
         logger.info("Keeping original 16:9 framing (no crop).")
 
-    # 2. Reuse the whole-video transcript when analysis-first already paid for it.
-    _emit_progress(on_progress, "transcribing", "Transcribing or loading the source transcript.")
-    if cached_transcript_path:
-        transcript = _load_cached_transcript(cached_transcript_path)
-        logger.info("Reusing cached whole-video transcript; skipping a second Groq call.")
-    else:
-        transcript = transcribe(
-            video_path, output_dir, api_key=groq_key, model=whisper_model
+    # 2. Decide how to analyse this source *before* paying for transcription.
+    #    A missing or silent audio track means there is nothing to transcribe;
+    #    an empty transcript on a loud track means "no speech", not "no video".
+    _emit_progress(on_progress, "profiling_source", "Inspecting the source audio and video.")
+    audio_activity = measure_audio_activity(video_path)
+    source_profile = classify_source(video_info, audio_activity=audio_activity)
+    logger.info("Source analysis mode: %s — %s", source_profile.analysis_mode, source_profile.summary())
+
+    transcript = {}
+    if source_profile.analysis_mode == MODE_VISUAL_ONLY:
+        # Skip transcription entirely: there is no speech to find.
+        _emit_progress(
+            on_progress, "transcribing",
+            "No usable audio; skipping transcription and analysing the video visually.",
         )
+        logger.info("Skipping transcription: %s", " ".join(source_profile.reasons) or "no audio")
+    else:
+        _emit_progress(on_progress, "transcribing", "Transcribing or loading the source transcript.")
+        if cached_transcript_path:
+            transcript = _load_cached_transcript(cached_transcript_path)
+            logger.info("Reusing cached whole-video transcript; skipping a second Groq call.")
+        else:
+            transcript = transcribe(
+                video_path, output_dir, api_key=groq_key, model=whisper_model
+            )
+        # Re-classify with the transcript in hand: a loud track whose
+        # transcription came back empty is "audio without speech", and the job
+        # must continue visually rather than failing on an empty transcript.
+        source_profile = classify_source(
+            video_info, audio_activity=audio_activity, transcript=transcript
+        )
+        if source_profile.analysis_mode != MODE_SPEECH:
+            logger.warning("Downgrading to visual analysis: %s", " ".join(source_profile.reasons))
+            _emit_progress(
+                on_progress, "profiling_source",
+                "No usable speech found; switching to visual analysis of the source.",
+            )
 
     # 3. Generate a bounded candidate pool, independently review it, then rank
     #    and diversify. Transcript-grounded timestamps remain authoritative.
@@ -622,12 +1080,36 @@ def run(
     candidate_warnings = []
     candidate_review = {"status": "not_run", "reviewed_count": 0, "rejected_count": 0}
 
-    if montage:
-        candidate_pool = _fit_montage_candidates(
-            selected_clips, transcript,
-            target_duration=float(target_duration or 40),
-            total_duration=video_dur,
+    if source_profile.uses_visual_analysis:
+        # Visual-only / audio-without-speech: clip boundaries come from scene
+        # detection plus frame review. No transcript evidence is claimed.
+        visual = find_visual_candidates(
+            video_path, video_dur,
+            api_key=gemini_key or config.GEMINI_API_KEY,
+            model=gemini_model,
+            target_duration=target_duration,
+            requested_count=requested_individual_count,
+            prompt=custom_prompt,
+            analysis_mode=source_profile.analysis_mode,
         )
+        candidate_pool = visual.get("candidates") or []
+        visual_context = {
+            "status": "used" if visual.get("semantic_evidence") else "boundaries_only",
+            "analysis_mode": source_profile.analysis_mode,
+            "scene_count": len(visual.get("scenes") or []),
+            "candidate_count": len(candidate_pool),
+            "semantic_evidence": bool(visual.get("semantic_evidence")),
+            "warning": visual.get("warning"),
+        }
+        if visual.get("warning"):
+            candidate_warnings.append(visual["warning"])
+        candidate_review = {
+            "status": "visual_analysis",
+            "reviewed_count": len(candidate_pool),
+            "rejected_count": 0,
+        }
+        if visual_context["warning"]:
+            logger.warning("Visual analysis: %s", visual_context["warning"])
     elif selected_clip:
         # Keep the selected angle as a real output when its hinted timestamps are
         # valid. Other slots draw from an over-generated, distinct candidate pool.
@@ -677,13 +1159,12 @@ def run(
             custom_prompt=custom_prompt,
         )
 
-    if not montage:
-        candidate_pool = _merge_unique_clip_candidates(
-            [], candidate_pool, candidate_pool_size
-        )
+    candidate_pool = _merge_unique_clip_candidates(
+        [], candidate_pool, candidate_pool_size
+    )
 
     review_key = gemini_key or config.GEMINI_API_KEY
-    if candidate_pool and review_key:
+    if candidate_pool and review_key and source_profile.uses_transcript:
         try:
             from .visual_context import sample_candidate_frames
 
@@ -721,23 +1202,41 @@ def run(
             candidate_warnings.append(
                 "Independent candidate review could not be completed; original transcript-validated timestamps were retained. Check provider availability and retry if needed."
             )
-    elif candidate_pool:
+    elif candidate_pool and source_profile.uses_transcript:
         candidate_review = {"status": "skipped_no_key", "reviewed_count": 0, "rejected_count": 0}
 
     _emit_progress(
         on_progress,
         "ranking_candidates",
-        "Ranking and diversifying the reviewed moments.",
+        "Selecting distinct clips against your request.",
         candidate_count=len(candidate_pool),
         candidate_review=candidate_review,
     )
-    if montage:
-        # Every fitted montage moment is a required user selection; text-similarity
-        # de-duplication must never drop one (two selected angles with similar
-        # titles/hooks would otherwise lose a shot and the montage would fail).
-        clip_candidates = _rank_montage_candidates(candidate_pool)
-    else:
-        clip_candidates = rank_and_diversify_candidates(candidate_pool, requested_individual_count)
+    # Global selection: every candidate is scored against the user's request
+    # *and* against the clips already accepted, so reused footage and repeated
+    # explanations are rejected regardless of how the candidate is titled.
+    selection = select_distinct_candidates(
+        candidate_pool,
+        requested_count=requested_individual_count,
+        policy=duration_policy,
+        prompt=custom_prompt,
+    )
+    clip_candidates = selection.candidates
+    selection_report = selection.to_dict()
+    if selection.shortfall:
+        shortfall_warning = (
+            "Requested {} individual clip(s) but only {} distinct moment(s) satisfy "
+            "the request; {} {} not delivered. {}".format(
+                requested_individual_count,
+                selection.selected_count,
+                selection.shortfall,
+                "clip was" if selection.shortfall == 1 else "clips were",
+                selection.summary(),
+            )
+        )
+        if shortfall_warning not in candidate_warnings:
+            candidate_warnings.append(shortfall_warning)
+        logger.warning(shortfall_warning)
     logger.info(
         "Clip params -> requested count=%s min=%s max=%s | reviewed pool=%d | selected %d candidate(s)",
         requested_individual_count, min_clip, max_clip, len(candidate_pool), len(clip_candidates),
@@ -749,19 +1248,20 @@ def run(
     # edges, expands with relevant context or trims toward the requested
     # duration when the story allows, and reports any mismatch explicitly
     # instead of silently dropping clips or padding with unrelated material.
-    if montage and clip_candidates:
-        # Montage shots use their own share of the overall target and must pass
-        # the same standalone-story planner as ordinary clips.
-        clip_candidates = _plan_clip_edits(
-            clip_candidates, transcript, video_dur, None,
-            generation_mode, custom_prompt, candidate_warnings,
-        )
+    if clip_candidates and not source_profile.uses_transcript:
+        # Visual mode has no sentence boundaries to plan against: the planner
+        # would either be a no-op or invent structure from frames. Keep the
+        # scene-aligned bounds the visual path produced.
         clip_candidates = _enforce_clip_constraints(
             clip_candidates, effective_min_clip, effective_max_clip,
-            len(clip_candidates), video_dur,
+            requested_individual_count, video_dur,
             trim_long=False, pad_short=False,
         )
+        logger.info("Visual mode: keeping %d scene-aligned candidate(s)", len(clip_candidates))
     elif clip_candidates:
+        # Every individual clip is planned toward the *full* requested
+        # duration. The montage is budgeted separately, further down, so it can
+        # never shorten the individual clips it is built from.
         clip_candidates = _plan_clip_edits(
             clip_candidates, transcript, video_dur, target_duration,
             generation_mode, custom_prompt, candidate_warnings,
@@ -920,95 +1420,6 @@ def run(
             except Exception:
                 pass
 
-    actual_individual_count = len(processed)
-
-    # Plan B: stitch the selected, independently captioned moments into one montage.
-    if montage:
-        _emit_progress(on_progress, "montage", "Stitching the selected clips into a montage.")
-        try:
-            from .montage import stitch_montage
-            montage_name = f"{base_name}_montage.mp4"
-            montage_path = os.path.join(output_dir, montage_name)
-            stitch_montage(
-                [os.path.join(output_dir, item["file"]) for item in processed],
-                montage_path,
-            )
-            montage_duration = probe_duration(montage_path)
-            if montage_duration > float(config.HARD_MAX_CLIP_SECONDS) + 0.25:
-                raise RuntimeError(
-                    f"Montage duration {montage_duration:.1f}s exceeds the hard "
-                    f"{config.HARD_MAX_CLIP_SECONDS:.0f}s limit; choose fewer/shorter moments."
-                )
-            duration_delta = montage_duration - float(target_duration or 40)
-            duration_tolerance = _montage_duration_tolerance(target_duration or 40)
-            if duration_delta > duration_tolerance:
-                try:
-                    if os.path.isfile(montage_path):
-                        os.remove(montage_path)
-                except OSError:
-                    pass
-                raise RuntimeError(
-                    f"Montage would exceed the requested {float(target_duration or 40):.0f}s "
-                    f"target by {duration_delta:.1f}s (tolerance ±{duration_tolerance:.1f}s); "
-                    "the overlong montage was not delivered. Shorten the target or choose "
-                    "angles with shorter complete passages."
-                )
-            if abs(duration_delta) > duration_tolerance:
-                processing_warnings.append(
-                    f"Montage actual duration is {montage_duration:.2f}s versus the "
-                    f"{float(target_duration or 40):.0f}s target ({duration_delta:+.2f}s; "
-                    f"tolerance ±{duration_tolerance:.1f}s). Complete transcript boundaries "
-                    "were preserved; meeting the target would require cutting speech or "
-                    "reusing footage."
-                )
-            montage_clip_dict = {
-                "index": len(processed) + 1,
-                "file": montage_name,
-                "title": f"{title} — Montage",
-                "start": 0.0,
-                "end": round(montage_duration, 2),
-                "duration": round(montage_duration, 2),
-                "target_duration": float(target_duration or 40),
-                "duration_delta": round(duration_delta, 2),
-                "is_montage": True,
-                "reason": "Stitched from selected complementary moments with video/audio crossfades.",
-            }
-            # Generate SRT sidecar for the stitched montage clip
-            try:
-                from .subtitles import cues_to_srt, parse_srt
-                montage_cues = []
-                current_offset = 0.0
-                fade = 0.25
-                for p_clip in processed:
-                    if p_clip.get("is_montage"):
-                        continue
-                    if p_clip.get("srt"):
-                        p_srt_path = os.path.join(output_dir, p_clip["srt"])
-                        if os.path.isfile(p_srt_path):
-                            with open(p_srt_path, "r", encoding="utf-8") as _f:
-                                p_cues = parse_srt(_f.read())
-                            shot_dur = p_clip.get("duration") or (p_clip["end"] - p_clip["start"])
-                            for cue in p_cues:
-                                montage_cues.append({
-                                    "start": round(cue["start"] + current_offset, 2),
-                                    "end": round(cue["end"] + current_offset, 2),
-                                    "text": cue["text"],
-                                })
-                            current_offset += max(0.0, shot_dur - fade)
-                if montage_cues:
-                    montage_srt_name = f"{base_name}_montage.srt"
-                    montage_srt_path = os.path.join(output_dir, montage_srt_name)
-                    with open(montage_srt_path, "w", encoding="utf-8") as _f:
-                        _f.write(cues_to_srt(montage_cues))
-                    montage_clip_dict["srt"] = montage_srt_name
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Could not generate montage SRT sidecar: %s", exc)
-
-            processed.append(montage_clip_dict)
-        except Exception as exc:
-            processing_warnings.append(f"Montage stitching failed: {exc}")
-            logger.exception("Montage stitching failed")
-
     # 6d. Verify the actual final artifacts. If a late transform is invalid,
     #     try earlier known-good render stages before marking the clip unusable.
     _emit_progress(
@@ -1135,13 +1546,28 @@ def run(
                 "file": clip.get("file"),
                 **clip.get("editorial_qa"),
             })
-        # Never silently miss the requested duration: compare the rendered
-        # length against the planning target and explain any mismatch.
+        # Duration is judged on the *measured* file against the *user's*
+        # request — never against the plan's own target, which would let a
+        # 26.6s clip that was planned for 26.6s pass as a 60s success.
         rendered_duration = (checks.get("duration") or {}).get("actual_seconds")
+        clip["actual_duration"] = (
+            round(float(rendered_duration), 2) if rendered_duration else None
+        )
+        duration_status, verdict = duration_policy.qa_status(
+            rendered_duration, context=f"Clip {clip.get('index', '?')}"
+        )
+        clip["duration_verdict"] = verdict.to_dict()
+        if verdict.status == STATUS_SHORTFALL:
+            clip["duration_shortfall"] = True
+            _add_render_warning(clip, verdict.message, processing_warnings)
+        elif verdict.status in (STATUS_OVERLONG,):
+            _add_render_warning(clip, verdict.message, processing_warnings)
+        # An unmeasurable duration is recorded in the verdict (and therefore in
+        # the request-compliance summary) rather than raised as a user warning:
+        # render QA already reports a missing duration check on its own.
+        # Keep the planner's own mismatch note as secondary detail.
         plan_target = (clip.get("edit_plan") or {}).get("target_duration")
-        if plan_target is None:
-            plan_target = target_duration
-        if rendered_duration and plan_target:
+        if rendered_duration and plan_target and not verdict.is_shortfall:
             mismatch = duration_mismatch_warning(
                 plan_target,
                 rendered_duration,
@@ -1156,10 +1582,17 @@ def run(
                 clip.pop("vertical_file", None)
         if clip.get("hook_file") != clip.get("file"):
             clip.pop("hook_file", None)
+        # A technically perfect clip that is far shorter than requested is not
+        # a clean pass: downgrade the clip's status so the job cannot report
+        # success for a result that does not meet the request.
+        if clip["qa_status"] == QA_PASS and duration_status == QA_SHORTFALL:
+            clip["qa_status"] = QA_SHORTFALL
         quality_reports.append({
             "index": clip.get("index"),
             "file": clip.get("file"),
             "status": clip["qa_status"],
+            "actual_duration": clip.get("actual_duration"),
+            "duration_verdict": clip.get("duration_verdict"),
             "checks": qa.get("checks", {}),
             "warnings": qa.get("warnings", []),
             "errors": qa.get("errors", []),
@@ -1207,21 +1640,81 @@ def run(
 
     processed = verified_clips
     actual_individual_count = sum(1 for clip in processed if not clip.get("is_montage"))
-    if not montage and actual_individual_count < requested_individual_count:
+
+    # A shortfall is reported whether or not a montage was requested. Counting
+    # was previously skipped in montage mode, which is how a job could deliver
+    # fewer clips than asked for and still report success.
+    if actual_individual_count < requested_individual_count:
         warning = (
             f"Requested {requested_individual_count} individual clips, but generated "
-            f"{actual_individual_count}; {actual_individual_count} passed render QA; "
-            "review the per-clip QA details."
+            f"{actual_individual_count}; {actual_individual_count} passed render QA. "
+            + selection.summary()
         )
         if warning not in processing_warnings:
             processing_warnings.append(warning)
             logger.warning(warning)
 
+    # The montage is a separate output with its own budget, built from the
+    # verified clips, and is never counted as one of them.
+    montage_clip = None
+    montage_report = {"status": "not_requested"}
+    if montage_requested:
+        montage_clip, montage_report = _build_montage(
+            video_path=video_path,
+            output_dir=output_dir,
+            base_name=base_name,
+            title=title,
+            transcript=transcript,
+            video_dur=video_dur,
+            montage_target=montage_target,
+            processed=processed,
+            preferred_moments=montage_preferred_moments,
+            generation_mode=generation_mode,
+            custom_prompt=custom_prompt,
+            processing_warnings=processing_warnings,
+            use_yolo=use_yolo,
+            target_aspect=target_aspect,
+            uses_transcript=source_profile.uses_transcript,
+            on_progress=on_progress,
+            candidate_review=candidate_review,
+        )
+        if montage_clip:
+            _verify_montage_output(
+                clip=montage_clip,
+                output_dir=output_dir,
+                target_seconds=montage_target,
+                expected_aspect=target_aspect,
+            )
+            montage_report["qa_status"] = montage_clip.get("qa_status")
+            if montage_clip.get("qa_status") == "fail":
+                montage_report["status"] = "failed"
+                montage_report["reason"] = (
+                    "The stitched montage did not pass post-render QA."
+                )
+                message = (
+                    "The montage was stitched but failed post-render QA; "
+                    "check the montage quality report before publishing it."
+                )
+                if message not in processing_warnings:
+                    processing_warnings.append(message)
+            processed.append(montage_clip)
+        elif montage_report.get("reason"):
+            message = f"Montage was not produced: {montage_report['reason']}"
+            if message not in processing_warnings:
+                processing_warnings.append(message)
+
     failed_qa_count = sum(report["status"] == "fail" for report in quality_reports)
-    if not quality_reports:
+    shortfall_count = sum(report["status"] == QA_SHORTFALL for report in quality_reports)
+    montage_qa_failed = bool(
+        montage_clip is not None and montage_clip.get("qa_status") == "fail"
+    )
+    if not quality_reports and not montage_clip:
         qa_status = "not_run"
-    elif failed_qa_count:
+    elif failed_qa_count or montage_qa_failed:
         qa_status = "fail"
+    elif shortfall_count:
+        # A clip that is far shorter than requested is not a clean pass.
+        qa_status = "shortfall"
     elif any(report["status"] == "warning" for report in quality_reports):
         qa_status = "warning"
     else:
@@ -1230,9 +1723,36 @@ def run(
         "status": qa_status,
         "checked_clip_count": len(quality_reports),
         "failed_clip_count": failed_qa_count,
+        "duration_shortfall_count": shortfall_count,
         "reports": quality_reports,
         "failed_outputs": failed_outputs,
+        # Separate accounting: the montage is verified as its own output and is
+        # never counted among the requested individual clips.
+        "montage": None if montage_clip is None else {
+            "file": montage_clip.get("file"),
+            "delivery_status": montage_report.get("status"),
+            "qa_status": montage_clip.get("qa_status"),
+            "target_seconds": montage_report.get("target_seconds"),
+            "actual_seconds": montage_report.get("actual_seconds"),
+            "duration_verdict": montage_clip.get("duration_verdict"),
+        },
     }
+
+    # Compose the request-compliance summary the job status and UI report from:
+    # exact clip count, per-clip duration verdicts, topic relevance and the
+    # montage's separate accounting.
+    request_compliance = _assess_request_compliance(
+        quality_reports=quality_reports,
+        requested_count=requested_individual_count,
+        delivered_count=actual_individual_count,
+        policy=duration_policy,
+        processed=processed,
+        prompt=custom_prompt,
+        montage_requested=montage_requested,
+        montage_report=montage_report,
+        source_profile=source_profile,
+        selection_report=selection_report,
+    )
     _emit_progress(
         on_progress,
         "quality_assurance",
@@ -1262,8 +1782,17 @@ def run(
         "clips": processed,
         "requested_clip_count": requested_individual_count,
         "individual_clip_count": actual_individual_count,
+        # Montage accounting is deliberately separate from the clip count:
+        # a montage is an additional output, never one of the requested clips.
+        "montage_requested": montage_requested,
+        "montage_count": sum(1 for item in processed if item.get("is_montage")),
         "montage_file": next((item["file"] for item in processed if item.get("is_montage")), None),
+        "montage_report": montage_report,
+        "duration_policy": duration_policy.to_dict(),
+        "source_profile": source_profile.to_dict(),
         "candidate_review": candidate_review,
+        "candidate_selection": selection_report,
+        "request_compliance": request_compliance,
         "quality_assurance": quality_assurance,
         "editorial_qa": editorial_summary(editorial_reviews),
         "generation_mode": generation_mode,

@@ -8,9 +8,13 @@ timed disappearance (OpenShorts behavior).
 """
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import urllib.request
 import uuid
+
+from .utils import logger, subprocess_text_kwargs
 
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
@@ -137,7 +141,7 @@ def download_font_if_needed():
         if not os.path.exists(FONT_DIR):
             os.makedirs(FONT_DIR)
         if not os.path.exists(FONT_PATH):
-            print(f"⚠️ Downloading font from {FONT_URL}...")
+            logger.info("Downloading font from %s...", FONT_URL)
             try:
                 # Add user agent to avoid 403s slightly
                 req = urllib.request.Request(
@@ -146,11 +150,14 @@ def download_font_if_needed():
                 )
                 with urllib.request.urlopen(req) as response, open(FONT_PATH, 'wb') as out_file:
                     out_file.write(response.read())
-                print("✅ Font downloaded.")
+                logger.info("Hook font downloaded.")
             except Exception as e:
-                print(f"⚠️ Failed to download font: {e}")
+                logger.warning("Failed to download hook font: %s", e)
     except OSError as e:
-        print(f"⚠️ Font directory {FONT_DIR} is not writable ({e}); using default font.")
+        logger.warning(
+            "Hook font directory %s is not writable (%s); using the default font.",
+            FONT_DIR, e,
+        )
 
 
 # Hook visual styles. Each maps to box fill (RGBA, alpha 0 = no box), text
@@ -202,7 +209,7 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png", 
     try:
         font = ImageFont.truetype(FONT_PATH, font_size)
     except Exception as e:
-        print(f"⚠️ Warning: Could not load font {FONT_PATH}, using default. Error: {e}")
+        logger.warning("Could not load hook font %s; using the default font (%s).", FONT_PATH, e)
         font = ImageFont.load_default()
 
     # Emoji handling: render with an emoji-capable font if one exists,
@@ -322,6 +329,38 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png", 
     return output_image_path, canvas_w, canvas_h
 
 
+def _decode_stderr(error) -> str:
+    """Best-effort stderr text from a CalledProcessError, never raising."""
+    raw = getattr(error, "stderr", None)
+    if raw is None:
+        return "Unknown"
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")[:800]
+    return str(raw)[:800]
+
+
+def _verify_overlay_output(path) -> None:
+    """Raise unless ``path`` is a decodable video with a video stream.
+
+    The overlay is written to a temporary file and only promoted to the real
+    output once it decodes, so an FFmpeg failure mid-write can never leave a
+    truncated file where a valid clip used to be.
+    """
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise RuntimeError("Hook overlay produced no output file.")
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", path],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=60, **subprocess_text_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"Hook overlay output could not be verified ({type(exc).__name__}).")
+    if probe.returncode != 0 or "video" not in (probe.stdout or ""):
+        raise RuntimeError("Hook overlay output has no decodable video stream.")
+
+
 def add_hook_to_video(video_path, text, output_path, position="top", font_scale=1.0,
                       duration=None, style="classic"):
     """
@@ -330,6 +369,10 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
     font_scale: float multiplier (1.0 = default)
     style: hook look (see HOOK_STYLES)
     duration: seconds the hook stays (None = whole clip)
+
+    The render is atomic: FFmpeg writes to a sibling temporary file which is
+    verified and only then moved onto ``output_path``. A failure therefore
+    leaves any pre-existing file at ``output_path`` untouched.
     """
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video {video_path} not found")
@@ -338,13 +381,15 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
     try:
         cmd = ['ffprobe', '-v', 'error', '-show_entries', 'stream=width,height',
                 '-of', 'csv=s=x:p=0', video_path]
-        res = subprocess.check_output(cmd, timeout=60).decode().strip()
+        res = subprocess.check_output(cmd, timeout=60).decode(
+            "utf-8", errors="replace"
+        ).strip()
         # Takes first stream if multiple
         dims = res.split('\n')[0].split('x')
         video_width = int(dims[0])
         video_height = int(dims[1])
     except Exception as e:
-        print(f"⚠️ FFprobe failed: {e}. Assuming 1080x1920")
+        logger.warning("FFprobe failed when sizing the hook overlay (%s); assuming 1080x1920.", e)
         video_width = 1080
         video_height = 1920
 
@@ -352,8 +397,15 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
     # Box check: Don't let it be wider than 90% of screen
     target_box_width = int(video_width * 0.9)
 
-    # Unique per invocation so parallel jobs can't overwrite each other's overlay.
-    hook_filename = f"temp_hook_{uuid.uuid4().hex[:8]}_{os.path.basename(video_path)}.png"
+    # Unique per invocation so parallel jobs can't overwrite each other's
+    # overlay. Written to the system temp directory (not the process CWD) so a
+    # read-only working directory cannot break hook rendering.
+    overlay_dir = tempfile.mkdtemp(prefix="autoclipper_hook_")
+    hook_filename = os.path.join(
+        overlay_dir, f"temp_hook_{uuid.uuid4().hex[:8]}_{os.path.basename(video_path)}.png"
+    )
+    # Sibling of the real output so the final move is atomic on the same volume.
+    staging_path = f"{output_path}.partial-{uuid.uuid4().hex[:8]}.mp4"
 
     try:
         img_path, box_w, box_h = create_hook_image(
@@ -373,7 +425,7 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
             overlay_y = int(video_height * 0.20)  # 20% from top
 
         # 4. FFmpeg Command
-        print(f"🔥 Overlaying hook: '{text}' at {overlay_x},{overlay_y}")
+        logger.info("Overlaying hook text at %s,%s", overlay_x, overlay_y)
 
         ffmpeg_cmd = [
             'ffmpeg', '-y',
@@ -385,23 +437,33 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
             '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
             '-pix_fmt', 'yuv420p',
             '-movflags', '+faststart',
-            output_path
+            staging_path
         ]
 
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800)
-        print(f"✅ Hook added to {output_path}")
+        subprocess.run(
+            ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=1800,
+        )
+        # Verify before promoting: a truncated render never replaces a good clip.
+        _verify_overlay_output(staging_path)
+        shutil.move(staging_path, output_path)
+        logger.info("Hook overlay written to %s", output_path)
         return True
 
     except subprocess.TimeoutExpired:
-        print("⚠️ FFmpeg hook overlay timed out after 1800s.")
+        logger.error("FFmpeg hook overlay timed out after 1800s.")
         raise RuntimeError("FFmpeg hook overlay timed out after 1800s.")
     except subprocess.CalledProcessError as e:
-        print(f"❌ FFmpeg Error: {e.stderr.decode() if e.stderr else 'Unknown'}")
+        logger.error("FFmpeg hook overlay failed: %s", _decode_stderr(e))
         raise e
     except Exception as e:
-        print(f"❌ Hook Gen Error: {e}")
+        logger.error("Hook overlay generation failed: %s", e)
         raise e
     finally:
-        # Cleanup temp image
-        if os.path.exists(hook_filename):
-            os.remove(hook_filename)
+        # Cleanup temp image and any staging file left by a failed render.
+        shutil.rmtree(overlay_dir, ignore_errors=True)
+        if os.path.exists(staging_path):
+            try:
+                os.remove(staging_path)
+            except OSError:
+                pass

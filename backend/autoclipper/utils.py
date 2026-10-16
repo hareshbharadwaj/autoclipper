@@ -9,15 +9,77 @@ import sys
 
 logger = logging.getLogger("autoclipper")
 
+# Text encoding used for every subprocess we run and every stream we log to.
+# FFmpeg, FFprobe and yt-dlp all emit UTF-8; decoding their output with a
+# Windows console code page (cp1252) raises UnicodeDecodeError on any
+# non-ASCII filename or title.
+SUBPROCESS_ENCODING = "utf-8"
+SUBPROCESS_ERRORS = "replace"
+
+
+def subprocess_text_kwargs() -> dict:
+    """Keyword arguments that make subprocess text handling encoding-safe."""
+    return {
+        "text": True,
+        "encoding": SUBPROCESS_ENCODING,
+        "errors": SUBPROCESS_ERRORS,
+    }
+
+
+def ensure_utf8_stream(stream=None):
+    """Make a text stream able to encode anything we log.
+
+    On Windows ``sys.stdout`` defaults to a legacy code page, so a log line
+    containing "⚠" raises ``UnicodeEncodeError``. Reconfiguring to UTF-8 with
+    ``errors="replace"`` turns an encoding failure into a visible replacement
+    character instead of a crashed job.
+    """
+    stream = sys.stdout if stream is None else stream
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding=SUBPROCESS_ENCODING, errors="replace")
+            return stream
+        except (ValueError, OSError):
+            pass
+    return stream
+
+
+class SafeStreamHandler(logging.StreamHandler):
+    """A stream handler that can never take the process down.
+
+    ``StreamHandler`` swallows exceptions but prints a "--- Logging error ---"
+    block for each one. Re-encoding to an ASCII-safe form keeps the log
+    readable and stops that noise on Windows consoles.
+    """
+
+    def emit(self, record):  # pragma: no cover - exercised via the tests below
+        try:
+            message = self.format(record)
+            stream = self.stream
+            try:
+                stream.write(message + self.terminator)
+            except UnicodeEncodeError:
+                encoding = getattr(stream, "encoding", None) or "ascii"
+                safe = message.encode(encoding, "replace").decode(encoding, "replace")
+                stream.write(safe + self.terminator)
+            self.flush()
+        except RecursionError:
+            raise
+        except Exception:  # noqa: BLE001 - logging must never raise
+            self.handleError(record)
+
 
 def setup_logging(verbose: bool = False):
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-        stream=sys.stdout,
-    )
+    root = logging.getLogger()
+    if not any(isinstance(handler, SafeStreamHandler) for handler in root.handlers):
+        handler = SafeStreamHandler(ensure_utf8_stream(sys.stdout))
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S"
+        ))
+        root.addHandler(handler)
+    root.setLevel(level)
 
 
 def sanitize_filename(name: str) -> str:
@@ -66,8 +128,8 @@ def run_command(cmd, check: bool = True, cwd: str = None) -> subprocess.Complete
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
         cwd=cwd,
+        **subprocess_text_kwargs(),
     )
     if check and result.returncode != 0:
         raise RuntimeError(
