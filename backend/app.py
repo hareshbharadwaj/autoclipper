@@ -411,11 +411,6 @@ async def process(
     aspect_ratio: str = Form(None),
     add_hook: bool = Form(False),
     montage: bool = Form(False),
-    voiceover_text: str = Form(None),
-    voiceover_engine: str = Form("auto"),
-    voiceover_voice: str = Form(None),
-    background_music_file: UploadFile = File(None),
-    music_volume: float = Form(0.18),
     content_type: str = Form("general"),
     generation_mode: str = Form("source_only"),
     current: User = Depends(get_current_user),
@@ -487,22 +482,7 @@ async def process(
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"Invalid selected_clips: {exc}")
 
-    if not 0.0 <= music_volume <= 1.0:
-        raise HTTPException(status_code=400, detail="music_volume must be between 0 and 1.")
-
     job_id = uuid.uuid4().hex[:12]
-    music_path = None
-    if background_music_file is not None:
-        allowed_audio_exts = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
-        ext = os.path.splitext(background_music_file.filename or "")[1].lower()
-        if ext not in allowed_audio_exts:
-            raise HTTPException(status_code=400, detail="Background music must be MP3, WAV, M4A, AAC, OGG, or FLAC.")
-        job_dir = os.path.join(config.OUTPUT_ROOT, job_id)
-        os.makedirs(job_dir, exist_ok=True)
-        music_path = os.path.join(job_dir, "background_music" + ext)
-        with open(music_path, "wb") as out:
-            while chunk := await background_music_file.read(1024 * 1024):
-                out.write(chunk)
     jobs[job_id] = {
         "job_id": job_id,
         "status": "queued",
@@ -540,11 +520,6 @@ async def process(
         "aspect_ratio": aspect_ratio or None,
         "add_hook": bool(add_hook),
         "montage": bool(montage),
-        "voiceover_text": voiceover_text,
-        "voiceover_engine": voiceover_engine or "auto",
-        "voiceover_voice": voiceover_voice or None,
-        "background_music_path": music_path,
-        "music_volume": max(0.0, min(float(music_volume), 1.0)),
         "content_type": content_type or "general",
     }
     if (
