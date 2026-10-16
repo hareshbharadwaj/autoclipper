@@ -247,7 +247,7 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
                 chunk.append(word["text"])
                 chunk_end = word["end"]
                 chunk_duration = chunk_end - chunk_start
-                sentence_end = bool(__import__("re").search(r"[.!?…][\\"'”’)]*$", word["text"]))
+                sentence_end = any(word["text"].rstrip().endswith(mark) for mark in (".", "!", "?", "…"))
                 if sentence_end and chunk_duration >= desired_per_shot * 0.70:
                     refined.append({
                         "start": chunk_start, "end": chunk_end, "text": " ".join(chunk)
