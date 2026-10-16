@@ -310,7 +310,7 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
                 duration_penalty = abs(duration - desired_per_shot) / desired_per_shot
                 # Peak relevance ensures the requested topic is present; average
                 # relevance favors windows that stay on topic instead of drifting.
-                score = (avg_relevance * 4.0) + (peak_relevance * 0.5) - (duration_penalty * 2.0)
+                score = (avg_relevance * 4.0) + (peak_relevance * 0.5) - (duration_penalty * 4.0)
                 windows.append((score, duration, shot_start, shot_end, lo, hi))
 
         if not windows:
