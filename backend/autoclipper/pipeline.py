@@ -890,6 +890,13 @@ def run(
                 )
             duration_delta = montage_duration - float(target_duration or 40)
             duration_tolerance = _montage_duration_tolerance(target_duration or 40)
+            if duration_delta > duration_tolerance:
+                raise RuntimeError(
+                    f"Montage would exceed the requested {float(target_duration or 40):.0f}s "
+                    f"target by {duration_delta:.1f}s (tolerance ±{duration_tolerance:.1f}s); "
+                    "the overlong montage was not delivered. Shorten the target or choose "
+                    "angles with shorter complete passages."
+                )
             if abs(duration_delta) > duration_tolerance:
                 processing_warnings.append(
                     f"Montage actual duration is {montage_duration:.2f}s versus the "
