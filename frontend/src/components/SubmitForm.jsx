@@ -53,10 +53,6 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
   const [selectedAngle, setSelectedAngle] = useState(null)
   const [montageMode, setMontageMode] = useState(false)
   const [selectedAngles, setSelectedAngles] = useState([])
-  const [voiceoverText, setVoiceoverText] = useState('')
-  const [voiceoverEngine, setVoiceoverEngine] = useState('auto')
-  const [backgroundMusicFile, setBackgroundMusicFile] = useState(null)
-  const [musicVolume, setMusicVolume] = useState(18)
 
   // Analysis state
   const [analysis, setAnalysis] = useState(null)
@@ -237,10 +233,6 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
         customPrompt: customPrompt.trim() || undefined,
         selectedClips,
         montage: montageMode || undefined,
-        voiceoverText: voiceoverText.trim() || undefined,
-        voiceoverEngine,
-        backgroundMusicFile: backgroundMusicFile || undefined,
-        musicVolume: musicVolume / 100,
         aspectRatio,
         addHook: addHook || undefined,
         splitScreen: splitScreen || undefined,
@@ -769,66 +761,6 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
                 <p className="mt-2 text-[11px] text-zinc-500">
                   Detected {aspectMeta.detected_label}. {aspectMeta.reason}
                 </p>
-              )}
-            </div>
-
-            {/* Optional Plan C audio layers */}
-            <div className="space-y-3 rounded-xl border border-zinc-700 bg-white/5 p-4">
-              <div>
-                <div className="text-xs font-semibold text-zinc-200 uppercase tracking-wider">Optional voiceover & background music</div>
-                <p className="mt-1 text-[11px] text-zinc-500">
-                  Voiceover is generated from your script. When music and narration are both enabled, music volume is automatically ducked under speech.
-                </p>
-              </div>
-              <div>
-                <label htmlFor="voiceoverText" className="block mb-1 text-xs text-zinc-300">Voiceover script (optional)</label>
-                <textarea
-                  id="voiceoverText"
-                  rows={2}
-                  maxLength={5000}
-                  value={voiceoverText}
-                  onChange={(e) => setVoiceoverText(e.target.value)}
-                  placeholder="Write narration for silent footage, B-roll, or an explanatory intro…"
-                  className="w-full resize-y rounded-lg bg-background border border-border px-3 py-2 text-sm text-white placeholder-zinc-600"
-                />
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label htmlFor="voiceoverEngine" className="block mb-1 text-xs text-zinc-300">Voice engine</label>
-                  <select
-                    id="voiceoverEngine"
-                    value={voiceoverEngine}
-                    onChange={(e) => setVoiceoverEngine(e.target.value)}
-                    className="w-full rounded-lg bg-background border border-border px-3 py-2 text-xs text-white"
-                  >
-                    <option value="auto">Automatic / fallback</option>
-                    <option value="kokoro">Kokoro (local)</option>
-                    <option value="edge">Edge TTS</option>
-                    <option value="gemini">Gemini TTS</option>
-                  </select>
-                </div>
-                <div>
-                  <label htmlFor="backgroundMusic" className="block mb-1 text-xs text-zinc-300">Background music (optional)</label>
-                  <input
-                    id="backgroundMusic"
-                    type="file"
-                    accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,audio/*"
-                    onChange={(e) => setBackgroundMusicFile(e.target.files?.[0] || null)}
-                    className="block w-full text-[11px] text-zinc-400 file:mr-2 file:rounded-md file:border-0 file:bg-white/10 file:px-2 file:py-1.5 file:text-zinc-200"
-                  />
-                  {backgroundMusicFile && <p className="mt-1 text-[10px] text-zinc-500">{backgroundMusicFile.name}</p>}
-                </div>
-              </div>
-              {backgroundMusicFile && (
-                <SliderRow
-                  label="Music level"
-                  value={musicVolume}
-                  min={5}
-                  max={40}
-                  step={1}
-                  unit="%"
-                  onChange={setMusicVolume}
-                />
               )}
             </div>
 
