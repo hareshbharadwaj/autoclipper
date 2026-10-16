@@ -438,131 +438,6 @@ def _plan_clip_edits(candidates, transcript, video_dur, target_duration,
     return planned
 
 
-def _apply_ai_narration(clip, plan, output_dir, base_name, voiceover_engine,
-                        voiceover_voice, gemini_key, processing_warnings):
-    """Prepend a clearly labelled, transcript-grounded AI narration card.
-
-    Used only in AI-expanded mode when the source is too short for the
-    requested duration. The card is a frozen frame carrying generated speech
-    built from verbatim transcript quotes; the original speaker's clip and
-    words are untouched. On failure the source-only clip is delivered with an
-    explicit warning.
-    """
-    narration = (plan or {}).get("narration") or {}
-    script = (narration.get("script") or "").strip()
-    if not script or clip.get("is_montage"):
-        return False
-    prior_name = clip.get("file")
-    src = os.path.join(output_dir, prior_name or "")
-    if not _nonempty_file(src):
-        return False
-    try:
-        from .voiceover import build_intro, concat_videos, generate_voiceover, wav_duration
-
-        wav_path = os.path.join(
-            output_dir, f"{base_name}_narration_{clip.get('index', 0)}.wav"
-        )
-        generate_voiceover(
-            script,
-            wav_path,
-            engine=voiceover_engine or "auto",
-            voice=voiceover_voice,
-            gemini_key=gemini_key,
-        )
-        if not _nonempty_file(wav_path):
-            raise RuntimeError("Narration synthesis produced no audio.")
-        actual = wav_duration(wav_path)
-        if actual <= 0:
-            raise RuntimeError("Narration audio duration could not be verified.")
-
-        card_name = prior_name.rsplit(".", 1)[0] + "_narrationcard.mp4"
-        card_path = os.path.join(output_dir, card_name)
-        build_intro(
-            src,
-            wav_path,
-            card_path,
-            hook_text=narration.get("label") or "AI narration",
-            duration=actual,
-        )
-        final_name = prior_name.rsplit(".", 1)[0] + "_ainarr.mp4"
-        final_path = os.path.join(output_dir, final_name)
-        concat_videos(card_path, src, final_path)
-        if not _nonempty_file(final_path):
-            raise RuntimeError("Narration concat produced no output.")
-
-        # Only now that the narrated render exists on disk does the edit plan
-        # adopt the measured narration length (source/edit/rendered timelines
-        # stay consistent with what is actually delivered).
-        finalize_narration_timing(plan, actual)
-
-        # Captions: burned ones ride inside the source segment; the SRT sidecar
-        # is rebased onto the edit timeline (narration card first).
-        if clip.get("srt"):
-            try:
-                from .subtitles import rebase_srt_file
-
-                rebase_srt_file(
-                    os.path.join(output_dir, clip["srt"]),
-                    plan,
-                    clip_source_start=float(clip.get("start", 0.0)),
-                )
-            except Exception as exc:  # noqa: BLE001
-                _add_render_warning(
-                    clip,
-                    f"Caption sidecar could not be rebased onto the final edit "
-                    f"timeline ({type(exc).__name__}); the delivered .srt does "
-                    "not match the final video and should be regenerated from "
-                    "the clip editor.",
-                    processing_warnings,
-                )
-
-        clip.setdefault("_render_fallbacks", []).append(prior_name)
-        clip["file"] = final_name
-        clip["ai_narration"] = {
-            "file": final_name,
-            "script": script[:2000],
-            "label": narration.get("label"),
-            "estimated_duration": narration.get("estimated_duration"),
-            "actual_duration": narration.get("actual_duration"),
-            "position": narration.get("position"),
-            "origin": "ai",
-            "grounding_quotes": list(narration.get("grounding_quotes") or []),
-        }
-        clip["planned_rendered_duration"] = plan.get("estimated_duration")
-        try:
-            if os.path.isfile(card_path):
-                os.remove(card_path)
-        except OSError:
-            pass
-        return True
-    except Exception as exc:  # noqa: BLE001
-        # The delivered clip is the untouched source-only render: restore the
-        # plan's timeline so duration metadata never includes narration that
-        # was planned but never produced.
-        try:
-            drop_narration(plan)
-        except Exception:  # noqa: BLE001
-            pass
-        clip.pop("planned_rendered_duration", None)
-        _add_render_warning(
-            clip,
-            f"AI-expanded narration could not be generated ({type(exc).__name__}); "
-            "delivering the source-only clip. "
-            + str((plan or {}).get("duration_explanation") or ""),
-            processing_warnings,
-        )
-        try:
-            card_path = os.path.join(
-                output_dir, (clip.get("file") or prior_name or "").rsplit(".", 1)[0] + "_narrationcard.mp4"
-            )
-            if os.path.isfile(card_path):
-                os.remove(card_path)
-        except OSError:
-            pass
-        clip["file"] = prior_name
-        return False
-
-
 def run(
     source: str,
     output_dir: str = "output",
@@ -591,11 +466,6 @@ def run(
     add_hook: bool = False,
     montage: bool = False,
     selected_clips: list = None,
-    voiceover_text: str = None,
-    voiceover_engine: str = "auto",
-    voiceover_voice: str = None,
-    background_music_path: str = None,
-    music_volume: float = 0.18,
     cached_transcript_path: str = None,
     on_clip=None,
     on_progress=None,
@@ -959,35 +829,6 @@ def run(
 
         clip["_render_fallbacks"] = list(dict.fromkeys(fallbacks))
 
-        # 6c. AI-expanded mode: when the source story alone cannot reach the
-        #     requested duration, prepend a clearly labelled narration card
-        #     built from verbatim transcript quotes. Source-only mode never
-        #     generates speech; the original speaker's clip is untouched.
-        if (
-            generation_mode == "ai_expanded"
-            and not montage
-            and (clip.get("edit_plan") or {}).get("narration")
-        ):
-            if _apply_ai_narration(
-                clip,
-                clip["edit_plan"],
-                output_dir,
-                base_name,
-                voiceover_engine,
-                voiceover_voice,
-                gemini_key,
-                processing_warnings,
-            ):
-                _emit_progress(
-                    on_progress,
-                    "rendering",
-                    f"Clip {idx + 1}: labelled AI narration card added "
-                    "(transcript-grounded).",
-                    current=idx + 1,
-                    total=total_clips,
-                    candidate_review=candidate_review,
-                )
-
         processed.append(clip)
         _emit_progress(
             on_progress,
@@ -1082,76 +923,6 @@ def run(
         except Exception as exc:
             processing_warnings.append(f"Montage stitching failed: {exc}")
             logger.exception("Montage stitching failed")
-
-    # Plan C: optional narration and/or background music. For multiple normal clips,
-    # apply the same requested audio treatment to the first clip only and say so.
-    audio_target = None
-    if montage:
-        if processed and processed[-1].get("is_montage"):
-            audio_target = processed[-1]
-        elif voiceover_text or background_music_path:
-            processing_warnings.append(
-                "Voiceover/music was skipped because montage stitching failed."
-            )
-    elif len(processed) == 1:
-        audio_target = processed[0]
-    elif voiceover_text or background_music_path:
-        audio_target = processed[0] if processed else None
-        if len(processed) > 1:
-            processing_warnings.append(
-                "Voiceover/music was applied to the first generated clip only; enable montage to mix one combined output."
-            )
-    if audio_target and (voiceover_text or background_music_path):
-        _emit_progress(on_progress, "audio", "Mixing requested voiceover and/or background music.")
-        try:
-            from .audio_mix import mix_audio_layers
-            voiceover_path = None
-            if voiceover_text and voiceover_text.strip():
-                from .voiceover import generate_voiceover
-                voiceover_path = os.path.join(output_dir, f"{base_name}_voiceover.wav")
-                generate_voiceover(
-                    voiceover_text.strip()[:5000],
-                    voiceover_path,
-                    engine=voiceover_engine or "auto",
-                    voice=voiceover_voice,
-                    gemini_key=gemini_key,
-                )
-            src = os.path.join(output_dir, audio_target["file"])
-            mixed_name = audio_target["file"].rsplit(".", 1)[0] + "_audio.mp4"
-            mixed_path = os.path.join(output_dir, mixed_name)
-            if voiceover_path and os.path.isfile(voiceover_path):
-                voice_duration = probe_duration(voiceover_path)
-                output_duration = probe_duration(src)
-                if voice_duration > 0 and output_duration > 0:
-                    audio_target["voiceover_duration"] = round(voice_duration, 2)
-                    if voice_duration < output_duration - max(2.0, output_duration * 0.05):
-                        warning = (
-                            f"Voiceover is {voice_duration:.1f}s for a {output_duration:.1f}s output. "
-                            "It plays once from the start; it is not stretched or repeated. "
-                            "Extend the script if narration should cover more of the video."
-                        )
-                        processing_warnings.append(warning)
-                        logger.info(warning)
-            mix_audio_layers(
-                src, mixed_path,
-                voiceover_path=voiceover_path,
-                music_path=background_music_path,
-                music_volume=music_volume,
-            )
-            if _nonempty_file(mixed_path):
-                audio_target.setdefault("_render_fallbacks", []).append(audio_target["file"])
-                audio_target["file"] = mixed_name
-                audio_target["audio_mixed"] = True
-            else:
-                raise RuntimeError("Audio mix did not produce a non-empty output file.")
-        except Exception as exc:
-            # The unmixed clip is delivered: clear metadata that only describes
-            # the discarded mix so the clip never claims audio it does not have.
-            audio_target.pop("audio_mixed", None)
-            audio_target.pop("voiceover_duration", None)
-            warning = f"Voiceover/music mixing failed ({type(exc).__name__}); the unmixed clip was retained."
-            processing_warnings.append(warning)
-            logger.exception("Voiceover/music mixing failed")
 
     # 6d. Verify the actual final artifacts. If a late transform is invalid,
     #     try earlier known-good render stages before marking the clip unusable.
