@@ -1,40 +1,18 @@
 import { useState, useEffect, useRef } from 'react'
-import { Sparkles, AudioLines, Play, Loader2, X, Wand2 } from 'lucide-react'
-import { enhanceClip, enhanceDraft, enhancePreview, previewVoiceOver, libraryFileUrl, cacheFileUrl } from '../api.js'
-
-const KOKORO_VOICES = [
-  'af_heart', 'af_alloy', 'af_bella', 'af_nova', 'af_sarah', 'af_sky',
-  'am_michael', 'am_puck', 'am_zeno',
-  'bf_alice', 'bf_emma', 'bm_daniel', 'bm_george', 'bm_leo',
-]
-const GEMINI_VOICES = [
-  'achernar', 'aoede', 'autonoe', 'alnilam', 'leda',
-  'schedar', 'umbriel', 'vindemiatrix', 'puck', 'zephyr',
-]
-const EDGE_VOICES = [
-  'id-ID-GadisNeural', 'id-ID-ArdiNeural',
-  'en-US-JennyNeural', 'en-US-GuyNeural',
-  'en-GB-SoniaNeural', 'en-GB-RyanNeural',
-]
+import { Sparkles, Loader2, X, Wand2 } from 'lucide-react'
+import { enhanceClip, enhanceDraft, enhancePreview, libraryFileUrl, cacheFileUrl } from '../api.js'
 
 export default function EnhanceModal({ name, clip, hook, onClose, onDone }) {
   const [hookText, setHookText] = useState(hook || '')
   const [hookPosition, setHookPosition] = useState('center')
   const [hookStyle, setHookStyle] = useState('classic')
   const [hookHold, setHookHold] = useState(5.0)
-  const [voExtend, setVoExtend] = useState(true)
-  const [voText, setVoText] = useState(hook || '')
-  const [engine, setEngine] = useState('kokoro')
-  const [voice, setVoice] = useState('')
-  const [mode, setMode] = useState('overlay')
-  const [audioPreviewUrl, setAudioPreviewUrl] = useState('')
   const [videoPreviewUrl, setVideoPreviewUrl] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState(null)
   const debounceRef = useRef(null)
 
-  const voiceList = engine === 'gemini' ? GEMINI_VOICES : engine === 'edge' ? EDGE_VOICES : KOKORO_VOICES
 
   // Auto video preview (left pane) whenever the hook changes.
   useEffect(() => {
@@ -53,10 +31,6 @@ export default function EnhanceModal({ name, clip, hook, onClose, onDone }) {
           hook_size: 'M',
           hook_style: hookStyle,
           hook_hold: hookHold,
-          vo_text: '',
-          vo_engine: engine,
-          vo_voice: voice || undefined,
-          vo_mode: mode,
         })
         console.log('preview resp', res)
         // unique per hook hash, so no stale cache
@@ -67,7 +41,7 @@ export default function EnhanceModal({ name, clip, hook, onClose, onDone }) {
       }
     }, 600)
     return () => debounceRef.current && clearTimeout(debounceRef.current)
-  }, [hookText, hookPosition, hookStyle, name, clip.file])
+  }, [hookText, hookPosition, hookStyle, hookHold, name, clip.file])
 
   async function handleDraftHook() {
     setError('')
@@ -82,31 +56,10 @@ export default function EnhanceModal({ name, clip, hook, onClose, onDone }) {
     }
   }
 
-  async function handleAudioPreview() {
-    setError('')
-    if (!voText.trim()) return setError('Teks voice-over kosong.')
-    setBusy(true)
-    try {
-      const url = await previewVoiceOver({
-        name,
-        filename: clip.file,
-        text: voText,
-        engine,
-        voice: voice || undefined,
-        mode,
-      })
-      setAudioPreviewUrl(url)
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setBusy(false)
-    }
-  }
-
   async function handleBurn() {
     setError('')
-    if (!hookText.trim() && !voText.trim())
-      return setError('Isi hook text atau voice-over text (atau keduanya).')
+    if (!hookText.trim())
+      return setError('Isi teks hook terlebih dahulu.')
     setBusy(true)
     try {
       const res = await enhanceClip({
@@ -117,11 +70,6 @@ export default function EnhanceModal({ name, clip, hook, onClose, onDone }) {
         hook_size: 'M',
         hook_style: hookStyle,
         hook_hold: hookHold,
-        vo_text: voText,
-        vo_engine: engine,
-        vo_voice: voice || undefined,
-        vo_mode: mode,
-        vo_extend: voExtend,
       })
       setResult(res)
       if (onDone) onDone(res)
@@ -208,7 +156,7 @@ export default function EnhanceModal({ name, clip, hook, onClose, onDone }) {
                   <option value="outline_yellow">Outline Kuning</option>
                 </select>
               </div>
-              <div className="mt-2 grid grid-cols-2 gap-3">
+              <div className="mt-2 grid grid-cols-1 gap-3">
                 <div>
                   <label className="text-xs text-zinc-400">Durasi hook (detik)</label>
                   <input
@@ -218,87 +166,9 @@ export default function EnhanceModal({ name, clip, hook, onClose, onDone }) {
                     className="mt-1 w-full rounded-lg bg-background border border-border px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-primary"
                   />
                 </div>
-                <div className="flex items-end">
-                  <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={voExtend}
-                      onChange={(e) => setVoExtend(e.target.checked)}
-                      className="accent-primary"
-                    />
-                    Perpanjang clip (hook+VO di awal)
-                  </label>
-                </div>
               </div>
             </section>
 
-            {/* Voice-Over */}
-            <section className="border-t border-border pt-4">
-              <div className="flex items-center gap-2 mb-2">
-                <AudioLines size={15} className="text-purple-300" />
-                <span className="text-xs font-semibold text-zinc-300 uppercase tracking-wider">Voice-Over</span>
-              </div>
-              <textarea
-                value={voText}
-                onChange={(e) => setVoText(e.target.value)}
-                rows={2}
-                placeholder="Teks yang akan dijadikan narasi suara…"
-                className="w-full rounded-lg bg-background border border-border px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-primary resize-y"
-              />
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-2">
-                <div>
-                  <label className="text-xs text-zinc-400">Engine</label>
-                  <select
-                    value={engine}
-                    onChange={(e) => { setEngine(e.target.value); setVoice('') }}
-                    className="mt-1 w-full rounded-lg bg-background border border-border px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-primary"
-                  >
-                    <option value="kokoro">Kokoro (lokal)</option>
-                    <option value="edge">Edge TTS</option>
-                    <option value="gemini">Gemini</option>
-                    <option value="auto">Auto</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs text-zinc-400">Voice</label>
-                  <select
-                    value={voice}
-                    onChange={(e) => setVoice(e.target.value)}
-                    className="mt-1 w-full rounded-lg bg-background border border-border px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-primary"
-                  >
-                    <option value="">Default</option>
-                    {voiceList.map((v) => (
-                      <option key={v} value={v}>{v}</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs text-zinc-400">Mode</label>
-                  <select
-                    value={mode}
-                    onChange={(e) => setMode(e.target.value)}
-                    className="mt-1 w-full rounded-lg bg-background border border-border px-3 py-2 text-sm text-zinc-200 focus:outline-none focus:border-primary"
-                  >
-                    <option value="overlay">Overlay (mix)</option>
-                    <option value="replace">Replace (dub)</option>
-                  </select>
-                </div>
-              </div>
-              <button
-                onClick={handleAudioPreview}
-                disabled={busy}
-                className="mt-3 flex items-center gap-2 px-4 py-2 rounded-lg bg-background border border-border text-white text-sm disabled:opacity-50"
-              >
-                {busy ? <Loader2 size={15} className="animate-spin" /> : <Play size={15} />}
-                Preview Suara
-              </button>
-              {audioPreviewUrl && (
-                <div className="mt-2">
-                  <p className="text-xs text-zinc-400 mb-1">Preview audio:</p>
-                  <audio controls src={audioPreviewUrl} className="w-full" />
-                </div>
-              )}
-            </section>
           </div>
         </div>
 
