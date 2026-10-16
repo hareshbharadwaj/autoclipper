@@ -8,7 +8,8 @@ import os
 import pytest
 
 from autoclipper import pipeline
-from autoclipper.subtitles import parse_srt, rebase_srt_file
+from autoclipper.edit_planner import build_edit_plan
+from autoclipper.subtitles import rebase_srt_file
 
 
 def _stub_transcript():
@@ -64,6 +65,18 @@ def _fake_cut_all_factory(folder):
         return results
     return fake_cut_all
 
+
+
+def _short_candidate():
+    return {
+        "start": 12.0, "end": 17.0,
+        "title": "Friends make you happy",
+        "hook": "Friends and happiness",
+        "description": "A short remark about friends and happiness",
+        "reason": "Cute one-liner",
+        "story_arc": "one line about friends",
+        "candidate_score": 90,
+    }
 
 def test_pipeline_reports_shortfall_instead_of_silently_dropping_clips(tmp_path, monkeypatch):
     """Scenario 8 (planning side): a 60s request with a 5s topic must be
@@ -212,7 +225,6 @@ def test_pipeline_never_generates_captions_during_render(tmp_path, monkeypatch):
     assert not [name for name in os.listdir(job_dir) if "sub" in name.lower()]
 
 
-@pytest.mark.parametrize("failing_stage", ["build_intro", "concat_videos"])
 def test_rebase_srt_file_fails_loudly_when_captions_cannot_rebase(tmp_path):
     """Review issue 2: an unmappable or missing caption sidecar must raise,
     never silently return mistimed captions as if they were rebased."""
@@ -276,3 +288,29 @@ def test_pipeline_marks_clip_unreviewed_when_edit_planning_fails(tmp_path, monke
     assert result["editorial_qa"]["status"] == "warning"
     assert result["editorial_qa"]["unchecked_clip_count"] == 1
     assert any("unreviewed" in w.lower() for w in result["processing_warnings"])
+
+def test_legacy_ai_expanded_request_stays_source_audio_only(tmp_path, monkeypatch):
+    """Removed narration mode must not create a narration card or change audio."""
+    transcript = _stub_transcript()
+    _patch_common(monkeypatch, tmp_path, transcript, [_short_candidate()])
+    monkeypatch.setattr(pipeline, "cut_all", _fake_cut_all_factory(tmp_path))
+
+    def qa_pass(path, **_kwargs):
+        return {"status": "pass", "file": os.path.basename(path), "checks": {
+            "audio": {"ok": True}, "duration": {"ok": True, "actual_seconds": 5.0},
+        }, "warnings": [], "errors": []}
+
+    monkeypatch.setattr(pipeline, "verify_rendered_file", qa_pass)
+    result = pipeline.run(
+        "stub", output_dir=str(tmp_path / "job"),
+        clip_count=1, target_duration=15, generation_mode="ai_expanded",
+        vertical=False, subtitles=False,
+    )
+
+    clip = result["clips"][0]
+    assert clip["edit_plan"]["mode"] == "source_only"
+    assert clip["edit_plan"].get("narration") is None
+    assert clip.get("ai_narration") is None
+    assert not any("voiceover" in warning.lower() or "background music" in warning.lower()
+                   for warning in result["processing_warnings"])
+
