@@ -333,6 +333,7 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
             # Override any angle-level estimate: montage clips share one total budget.
             "target_duration": round(desired_per_shot, 2),
             "topic_match_score": round(segment_scores[anchor_idx], 3),
+            "_montage_selected": True,
             "_user_selected": True,
         })
 
