@@ -13,9 +13,9 @@ def test_pipeline_reports_actual_montage_duration_without_cutting_transcript_seg
         "duration": 102,
         "language": "English",
         "segments": [
-            {"start": 0, "end": 17, "text": "First complete thought."},
+            {"start": 0, "end": 17, "text": "Same hook is the first complete thought."},
             {"start": 17, "end": 34, "text": "Second complete thought."},
-            {"start": 34, "end": 51, "text": "Third complete thought."},
+            {"start": 34, "end": 51, "text": "Same hook is the third complete thought."},
             {"start": 51, "end": 68, "text": "Fourth complete thought."},
             {"start": 68, "end": 85, "text": "Fifth complete thought."},
             {"start": 85, "end": 102, "text": "Sixth complete thought."},
@@ -164,3 +164,60 @@ def test_montage_keeps_user_selected_moments_with_identical_text(tmp_path, monke
     assert len(captured["montage_inputs"]) == 2
     assert result["individual_clip_count"] == 2
     assert result["montage_file"] == "source_montage.mp4"
+
+
+def test_montage_uses_topic_evidence_instead_of_wrong_analysis_timestamp():
+    """A bad hint must not force a selected angle onto an unrelated passage."""
+    transcript = {
+        "duration": 60,
+        "segments": [
+            {"start": 0, "end": 15, "text": "Knife safety starts with keeping the blade pointed down."},
+            {"start": 15, "end": 30, "text": "Never wave a knife and always keep knife safety in mind."},
+            {"start": 30, "end": 45, "text": "When cutting a round vegetable that can roll, use the tunnel method."},
+            {"start": 45, "end": 60, "text": "Now they will not roll away, and you have a flat surface to cut safely."},
+        ],
+    }
+    selected = [
+        {
+            "title": "Knife Safety Rules",
+            "description": "Avoid dangerous knife handling mistakes.",
+            "start": 0, "end": 30,
+        },
+        {
+            "title": "Stop Your Veggies From Rolling",
+            "description": "Use the tunnel method so round vegetables do not roll away.",
+            # Deliberately wrong timestamp: semantic matching should find 30-60.
+            "start": 0, "end": 15,
+        },
+    ]
+
+    clips = pipeline._fit_montage_candidates(selected, transcript, 60, 60)
+
+    assert len(clips) == 2
+    assert clips[0]["start"] == 0
+    assert clips[0]["end"] == 30
+    assert clips[1]["start"] == 30
+    assert clips[1]["end"] == 60
+    assert all(clip["target_duration"] == 30.12 or clip["target_duration"] == 30.0
+               for clip in clips)
+    assert clips[1]["topic_match_score"] > 0
+
+
+def test_montage_rejects_selected_angle_not_grounded_in_transcript():
+    transcript = {
+        "duration": 20,
+        "segments": [
+            {"start": 0, "end": 10, "text": "The tomato is red and ripe."},
+            {"start": 10, "end": 20, "text": "Cut the tomato into small pieces."},
+        ],
+    }
+    selected = [
+        {"title": "Quantum Physics", "description": "Black holes and quantum gravity",
+         "start": 0, "end": 10},
+        {"title": "Space Travel", "description": "Rockets travelling to Mars",
+         "start": 10, "end": 20},
+    ]
+
+    import pytest
+    with pytest.raises(ValueError, match="Could not ground selected angle"):
+        pipeline._fit_montage_candidates(selected, transcript, 20, 20)
