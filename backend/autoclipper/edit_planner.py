@@ -523,8 +523,8 @@ def duration_mismatch_warning(target_duration, actual_duration,
         f"{actual:.1f}s ({abs(delta):.1f}s {direction}, tolerance "
         f"+/-{target * tolerance_ratio:.1f}s). Complete sentences and the "
         "payoff were preserved over hitting the exact number. Adjust the "
-        "target, pick a richer moment, or enable AI-expanded mode to fill the "
-        "gap with labelled transcript-grounded narration."
+        "target or pick a richer moment. AutoClipper never injects external "
+        "narration or music; the original source audio is preserved."
     )
 
 
