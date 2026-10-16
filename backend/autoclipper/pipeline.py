@@ -1044,26 +1044,9 @@ def run(
                 )
         except (TypeError, ValueError):
             expected_duration = None
-        # Fallback renders produced before the narration card are source-only.
-        # When QA falls back to one of them, it must be verified against the
-        # source-only edit duration — never the narrated total.
-        try:
-            edit_plan = clip.get("edit_plan") or {}
-            if edit_plan.get("source_duration") is not None:
-                source_only_duration = float(edit_plan["source_duration"])
-            else:
-                source_only_duration = (
-                    float(clip.get("end", 0.0)) - float(clip.get("start", 0.0))
-                )
-        except (TypeError, ValueError):
-            source_only_duration = None
-        narrated_file = os.path.basename(
-            (clip.get("ai_narration") or {}).get("file") or ""
-        )
-        expected_audio = (
-            True if is_montage_clip or clip.get("audio_mixed")
-            else bool(video_info.get("has_audio"))
-        )
+        # A stitched montage always has an audio stream (silence is added if
+        # the source has none); individual clips preserve the source audio state.
+        expected_audio = True if is_montage_clip else bool(video_info.get("has_audio"))
         qa_args = {
             "expected_duration": expected_duration,
             "expected_aspect": target_aspect,
@@ -1090,13 +1073,7 @@ def run(
                 fallback_base = os.path.basename(fallback_name)
                 fallback_path = os.path.join(output_dir, fallback_base)
                 fallback_clip = {**clip, "file": fallback_base}
-                # A render that predates the narration card is source-only:
-                # verify it against the source-only edit duration, not the
-                # narrated total the failed final render was measured against.
-                is_source_only_render = bool(narrated_file) and fallback_base != narrated_file
                 fallback_expected = expected_duration
-                if is_source_only_render and source_only_duration is not None:
-                    fallback_expected = source_only_duration
                 fallback_args = {
                     **qa_args,
                     "clip": fallback_clip,
