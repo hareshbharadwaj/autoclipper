@@ -289,7 +289,7 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
         # requested per-shot budget without padding with unrelated material.
         windows = []
         for lo in range(anchor_idx, -1, -1):
-            if segments[lo]["end"] - segments[anchor_idx]["start"] > max_per_shot:
+            if segments[anchor_idx]["end"] - segments[lo]["start"] > max_per_shot:
                 break
             for hi in range(anchor_idx, len(segments)):
                 shot_start = segments[lo]["start"]
@@ -310,7 +310,7 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
                 duration_penalty = abs(duration - desired_per_shot) / desired_per_shot
                 # Peak relevance ensures the requested topic is present; average
                 # relevance favors windows that stay on topic instead of drifting.
-                score = (avg_relevance * 4.0) + (peak_relevance * 0.5) - duration_penalty
+                score = (avg_relevance * 4.0) + (peak_relevance * 0.5) - (duration_penalty * 2.0)
                 windows.append((score, duration, shot_start, shot_end, lo, hi))
 
         if not windows:
