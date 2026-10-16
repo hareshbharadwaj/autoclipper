@@ -37,7 +37,6 @@ from autoclipper.trending import get_trending_ideas
 from autoclipper.trending_youtube import fetch_trending, enrich_trending, CATEGORY_MAP
 from autoclipper.subtitles import build_ass, burn_ass, cues_to_srt
 from autoclipper.hooks import add_hook_to_video
-from autoclipper import voiceover as voiceover_mod
 from autoclipper.youtube_uploader import (
     get_auth_url,
     exchange_code,
