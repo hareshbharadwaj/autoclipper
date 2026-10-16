@@ -93,9 +93,9 @@ def test_montage_keeps_user_selected_moments_with_identical_text(tmp_path, monke
         "duration": 68,
         "language": "English",
         "segments": [
-            {"start": 0, "end": 17, "text": "First complete thought."},
+            {"start": 0, "end": 17, "text": "Same hook is the first complete thought."},
             {"start": 17, "end": 34, "text": "Second complete thought."},
-            {"start": 34, "end": 51, "text": "Third complete thought."},
+            {"start": 34, "end": 51, "text": "Same hook is the third complete thought."},
             {"start": 51, "end": 68, "text": "Fourth complete thought."},
         ],
         "words": [],
