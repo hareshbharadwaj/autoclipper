@@ -99,7 +99,7 @@ def test_pipeline_reports_shortfall_instead_of_silently_dropping_clips(tmp_path,
     assert clip["editorial_qa"]["status"] in {"pass", "warning", "fail"}
     joined = " ".join(result["processing_warnings"])
     assert "60s" in joined  # the requested target is named
-    assert "source-only" in joined.lower() or "never adds generated narration" in joined.lower()
+    assert "keeps source audio" in joined.lower() or "never generates narration" in joined.lower()
     # The rendered-vs-target gap is reported as well.
     assert any("requested 60s" in warning.lower() for warning in result["processing_warnings"])
 
