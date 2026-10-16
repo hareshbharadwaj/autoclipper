@@ -12,6 +12,7 @@ from .analyze import (
 from .clip import cut_all
 from .edit_planner import (
     build_edit_plan,
+    duration_mismatch_warning,
     normalize_generation_mode,
 )
 from .editorial_qa import editorial_summary, review_edit_plan
