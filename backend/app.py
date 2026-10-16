@@ -1300,122 +1300,24 @@ async def hook_preview(req: HookPreviewRequest):
                         filename=preview_name)
 
 
-# --- Voice-over (Kokoro TTS locally + Gemini TTS fallback) --------------
-class VoiceOverRequest(BaseModel):
-    job_id: Optional[str] = None     # for generated clips
-    name: Optional[str] = None       # for library clips
-    filename: str
-    text: str
-    engine: str = "auto"             # auto | kokoro | gemini
-    voice: str = None
-    mode: str = "overlay"            # overlay (mix) | replace (dub)
-
-
-@app.post("/api/voiceover")
-async def voiceover(req: VoiceOverRequest, current: User = Depends(get_current_user)):
-    """Generate a voice-over for a clip and burn it into a new mp4.
-
-    engine='auto' picks Kokoro for English-ish text and Gemini for Indonesian
-    (Gemini needs the user's stored GEMINI_API_KEY).
-    """
-    if not req.text or not req.text.strip():
-        raise HTTPException(status_code=400, detail="Voice-over text is required")
-    if req.mode not in ("overlay", "replace"):
-        raise HTTPException(status_code=400, detail="mode must be 'overlay' or 'replace'")
-
-    # Resolve the source video.
-    if req.name:
-        output_dir = os.path.join(config.OUTPUT_ROOT, "library", req.name)
-    else:
-        if not req.job_id:
-            raise HTTPException(status_code=400, detail="job_id or name required")
-        output_dir = os.path.join(config.OUTPUT_ROOT, req.job_id)
-    video = os.path.join(output_dir, req.filename)
-    if not os.path.isfile(video):
-        raise HTTPException(status_code=404, detail="Clip not found")
-
-    base = os.path.splitext(req.filename)[0]
-    wav_name = f"{base}_vo.wav"
-    wav_path = os.path.join(output_dir, wav_name)
-    out_name = f"{base}_vo.mp4"
-    out_path = os.path.join(output_dir, out_name)
-
-    # Gemini key (for fallback / Indonesian) comes from the authenticated user.
-    from autoclipper.db import decrypt_value
-
-    gemini_key = decrypt_value(current.gemini_key) or config.GEMINI_API_KEY
-
-    try:
-        voiceover_mod.generate_voiceover(
-            req.text, wav_path, engine=req.engine, voice=req.voice, gemini_key=gemini_key
-        )
-        voiceover_mod.mix_voiceover(video, wav_path, out_path, mode=req.mode)
-    except Exception as e:  # noqa: BLE001
-        detail = f"Voice-over failed: {e}"
-        logger.warning(detail)
-        raise HTTPException(status_code=500, detail=detail)
-
-    return {"filename": out_name, "wav": wav_name}
-
-
-@app.post("/api/voiceover/preview")
-async def voiceover_preview(req: VoiceOverRequest, current: User = Depends(get_current_user)):
-    """Generate only the voice-over WAV (no video mix) for a quick listen."""
-    if not req.text or not req.text.strip():
-        raise HTTPException(status_code=400, detail="Voice-over text is required")
-
-    if req.name:
-        output_dir = os.path.join(config.OUTPUT_ROOT, "library", req.name)
-    else:
-        if not req.job_id:
-            raise HTTPException(status_code=400, detail="job_id or name required")
-        output_dir = os.path.join(config.OUTPUT_ROOT, req.job_id)
-    if not os.path.isfile(os.path.join(output_dir, req.filename)):
-        raise HTTPException(status_code=404, detail="Clip not found")
-
-    preview_name = f"vo_preview_{os.path.splitext(req.filename)[0]}.wav"
-    preview_path = os.path.join(output_dir, preview_name)
-    from autoclipper.db import decrypt_value
-
-    gemini_key = decrypt_value(current.gemini_key) or config.GEMINI_API_KEY
-    try:
-        voiceover_mod.generate_voiceover(
-            req.text, preview_path, engine=req.engine, voice=req.voice, gemini_key=gemini_key
-        )
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Preview failed: {e}")
-    return FileResponse(preview_path, media_type="audio/wav", filename=preview_name)
-
-
-# --- Enhance (Hook + Voice-Over in one pass) ------------------------------
+# --- Enhance (hook overlay only; source audio is preserved) ------------------
 
 class EnhanceRequest(BaseModel):
-    name: Optional[str] = None        # library folder name
-    job_id: Optional[str] = None     # or a processing job id
-    filename: str                     # clip file inside the folder/job
-    # Hook overlay (optional)
+    name: Optional[str] = None
+    job_id: Optional[str] = None
+    filename: str
     hook_text: str = ""
-    hook_position: str = "top"       # top | center | bottom
-    hook_size: str = "M"             # S | M | L (maps to font_scale)
-    hook_style: str = "classic"      # classic | dark | yellow | red | outline | outline_yellow
-    hook_hold: float = 5.0           # seconds the hook stays (0/None = whole clip)
-    # Voice-over (optional)
-    vo_text: str = ""
-    vo_engine: str = "kokoro"        # kokoro | gemini | auto
-    vo_voice: str = ""
-    vo_mode: str = "overlay"         # overlay | replace
-    vo_extend: bool = True           # if hook+vo: prepend intro (hook+vo) then play clip
+    hook_position: str = "top"
+    hook_size: str = "M"
+    hook_style: str = "classic"
+    hook_hold: float = 5.0
 
 
 @app.post("/api/enhance")
 async def enhance(req: EnhanceRequest, current: User = Depends(get_current_user)):
-    """Burn a viral hook AND/OR a voice-over onto a clip in a single pass.
-
-    Either `hook_text` or `vo_text` (or both) may be provided. The hook is
-    burned first, then the voice-over (if any) is mixed into the result.
-    """
-    if not req.hook_text.strip() and not req.vo_text.strip():
-        raise HTTPException(status_code=400, detail="Provide hook_text or vo_text (or both).")
+    """Burn a text hook onto a clip without generating or mixing audio."""
+    if not req.hook_text or not req.hook_text.strip():
+        raise HTTPException(status_code=400, detail="Hook text is required")
 
     if req.name:
         output_dir = os.path.join(config.OUTPUT_ROOT, "library", req.name)
@@ -1427,127 +1329,42 @@ async def enhance(req: EnhanceRequest, current: User = Depends(get_current_user)
     if not os.path.isfile(video):
         raise HTTPException(status_code=404, detail="Clip not found")
 
-    from autoclipper import hooks as _hooks
-    from autoclipper.db import decrypt_value
-
-    gemini_key = decrypt_value(current.gemini_key) or config.GEMINI_API_KEY
     base = os.path.splitext(req.filename)[0]
-    step_path = video
-
-    orig_entry = None
+    out_name = f"hook_{base}.mp4"
+    out_path = os.path.join(output_dir, out_name)
     try:
-        both = bool(req.hook_text.strip()) and bool(req.vo_text.strip())
-        created_paths = []
+        size_scale = {"S": 0.8, "M": 1.0, "L": 1.25}.get(req.hook_size, 1.0)
+        duration = req.hook_hold if req.hook_hold and req.hook_hold > 0 else None
+        add_hook_to_video(
+            video, req.hook_text, out_path,
+            position=req.hook_position, font_scale=size_scale,
+            duration=duration, style=req.hook_style,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Enhance failed: {type(exc).__name__}")
 
-        if both and req.vo_extend:
-            font_scale = {"S": 0.8, "M": 1.0, "L": 1.25}.get(req.hook_size, 1.0)
-            vo_wav = os.path.join(output_dir, f"vo_{base}.wav")
-            voiceover_mod.generate_voiceover(
-                req.vo_text, vo_wav, engine=req.vo_engine,
-                voice=req.vo_voice or None, gemini_key=gemini_key,
-            )
-            created_paths.append(vo_wav)
-            vo_dur = voiceover_mod.wav_duration(vo_wav)
-            intro_dur = max(req.hook_hold if req.hook_hold and req.hook_hold > 0 else 0.0, vo_dur)
-            intro_path = os.path.join(output_dir, f"intro_{base}.mp4")
-            voiceover_mod.build_intro(
-                video, vo_wav, intro_path,
-                hook_text=req.hook_text, hook_position=req.hook_position,
-                font_scale=font_scale, style=req.hook_style, duration=intro_dur,
-            )
-            created_paths.append(intro_path)
-            final_out = os.path.join(output_dir, f"enhanced_{base}.mp4")
-            voiceover_mod.concat_videos(intro_path, video, final_out)
-            step_path = final_out
-        else:
-            hook_out = None
-            vo_wav = None
-            final_out = None
-
-            # 1) Hook overlay (if requested)
-            if req.hook_text.strip():
-                hook_out = os.path.join(output_dir, f"hook_{base}.mp4")
-                font_scale = {"S": 0.8, "M": 1.0, "L": 1.25}.get(req.hook_size, 1.0)
-                duration = req.hook_hold if req.hook_hold and req.hook_hold > 0 else None
-                _hooks.add_hook_to_video(
-                    step_path, req.hook_text, hook_out,
-                    position=req.hook_position, font_scale=font_scale,
-                    duration=duration, style=req.hook_style,
-                )
-                step_path = hook_out
-
-            # 2) Voice-over (if requested)
-            if req.vo_text.strip():
-                vo_wav = os.path.join(output_dir, f"vo_{base}.wav")
-                voiceover_mod.generate_voiceover(
-                    req.vo_text, vo_wav, engine=req.vo_engine,
-                    voice=req.vo_voice or None, gemini_key=gemini_key,
-                )
-                created_paths.append(vo_wav)
-                final_out = os.path.join(output_dir, f"enhanced_{base}.mp4")
-                voiceover_mod.mix_voiceover(step_path, vo_wav, final_out, mode=req.vo_mode)
-                if hook_out is not None:
-                    created_paths.append(hook_out)  # hook was intermediate
-                step_path = final_out
-
-        # Remove all intermediate files (vo_wav, intro, hook if not final)
-        for p in created_paths:
-            if os.path.isfile(p) and p != step_path:
-                os.remove(p)
-
-        # Update library manifest so the enhanced clip appears with its metadata
-        if req.name:
-            manifest_path = os.path.join(output_dir, "manifest.json")
-            if os.path.isfile(manifest_path):
-                from autoclipper.utils import write_json
-                import json as _json
-                with open(manifest_path, "r", encoding="utf-8") as _mf:
-                    manifest = _json.load(_mf)
-                # Find the matching original clip entry
-                orig_entry = None
-                for c in manifest.get("clips", []):
-                    if c.get("file") == req.filename:
-                        orig_entry = c
+    if req.name:
+        manifest_path = os.path.join(output_dir, "manifest.json")
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as handle:
+                    manifest = json.load(handle)
+                for entry in manifest.get("clips", []):
+                    if entry.get("file") == req.filename:
+                        enhanced_entry = dict(entry)
+                        enhanced_entry.update({
+                            "file": out_name,
+                            "enhanced": True,
+                            "hook": req.hook_text,
+                        })
+                        manifest["clips"].append(enhanced_entry)
+                        from autoclipper.utils import write_json
+                        write_json(manifest_path, manifest)
                         break
-                if orig_entry is None:
-                    base = os.path.splitext(req.filename)[0]
-                    idx = int("".join(filter(str.isdigit, base)) or "0")
-                    for c in manifest.get("clips", []):
-                        if c.get("index") == idx:
-                            orig_entry = c
-                            break
-                if orig_entry is not None:
-                    # Build enhanced entry from original metadata
-                    enhanced_entry = dict(orig_entry)
-                    enhanced_entry["file"] = os.path.basename(step_path)
-                    enhanced_entry["enhanced"] = True
-                    # Ensure index is set
-                    if "index" not in enhanced_entry:
-                        enhanced_entry["index"] = len(manifest.get("clips", [])) + 1
-                    # Update or append
-                    found = False
-                    for i, c in enumerate(manifest.get("clips", [])):
-                        if c.get("file") == enhanced_entry["file"]:
-                            manifest["clips"][i] = enhanced_entry
-                            found = True
-                            break
-                    if not found:
-                        manifest.setdefault("clips", []).append(enhanced_entry)
-                    write_json(manifest_path, manifest)
-        # Return metadata alongside the filename
-        result_meta = {"filename": os.path.basename(step_path)}
-        if req.name and orig_entry is not None:
-            result_meta.update({
-                "title": orig_entry.get("title", ""),
-                "description": orig_entry.get("description", ""),
-                "hook": req.hook_text or orig_entry.get("hook", ""),
-            })
-    except HTTPException:
-        raise
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Enhance failed: {e}")
+            except (OSError, json.JSONDecodeError):
+                logger.warning("Could not update library manifest for enhanced clip %s", out_name)
 
-    return result_meta
+    return {"filename": out_name, "hook": req.hook_text}
 
 
 # --- Chat-split (two-person interview/podcast) --------------------------------
