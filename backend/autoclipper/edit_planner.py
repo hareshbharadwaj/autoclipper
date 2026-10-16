@@ -865,8 +865,8 @@ def build_edit_plan(transcript, candidate, *, target_duration=None,
                         if narration else
                         ". A source-only edit keeps the complete story instead of "
                         "padding with unrelated footage or cutting sentences. "
-                        "Enable AI-expanded mode for labelled supplemental "
-                        "narration, or lower the target duration."
+                        "AutoClipper keeps source audio and never generates narration; "
+                        "lower the target duration to fit the available source story."
                     )
                 )
                 warnings.append(duration_explanation)
