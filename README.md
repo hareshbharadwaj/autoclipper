@@ -391,15 +391,5 @@ Released under the [MIT License](LICENSE).
 
 ## Multi-shot Montage (Plan B)
 
-In the analysis-first studio, enable **Build a multi-shot montage** and select 2–3 distinct angle cards. The backend aligns each shot to transcript segment boundaries, avoids overlapping source moments, reframes and burns captions on each shot, then stitches the shots with short FFmpeg video fades and audio crossfades. The requested total duration is distributed across the shots; sentence boundaries take priority, and a warning is returned if the final duration differs from the target by more than three seconds. A montage over the hard 120-second ceiling is rejected rather than silently trimmed mid-sentence.
-
-## Optional Voiceover + Background Music (Plan C)
-
-- Enter an optional narration script (up to 5,000 characters) and choose Automatic, Kokoro, Edge TTS, or Gemini TTS.
-- Optionally upload an MP3, WAV, M4A, AAC, OGG, or FLAC music bed.
-- Music level is adjustable. When narration and music are both enabled, FFmpeg's sidechain compressor ducks music under narration while retaining the source audio at a reduced level.
-- If the input clip has no audio, the mixer creates a silent base track so voiceover/music can still be added.
-- Audio processing failures are reported in `processing_warnings`; the original rendered clip is preserved rather than reported as successfully mixed.
-
-The audio options apply to the combined montage when montage mode is enabled. For multiple separate clips in classic mode, audio is applied to the first clip only and a warning explains that limitation.
+In the analysis-first studio, enable **Build a multi-shot montage** and select 2–3 distinct angle cards. Each selected angle is grounded against the transcript instead of trusting its estimated timestamp alone. The backend chooses complete, non-overlapping transcript passages within a shared per-shot budget, runs standalone-story planning and editorial checks, and stitches the individual clips with short video/audio crossfades. The montage uses only the source video's audio. If a selected angle cannot be grounded in the transcript, or the stitched output exceeds the requested total-duration tolerance, the montage is rejected with a warning rather than silently delivering unrelated or overlong content. The global hard ceiling remains 120 seconds.
 
