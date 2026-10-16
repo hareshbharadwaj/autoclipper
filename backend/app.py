@@ -223,6 +223,45 @@ def _run_pipeline_sync(job_id: str, source: str, output_dir: str, opts: dict, on
     )
 
 
+def _job_status_for(result: dict) -> tuple[str, str]:
+    """Map a pipeline result to the job status the UI reports.
+
+    Producing files is not success. A job whose *request* was not satisfied —
+    a missing individual clip, a clip far shorter than the requested duration,
+    duplicate footage, or a failed montage — is reported as
+    ``completed_with_warnings`` so the shortfall cannot masquerade as a clean
+    pass.
+    """
+    compliance = result.get("request_compliance") or {}
+    qa_state = (result.get("quality_assurance") or {}).get("status", "unknown")
+    if "satisfied" in compliance:
+        satisfied = bool(compliance.get("satisfied")) and qa_state in ("pass", "not_run")
+    else:
+        # Older/stubbed producers do not emit compliance: trust QA alone.
+        satisfied = qa_state in ("pass", "not_run")
+    if satisfied:
+        return "completed", "Clip generation, QA, and metadata saving are complete."
+    return "completed_with_warnings", _compliance_message(compliance, qa_state)
+
+
+def _compliance_message(compliance: dict, qa_state: str) -> str:
+    """One sentence explaining why a finished job did not fully satisfy the request."""
+    failures = list(compliance.get("failures") or [])
+    if failures:
+        return "Finished, but the request was not fully met: " + " ".join(failures[:3])
+    if qa_state == "shortfall":
+        return (
+            "Finished, but one or more clips are shorter than the requested duration. "
+            "Review the per-clip duration details before publishing."
+        )
+    if qa_state in ("fail", "warning"):
+        return (
+            f"Finished, but post-render QA reported '{qa_state}'. "
+            "Review the per-clip QA details before publishing."
+        )
+    return "Finished with warnings; review the job details."
+
+
 async def _run_job(job_id: str, source: str, opts: dict):
     job = jobs[job_id]
     output_dir = os.path.join(config.OUTPUT_ROOT, job_id)
@@ -269,12 +308,22 @@ async def _run_job(job_id: str, source: str, opts: dict):
                 on_progress=on_progress_update,
             )
         job["result"] = result
-        job["status"] = "completed"
+        # A job that produced files is not automatically a success: the status
+        # must reflect whether the request was actually satisfied. Delivery
+        # that misses the requested clip count or clip duration is reported as
+        # a partial result instead of a clean "completed".
+        compliance = result.get("request_compliance") or {}
+        qa_state = (result.get("quality_assurance") or {}).get("status", "unknown")
+        job["status"], message = _job_status_for(result)
         job["progress"] = {
-            "stage": "completed",
-            "message": "Clip generation, QA, and metadata saving are complete.",
+            "stage": job["status"],
+            "message": message,
             "updated_at": time.time(),
-            "qa_status": (result.get("quality_assurance") or {}).get("status", "unknown"),
+            "qa_status": qa_state,
+            "request_satisfied": bool(compliance.get("satisfied")),
+            "requested_individual_clips": compliance.get("requested_individual_clips"),
+            "delivered_individual_clips": compliance.get("delivered_individual_clips"),
+            "duration_shortfall_clips": compliance.get("duration_shortfall_clips"),
         }
     except Exception as e:  # noqa: BLE001
         job["status"] = "failed"
@@ -410,6 +459,7 @@ async def process(
     aspect_ratio: str = Form(None),
     add_hook: bool = Form(False),
     montage: bool = Form(False),
+    montage_target_duration: float = Form(None),
     content_type: str = Form("general"),
     generation_mode: str = Form("source_only"),
     current: User = Depends(get_current_user),
@@ -519,6 +569,7 @@ async def process(
         "aspect_ratio": aspect_ratio or None,
         "add_hook": bool(add_hook),
         "montage": bool(montage),
+        "montage_target_duration": montage_target_duration,
         "content_type": content_type or "general",
     }
     if (

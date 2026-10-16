@@ -126,6 +126,7 @@ export default function App() {
     if (payload.selectedClips) opts.selected_clips = JSON.stringify(payload.selectedClips)
     if (payload.analysisId) opts.analysis_id = payload.analysisId
     if (payload.montage) opts.montage = true
+    if (payload.montageTargetDuration) opts.montage_target_duration = payload.montageTargetDuration
     if (payload.voiceoverText) opts.voiceover_text = payload.voiceoverText
     if (payload.voiceoverEngine) opts.voiceover_engine = payload.voiceoverEngine
     if (payload.voiceoverVoice) opts.voiceover_voice = payload.voiceoverVoice

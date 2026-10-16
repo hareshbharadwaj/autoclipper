@@ -6,6 +6,7 @@ import {
 import GamingLayoutModal from './GamingLayoutModal.jsx'
 import { uploadFile, prepareGaming, getStatus, analyzeVideo, getAnalysis } from '../api.js'
 import { normalizeAnalysisClipCount } from '../utils/clipCount.js'
+import { buildDirectedClipRequest } from '../utils/directedRequest.js'
 
 const CONTENT_TYPES = [
   { id: 'general', label: 'General / Other' },
@@ -51,6 +52,7 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
   const [addHook, setAddHook] = useState(false)
   const [selectedAngle, setSelectedAngle] = useState(null)
   const [montageMode, setMontageMode] = useState(false)
+  const [montageTargetDuration, setMontageTargetDuration] = useState(60)
   const [selectedAngles, setSelectedAngles] = useState([])
 
   // Analysis state
@@ -213,25 +215,23 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
         setAnalysisError('Choose 2 or 3 distinct angles to build a montage.')
         return
       }
-      const selectedClips = montageMode
-        ? selectedAngles.map((index) => {
-            const angle = angles[index]
-            return { ...angle, start: angle.start_hint, end: angle.end_hint }
-          })
-        : undefined
-      const selectedClip = !montageMode && selectedAngle != null
-        ? { ...angles[selectedAngle], start: angles[selectedAngle]?.start_hint, end: angles[selectedAngle]?.end_hint }
-        : undefined
+      const directed = buildDirectedClipRequest({
+        montageMode,
+        // The requested clip count always means independent individual clips.
+        // A montage is an additional output and never consumes one of them.
+        individualClipCount: analysisClipCount,
+        montageTargetSeconds: montageTargetDuration,
+        selectedAngles,
+        selectedAngle,
+        angles,
+      })
       onSubmit({
         source: analysis.source,
         analysisId: analysis.analysis_id,
-        selectedClip,
-        clipCount: montageMode ? selectedClips.length : analysisClipCount,
+        ...directed,
         targetDuration: Math.min(120, Math.max(10, Number(targetDuration) || 40)),
         generationMode: 'source_only',
         customPrompt: customPrompt.trim() || undefined,
-        selectedClips,
-        montage: montageMode || undefined,
         aspectRatio,
         addHook: addHook || undefined,
         splitScreen: splitScreen || undefined,
@@ -577,14 +577,13 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
                 </label>
                 <p className="mt-1 text-[11px] text-zinc-500">
                   {montageMode
-                    ? 'Montage mode uses the 2–3 selected moments and also creates a separate stitched montage.'
+                    ? 'These are separate individual clips. The montage below is created in addition to them and never replaces one.'
                     : 'Generate this many separate clips; the selected angle is included when its timestamps are valid.'}
                 </p>
               </div>
               <select
                 id="analysisClipCount"
-                value={montageMode ? Math.max(2, selectedAngles.length) : analysisClipCount}
-                disabled={montageMode}
+                value={analysisClipCount}
                 onChange={(e) => setAnalysisClipCount(normalizeAnalysisClipCount(e.target.value))}
                 className="w-full sm:w-28 rounded-lg bg-background border border-border px-3 py-2 text-sm text-white disabled:opacity-50"
               >
@@ -644,6 +643,23 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
                       {montageMode && (
                         <span className="block text-[11px] text-cyan-300 mt-1">
                           {selectedAngles.length}/3 angles selected (choose at least 2)
+                        </span>
+                      )}
+                      {montageMode && (
+                        <span className="mt-2 flex items-center gap-2 text-[11px] text-zinc-400">
+                          Montage target
+                          <input
+                            type="number"
+                            min={10}
+                            max={180}
+                            step={5}
+                            value={montageTargetDuration}
+                            onChange={(e) => setMontageTargetDuration(e.target.value)}
+                            onClick={(e) => e.preventDefault()}
+                            className="w-20 rounded-md bg-background border border-border px-2 py-1 text-xs text-white"
+                            aria-label="Montage target duration in seconds"
+                          />
+                          seconds (reported against the real stitched length)
                         </span>
                       )}
                     </span>
