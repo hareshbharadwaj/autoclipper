@@ -782,7 +782,7 @@ def build_edit_plan(transcript, candidate, *, target_duration=None,
 
     # 4. Relevance keywords for contextual expansion / narration selection.
     core_texts = [units[i]["text"] for i in range(lo, hi + 1)]
-    keywords = _keyword_set(topic_text, candidate, core_texts)
+    keywords = _keyword_set(topic_text, candidate, [] if candidate.get("_montage_selected") else core_texts)
 
     core_duration = units[hi]["end"] - units[lo]["start"]
 
