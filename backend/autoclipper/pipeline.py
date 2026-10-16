@@ -501,6 +501,10 @@ def run(
     # Clamp oversized requests and validate count before any ingest/model work.
     target_duration = _normalize_target_duration(target_duration)
     generation_mode = normalize_generation_mode(generation_mode)
+    # The voiceover/narration feature is removed: stale clients requesting the
+    # former ai_expanded mode still receive source-only edits and original audio.
+    if generation_mode == "ai_expanded":
+        generation_mode = "source_only"
     clip_count = _normalize_clip_count(clip_count)
     if montage:
         if not selected_clips or not 2 <= len(selected_clips) <= 3:
