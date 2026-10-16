@@ -16,6 +16,8 @@ from .edit_planner import (
     duration_mismatch_warning,
     finalize_narration_timing,
     normalize_generation_mode,
+    content_words,
+    relevance_score,
 )
 from .editorial_qa import editorial_summary, review_edit_plan
 from .ingest import ingest
@@ -170,41 +172,74 @@ def _montage_duration_tolerance(target_duration):
 
 def _fit_montage_candidates(candidates, transcript, target_duration, total_duration,
                             crossfade_seconds=0.25):
-    """Fit selected angles to complete transcript segments near the target length.
+    """Choose topic-grounded, sentence-aligned shots within the montage time budget.
 
-    Segment boundaries come from Whisper timestamps. The per-shot target reserves
-    time for the montage crossfades. When no boundary is close enough, the closest
-    complete segment is retained (never duplicated or cut mid-sentence); the caller
-    reports the actual stitched duration and its deviation from the target.
+    Analysis timestamps are hints, not proof that the hinted passage matches the
+    angle. Prefer transcript passages whose words support the selected angle, and
+    treat the montage target as a shared budget across all selected shots.
     """
+    from .edit_planner import content_words, relevance_score
+
     segments = []
     for segment in transcript.get("segments", []) or []:
         try:
             start, end = float(segment["start"]), float(segment["end"])
         except (KeyError, TypeError, ValueError):
             continue
-        if end <= start or not (segment.get("text") or "").strip():
+        text = (segment.get("text") or "").strip()
+        if end <= start or not text:
             continue
         if total_duration:
             start = max(0.0, min(start, float(total_duration)))
             end = max(0.0, min(end, float(total_duration)))
         if end > start:
-            segments.append({"start": start, "end": end})
+            segments.append({"start": start, "end": end, "text": text})
     segments.sort(key=lambda item: (item["start"], item["end"]))
     if not segments:
-        raise ValueError("Montage needs word/sentence timestamps from the transcript.")
+        raise ValueError("Montage needs timestamped transcript segments.")
     if not candidates or not 2 <= len(candidates) <= 3:
         raise ValueError("Montage mode requires 2 or 3 selected video moments.")
 
-    target = min(float(config.HARD_MAX_CLIP_SECONDS), max(3.0, float(target_duration)))
+    target = min(float(config.HARD_MAX_CLIP_SECONDS), max(5.0, float(target_duration)))
     shot_count = len(candidates)
     fade = max(0.0, float(crossfade_seconds))
-    # The output duration is sum(segment durations) - fade * (shots - 1).
     desired_source_total = min(
         float(config.HARD_MAX_CLIP_SECONDS), target + fade * (shot_count - 1)
     )
     desired_per_shot = max(3.0, desired_source_total / shot_count)
-    hard_per_shot = (float(config.HARD_MAX_CLIP_SECONDS) + fade * (shot_count - 1)) / shot_count
+    # A shot may vary from the ideal only as much as sentence boundaries require.
+    # Crucially, the original angle hint is not a minimum-duration requirement.
+    max_per_shot = min(
+        float(config.HARD_MAX_CLIP_SECONDS),
+        desired_per_shot + max(3.0, desired_per_shot * 0.25),
+    )
+
+    def _expanded_terms(text):
+        terms = set(content_words(text))
+        # Small deterministic morphology expansion handles common transcript
+        # variants (rolling/roll, vegetables/vegetable, chopping/chop) without
+        # relying on another model call.
+        for term in list(terms):
+            if term.endswith("ing") and len(term) > 5:
+                stem = term[:-3]
+                terms.add(stem)
+                if len(stem) > 2 and stem[-1] == stem[-2]:
+                    terms.add(stem[:-1])
+            if term.endswith("ies") and len(term) > 4:
+                terms.add(term[:-3] + "y")
+            if term.endswith("s") and not term.endswith("ss") and len(term) > 4:
+                terms.add(term[:-1])
+        synonym_groups = (
+            {"veggie", "veggies", "vegetable", "vegetables"},
+            {"roll", "rolling", "rolled", "rolls"},
+            {"knife", "knives"},
+            {"chop", "chopping", "chopped", "chops"},
+            {"slice", "slicing", "sliced", "slices"},
+        )
+        for group in synonym_groups:
+            if terms & group:
+                terms.update(group)
+        return terms
 
     chosen = []
     for angle in candidates:
@@ -212,81 +247,79 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
             hint_start = float(angle.get("start", angle.get("start_hint", 0)))
             hint_end = float(angle.get("end", angle.get("end_hint", 0)))
         except (TypeError, ValueError):
-            continue
-        if hint_end <= hint_start:
-            continue
+            hint_start, hint_end = 0.0, 0.0
         if total_duration:
             hint_start = max(0.0, min(hint_start, float(total_duration)))
             hint_end = max(0.0, min(hint_end, float(total_duration)))
-        if hint_end <= hint_start:
-            continue
 
-        # If hint_start falls inside an already chosen moment, shift it past it
-        for item in chosen:
-            if item["start"] <= hint_start < item["end"]:
-                hint_start = item["end"]
-
-        # Start on the complete transcript segment containing the angle's opening
-        # hint; otherwise use the nearest boundary. This includes the opening setup.
-        containing = [
-            i for i, segment in enumerate(segments)
-            if segment["start"] <= hint_start < segment["end"]
-        ]
-        start_idx = containing[0] if containing else min(
-            range(len(segments)), key=lambda i: abs(segments[i]["start"] - hint_start)
+        angle_text = " ".join(
+            str(angle.get(key) or "")
+            for key in ("title", "hook", "description", "custom_prompt", "reason", "story_arc")
         )
-        shot_start = segments[start_idx]["start"]
-
-        # Ensure shot_start does not start inside an existing chosen moment
-        while any(item["start"] <= shot_start < item["end"] for item in chosen) and start_idx + 1 < len(segments):
-            start_idx += 1
-            shot_start = segments[start_idx]["start"]
-
-        # If the hinted duration fits within hard_per_shot, honor the hinted end as a minimum.
-        # Otherwise, the angle is longer than the montage shot limit; fit to desired_per_shot within hard_per_shot.
-        minimum_end_idx = start_idx
-        if (hint_end - shot_start) <= hard_per_shot:
-            minimum_end_idx = next(
-                (i for i in range(start_idx, len(segments)) if segments[i]["end"] >= hint_end),
-                len(segments) - 1,
+        keywords = _expanded_terms(angle_text)
+        if not keywords:
+            raise ValueError(
+                f"Selected montage angle '{angle.get('title') or 'Untitled'}' has no usable topic terms."
             )
+        segment_scores = [relevance_score(seg["text"], keywords) for seg in segments]
 
-        possible_ends = []
-        for end_idx in range(minimum_end_idx, len(segments)):
-            shot_end = segments[end_idx]["end"]
-            shot_duration = shot_end - shot_start
-            if shot_duration < 3.0:
-                continue
-            if shot_duration > hard_per_shot:
+        # Select the best transcript-supported anchor across the whole video. The
+        # model timestamp is used only to break ties; it cannot force an unrelated
+        # section into a selected angle.
+        available_indices = [
+            i for i, seg in enumerate(segments)
+            if not any(seg["start"] < item["end"] and seg["end"] > item["start"] for item in chosen)
+        ]
+        matching_indices = [i for i in available_indices if segment_scores[i] > 0]
+        if not matching_indices:
+            raise ValueError(
+                f"Could not ground selected angle '{angle.get('title') or 'Untitled'}' "
+                "in the transcript. Choose a different angle or analyze the source again."
+            )
+        anchor_idx = max(
+            matching_indices,
+            key=lambda i: (
+                segment_scores[i],
+                -abs(segments[i]["start"] - hint_start) if hint_end > hint_start else 0.0,
+            ),
+        )
+
+        # Evaluate contiguous windows containing the topical anchor. Keep complete
+        # transcript segments, avoid already-selected footage, and prefer the
+        # requested per-shot budget without padding with unrelated material.
+        windows = []
+        for lo in range(anchor_idx, -1, -1):
+            if segments[lo]["end"] - segments[anchor_idx]["start"] > max_per_shot:
                 break
-            if any(shot_start < item["end"] and shot_end > item["start"] for item in chosen):
-                continue
-            possible_ends.append((shot_duration, shot_end))
-
-        # Fallback: if no end >= minimum_end_idx was <= hard_per_shot, search from start_idx
-        if not possible_ends:
-            for end_idx in range(start_idx, len(segments)):
-                shot_end = segments[end_idx]["end"]
-                shot_duration = shot_end - shot_start
-                if shot_duration < 3.0:
-                    continue
-                if shot_duration > hard_per_shot:
+            for hi in range(anchor_idx, len(segments)):
+                shot_start = segments[lo]["start"]
+                shot_end = segments[hi]["end"]
+                duration = shot_end - shot_start
+                if duration > max_per_shot:
                     break
-                if any(shot_start < item["end"] and shot_end > item["start"] for item in chosen):
+                if duration < 3.0:
                     continue
-                possible_ends.append((shot_duration, shot_end))
+                if any(
+                    shot_start < item["end"] and shot_end > item["start"]
+                    for item in chosen
+                ):
+                    continue
+                scores = segment_scores[lo:hi + 1]
+                avg_relevance = sum(scores) / max(1, len(scores))
+                peak_relevance = max(scores, default=0.0)
+                duration_penalty = abs(duration - desired_per_shot) / desired_per_shot
+                # Peak relevance ensures the requested topic is present; average
+                # relevance favors windows that stay on topic instead of drifting.
+                score = (avg_relevance * 4.0) + (peak_relevance * 0.5) - duration_penalty
+                windows.append((score, duration, shot_start, shot_end, lo, hi))
 
-        if not possible_ends:
-            fallback_end = min(shot_start + hard_per_shot, float(total_duration or (shot_start + hard_per_shot)))
-            if fallback_end - shot_start >= 3.0 and not any(shot_start < item["end"] and fallback_end > item["start"] for item in chosen):
-                possible_ends.append((fallback_end - shot_start, fallback_end))
-
-        if not possible_ends:
-            continue
-
-        shot_duration, shot_end = min(
-            possible_ends,
-            key=lambda item: (abs(item[0] - desired_per_shot), item[0] > desired_per_shot),
+        if not windows:
+            raise ValueError(
+                f"Could not find a distinct transcript-aligned shot for angle "
+                f"'{angle.get('title') or 'Untitled'}' within its montage time budget."
+            )
+        _, duration, shot_start, shot_end, lo, hi = max(
+            windows, key=lambda w: (w[0], -abs(w[1] - desired_per_shot))
         )
         chosen.append({
             "start": round(shot_start, 2),
@@ -294,34 +327,18 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
             "title": (angle.get("title") or "Montage moment")[:80],
             "description": (angle.get("description") or "")[:220],
             "hook": (angle.get("hook") or "")[:120],
+            "custom_prompt": (angle.get("custom_prompt") or "")[:1200],
             "reason": angle.get("reason") or "Selected from whole-video analysis",
-            "story_arc": "Selected angle; transcript-aligned montage segment",
+            "story_arc": angle.get("story_arc") or "Transcript-grounded selected angle",
+            # Override any angle-level estimate: montage clips share one total budget.
+            "target_duration": round(desired_per_shot, 2),
+            "topic_match_score": round(segment_scores[anchor_idx], 3),
             "_user_selected": True,
         })
 
-    # If fewer than 2 distinct moments were selected, pick non-overlapping fallback segments
-    if len(chosen) < 2 and segments:
-        for seg in segments:
-            s_start, s_end = seg["start"], seg["end"]
-            if s_end - s_start < 3.0:
-                continue
-            if not any(s_start < item["end"] and s_end > item["start"] for item in chosen):
-                chosen.append({
-                    "start": round(s_start, 2),
-                    "end": round(min(s_start + desired_per_shot, s_end), 2),
-                    "title": "Montage moment",
-                    "description": "",
-                    "hook": "",
-                    "reason": "Selected from transcript to fulfill montage moment count",
-                    "story_arc": "Transcript-aligned montage segment",
-                    "_user_selected": False,
-                })
-                if len(chosen) >= 2:
-                    break
-
     chosen.sort(key=lambda item: item["start"])
     if not 2 <= len(chosen) <= 3:
-        raise ValueError("Could not find 2-3 distinct, non-overlapping transcript moments for this montage.")
+        raise ValueError("Could not find 2-3 distinct, topic-grounded montage moments.")
     return chosen
 
 
@@ -681,13 +698,18 @@ def run(
     # edges, expands with relevant context or trims toward the requested
     # duration when the story allows, and reports any mismatch explicitly
     # instead of silently dropping clips or padding with unrelated material.
-    if montage:
-        if effective_min_clip is not None or effective_max_clip is not None or requested_individual_count:
-            clip_candidates = _enforce_clip_constraints(
-                clip_candidates, effective_min_clip, effective_max_clip,
-                len(clip_candidates), video_dur,
-                trim_long=False, pad_short=False,
-            )
+    if montage and clip_candidates:
+        # Montage shots use their own share of the overall target and must pass
+        # the same standalone-story planner as ordinary clips.
+        clip_candidates = _plan_clip_edits(
+            clip_candidates, transcript, video_dur, None,
+            generation_mode, custom_prompt, candidate_warnings,
+        )
+        clip_candidates = _enforce_clip_constraints(
+            clip_candidates, effective_min_clip, effective_max_clip,
+            len(clip_candidates), video_dur,
+            trim_long=False, pad_short=False,
+        )
     elif clip_candidates:
         clip_candidates = _plan_clip_edits(
             clip_candidates, transcript, video_dur, target_duration,
