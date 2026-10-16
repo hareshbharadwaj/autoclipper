@@ -221,3 +221,56 @@ def test_montage_rejects_selected_angle_not_grounded_in_transcript():
     import pytest
     with pytest.raises(ValueError, match="Could not ground selected angle"):
         pipeline._fit_montage_candidates(selected, transcript, 20, 20)
+
+
+
+def test_short_montages_use_word_timestamps_when_whisper_segments_are_too_coarse():
+    """10s/30s montages should not fail just because Whisper segments are 15s long."""
+    import pytest
+
+    cases = [
+        (10, [
+            {"title": "Knife safety", "description": "Keep the blade pointed down."},
+            {"title": "Vegetable cutting", "description": "Use the tunnel method for round vegetables."},
+        ]),
+        (30, [
+            {"title": "Knife safety", "description": "Keep the blade pointed down."},
+            {"title": "Vegetable cutting", "description": "Use the tunnel method for round vegetables."},
+            {"title": "Portrait framing", "description": "Keep the speaker centered in portrait video."},
+        ]),
+    ]
+    source_texts = [
+        "Knife safety starts here. Keep the blade pointed down.",
+        "Vegetable cutting uses a tunnel method. Stop round vegetables rolling away.",
+        "Portrait framing keeps the speaker centered. Portrait video follows motion.",
+    ]
+
+    for target, angles in cases:
+        segments = []
+        words = []
+        for segment_index, text in enumerate(source_texts[:len(angles)]):
+            start = segment_index * 15.0
+            end = start + 15.0
+            segments.append({"start": start, "end": end, "text": text})
+            tokens = text.split()
+            step = 15.0 / len(tokens)
+            for word_index, token in enumerate(tokens):
+                words.append({
+                    "word": token,
+                    "start": start + word_index * step,
+                    "end": start + (word_index + 1) * step,
+                })
+        transcript = {"duration": 15.0 * len(angles), "segments": segments, "words": words}
+        selected = [
+            {**angle, "start": i * 15.0, "end": (i + 1) * 15.0}
+            for i, angle in enumerate(angles)
+        ]
+
+        clips = pipeline._fit_montage_candidates(
+            selected, transcript, target, transcript["duration"]
+        )
+
+        assert len(clips) == len(angles)
+        assert all(clip["end"] - clip["start"] <= target / len(angles) * 1.6
+                   for clip in clips)
+        assert all(clip["topic_match_score"] > 0 for clip in clips)
