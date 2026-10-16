@@ -218,7 +218,7 @@ def test_short_topic_reports_shortfall_in_source_only_mode():
     joined = " ".join(plan["warnings"])
     assert "40s" in joined  # reports the requested target explicitly
     assert "source-only" in joined.lower() or "source only" in joined.lower()
-    assert "AI-expanded" in joined or "ai_expanded" in joined.lower()
+    assert "never generates narration" in joined.lower() or "keeps source audio" in joined.lower()
     # Unrelated neighbours were not used as padding.
     assert all(seg["text"] == "Your friends make you happy." for seg in plan["segments"])
 
@@ -358,7 +358,7 @@ def test_duration_mismatch_warning_is_actionable_and_silent_within_tolerance():
     warning = duration_mismatch_warning(60, 9)
     assert warning is not None
     assert "60" in warning and "9.0" in warning
-    assert "AI-expanded" in warning or "target duration" in warning
+    assert "original source audio" in warning or "target duration" in warning
     assert duration_mismatch_warning(60, 58) is None
     assert duration_mismatch_warning(60, 62) is None
     assert duration_mismatch_warning(None, 9) is None

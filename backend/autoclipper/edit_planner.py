@@ -523,8 +523,8 @@ def duration_mismatch_warning(target_duration, actual_duration,
         f"{actual:.1f}s ({abs(delta):.1f}s {direction}, tolerance "
         f"+/-{target * tolerance_ratio:.1f}s). Complete sentences and the "
         "payoff were preserved over hitting the exact number. Adjust the "
-        "target, pick a richer moment, or enable AI-expanded mode to fill the "
-        "gap with labelled transcript-grounded narration."
+        "target or pick a richer moment. AutoClipper never injects external "
+        "narration or music; the original source audio is preserved."
     )
 
 
@@ -782,7 +782,7 @@ def build_edit_plan(transcript, candidate, *, target_duration=None,
 
     # 4. Relevance keywords for contextual expansion / narration selection.
     core_texts = [units[i]["text"] for i in range(lo, hi + 1)]
-    keywords = _keyword_set(topic_text, candidate, core_texts)
+    keywords = _keyword_set(topic_text, candidate, [] if candidate.get("_montage_selected") else core_texts)
 
     core_duration = units[hi]["end"] - units[lo]["start"]
 
@@ -865,8 +865,8 @@ def build_edit_plan(transcript, candidate, *, target_duration=None,
                         if narration else
                         ". A source-only edit keeps the complete story instead of "
                         "padding with unrelated footage or cutting sentences. "
-                        "Enable AI-expanded mode for labelled supplemental "
-                        "narration, or lower the target duration."
+                        "AutoClipper keeps source audio and never generates narration; "
+                        "lower the target duration to fit the available source story."
                     )
                 )
                 warnings.append(duration_explanation)

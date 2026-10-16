@@ -12,9 +12,7 @@ from .analyze import (
 from .clip import cut_all
 from .edit_planner import (
     build_edit_plan,
-    drop_narration,
     duration_mismatch_warning,
-    finalize_narration_timing,
     normalize_generation_mode,
 )
 from .editorial_qa import editorial_summary, review_edit_plan
@@ -170,41 +168,117 @@ def _montage_duration_tolerance(target_duration):
 
 def _fit_montage_candidates(candidates, transcript, target_duration, total_duration,
                             crossfade_seconds=0.25):
-    """Fit selected angles to complete transcript segments near the target length.
+    """Choose topic-grounded, sentence-aligned shots within the montage time budget.
 
-    Segment boundaries come from Whisper timestamps. The per-shot target reserves
-    time for the montage crossfades. When no boundary is close enough, the closest
-    complete segment is retained (never duplicated or cut mid-sentence); the caller
-    reports the actual stitched duration and its deviation from the target.
+    Analysis timestamps are hints, not proof that the hinted passage matches the
+    angle. Prefer transcript passages whose words support the selected angle, and
+    treat the montage target as a shared budget across all selected shots.
     """
+    from .edit_planner import content_words, relevance_score
+
     segments = []
     for segment in transcript.get("segments", []) or []:
         try:
             start, end = float(segment["start"]), float(segment["end"])
         except (KeyError, TypeError, ValueError):
             continue
-        if end <= start or not (segment.get("text") or "").strip():
+        text = (segment.get("text") or "").strip()
+        if end <= start or not text:
             continue
         if total_duration:
             start = max(0.0, min(start, float(total_duration)))
             end = max(0.0, min(end, float(total_duration)))
         if end > start:
-            segments.append({"start": start, "end": end})
+            segments.append({"start": start, "end": end, "text": text})
     segments.sort(key=lambda item: (item["start"], item["end"]))
     if not segments:
-        raise ValueError("Montage needs word/sentence timestamps from the transcript.")
+        raise ValueError("Montage needs timestamped transcript segments.")
     if not candidates or not 2 <= len(candidates) <= 3:
         raise ValueError("Montage mode requires 2 or 3 selected video moments.")
 
-    target = min(float(config.HARD_MAX_CLIP_SECONDS), max(3.0, float(target_duration)))
+    target = min(float(config.HARD_MAX_CLIP_SECONDS), max(5.0, float(target_duration)))
     shot_count = len(candidates)
     fade = max(0.0, float(crossfade_seconds))
-    # The output duration is sum(segment durations) - fade * (shots - 1).
     desired_source_total = min(
         float(config.HARD_MAX_CLIP_SECONDS), target + fade * (shot_count - 1)
     )
     desired_per_shot = max(3.0, desired_source_total / shot_count)
-    hard_per_shot = (float(config.HARD_MAX_CLIP_SECONDS) + fade * (shot_count - 1)) / shot_count
+    # A shot may vary from the ideal only as much as sentence boundaries require.
+    # Crucially, the original angle hint is not a minimum-duration requirement.
+    max_per_shot = min(
+        float(config.HARD_MAX_CLIP_SECONDS),
+        desired_per_shot + max(3.0, desired_per_shot * 0.25),
+    )
+
+    # Whisper segment timestamps can be much coarser than the requested shot
+    # length (for example, a 15-second segment for a 5-second shot). Use the
+    # word timestamps already returned by Whisper to create short, word-aligned
+    # fallback units for those long segments. Prefer sentence punctuation; only
+    # split inside a sentence when its duration otherwise makes short montages
+    # impossible. This is deterministic and does not invent timestamps.
+    word_items = []
+    for word in transcript.get("words", []) or []:
+        if not isinstance(word, dict):
+            continue
+        try:
+            word_start, word_end = float(word["start"]), float(word["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        word_text = str(word.get("word") or word.get("text") or "").strip()
+        if word_text and word_end > word_start:
+            word_items.append({"start": word_start, "end": word_end, "text": word_text})
+    if word_items:
+        refined = []
+        for segment in segments:
+            duration = segment["end"] - segment["start"]
+            overlapping_words = [
+                word for word in word_items
+                if word["start"] < segment["end"] and word["end"] > segment["start"]
+            ]
+            if duration <= max_per_shot or len(overlapping_words) < 2:
+                refined.append(segment)
+                continue
+            chunk = []
+            chunk_start = None
+            chunk_end = None
+            for word in overlapping_words:
+                if chunk_start is None:
+                    chunk_start = word["start"]
+                chunk.append(word["text"])
+                chunk_end = word["end"]
+                chunk_duration = chunk_end - chunk_start
+                sentence_end = any(word["text"].rstrip().endswith(mark) for mark in (".", "!", "?", "…"))
+                if sentence_end and chunk_duration >= desired_per_shot * 0.70:
+                    refined.append({
+                        "start": chunk_start, "end": chunk_end, "text": " ".join(chunk)
+                    })
+                    chunk, chunk_start, chunk_end = [], None, None
+                elif chunk_duration >= desired_per_shot:
+                    refined.append({
+                        "start": chunk_start, "end": chunk_end, "text": " ".join(chunk)
+                    })
+                    chunk, chunk_start, chunk_end = [], None, None
+            if chunk and chunk_start is not None and chunk_end is not None:
+                refined.append({"start": chunk_start, "end": chunk_end, "text": " ".join(chunk)})
+        if refined:
+            segments = sorted(refined, key=lambda item: (item["start"], item["end"]))
+
+    def _expanded_terms(text):
+        terms = set(content_words(text))
+        # Small deterministic morphology expansion handles common transcript
+        # variants (rolling/roll, vegetables/vegetable, chopping/chop) without
+        # relying on another model call.
+        for term in list(terms):
+            if term.endswith("ing") and len(term) > 5:
+                stem = term[:-3]
+                terms.add(stem)
+                if len(stem) > 2 and stem[-1] == stem[-2]:
+                    terms.add(stem[:-1])
+            if term.endswith("ies") and len(term) > 4:
+                terms.add(term[:-3] + "y")
+            if term.endswith("s") and not term.endswith("ss") and len(term) > 4:
+                terms.add(term[:-1])
+        return terms
 
     chosen = []
     for angle in candidates:
@@ -212,81 +286,86 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
             hint_start = float(angle.get("start", angle.get("start_hint", 0)))
             hint_end = float(angle.get("end", angle.get("end_hint", 0)))
         except (TypeError, ValueError):
-            continue
-        if hint_end <= hint_start:
-            continue
+            hint_start, hint_end = 0.0, 0.0
         if total_duration:
             hint_start = max(0.0, min(hint_start, float(total_duration)))
             hint_end = max(0.0, min(hint_end, float(total_duration)))
-        if hint_end <= hint_start:
-            continue
 
-        # If hint_start falls inside an already chosen moment, shift it past it
-        for item in chosen:
-            if item["start"] <= hint_start < item["end"]:
-                hint_start = item["end"]
-
-        # Start on the complete transcript segment containing the angle's opening
-        # hint; otherwise use the nearest boundary. This includes the opening setup.
-        containing = [
-            i for i, segment in enumerate(segments)
-            if segment["start"] <= hint_start < segment["end"]
-        ]
-        start_idx = containing[0] if containing else min(
-            range(len(segments)), key=lambda i: abs(segments[i]["start"] - hint_start)
+        angle_text = " ".join(
+            str(angle.get(key) or "")
+            for key in ("title", "hook", "description", "custom_prompt", "reason", "story_arc")
         )
-        shot_start = segments[start_idx]["start"]
-
-        # Ensure shot_start does not start inside an existing chosen moment
-        while any(item["start"] <= shot_start < item["end"] for item in chosen) and start_idx + 1 < len(segments):
-            start_idx += 1
-            shot_start = segments[start_idx]["start"]
-
-        # If the hinted duration fits within hard_per_shot, honor the hinted end as a minimum.
-        # Otherwise, the angle is longer than the montage shot limit; fit to desired_per_shot within hard_per_shot.
-        minimum_end_idx = start_idx
-        if (hint_end - shot_start) <= hard_per_shot:
-            minimum_end_idx = next(
-                (i for i in range(start_idx, len(segments)) if segments[i]["end"] >= hint_end),
-                len(segments) - 1,
+        keywords = _expanded_terms(angle_text)
+        if not keywords:
+            raise ValueError(
+                f"Selected montage angle '{angle.get('title') or 'Untitled'}' has no usable topic terms."
             )
+        segment_scores = [relevance_score(seg["text"], keywords) for seg in segments]
 
-        possible_ends = []
-        for end_idx in range(minimum_end_idx, len(segments)):
-            shot_end = segments[end_idx]["end"]
-            shot_duration = shot_end - shot_start
-            if shot_duration < 3.0:
-                continue
-            if shot_duration > hard_per_shot:
+        # Select the best transcript-supported anchor across the whole video. The
+        # model timestamp is used only to break ties; it cannot force an unrelated
+        # section into a selected angle.
+        available_indices = [
+            i for i, seg in enumerate(segments)
+            if not any(seg["start"] < item["end"] and seg["end"] > item["start"] for item in chosen)
+        ]
+        matching_indices = [i for i in available_indices if segment_scores[i] > 0]
+        if not matching_indices:
+            raise ValueError(
+                f"Could not ground selected angle '{angle.get('title') or 'Untitled'}' "
+                "in the transcript. Choose a different angle or analyze the source again."
+            )
+        anchor_idx = max(
+            matching_indices,
+            key=lambda i: (
+                segment_scores[i],
+                -abs(segments[i]["start"] - hint_start) if hint_end > hint_start else 0.0,
+            ),
+        )
+
+        # Evaluate contiguous windows containing the topical anchor. Keep complete
+        # transcript segments, avoid already-selected footage, and prefer the
+        # requested per-shot budget without padding with unrelated material.
+        windows = []
+        for lo in range(anchor_idx, -1, -1):
+            if segments[anchor_idx]["end"] - segments[lo]["start"] > max_per_shot:
                 break
-            if any(shot_start < item["end"] and shot_end > item["start"] for item in chosen):
-                continue
-            possible_ends.append((shot_duration, shot_end))
-
-        # Fallback: if no end >= minimum_end_idx was <= hard_per_shot, search from start_idx
-        if not possible_ends:
-            for end_idx in range(start_idx, len(segments)):
-                shot_end = segments[end_idx]["end"]
-                shot_duration = shot_end - shot_start
-                if shot_duration < 3.0:
-                    continue
-                if shot_duration > hard_per_shot:
+            for hi in range(anchor_idx, len(segments)):
+                shot_start = segments[lo]["start"]
+                shot_end = segments[hi]["end"]
+                duration = shot_end - shot_start
+                if duration > max_per_shot:
                     break
-                if any(shot_start < item["end"] and shot_end > item["start"] for item in chosen):
+                if duration < 3.0:
                     continue
-                possible_ends.append((shot_duration, shot_end))
+                if any(
+                    shot_start < item["end"] and shot_end > item["start"]
+                    for item in chosen
+                ):
+                    continue
+                scores = segment_scores[lo:hi + 1]
+                avg_relevance = sum(scores) / max(1, len(scores))
+                peak_relevance = max(scores, default=0.0)
+                duration_penalty = abs(duration - desired_per_shot) / desired_per_shot
+                # Peak relevance ensures the requested topic is present; average
+                # relevance favors windows that stay on topic instead of drifting.
+                score = (avg_relevance * 4.0) + (peak_relevance * 0.5) - (duration_penalty * 4.0)
+                windows.append((score, duration, shot_start, shot_end, lo, hi))
 
-        if not possible_ends:
-            fallback_end = min(shot_start + hard_per_shot, float(total_duration or (shot_start + hard_per_shot)))
-            if fallback_end - shot_start >= 3.0 and not any(shot_start < item["end"] and fallback_end > item["start"] for item in chosen):
-                possible_ends.append((fallback_end - shot_start, fallback_end))
-
-        if not possible_ends:
-            continue
-
-        shot_duration, shot_end = min(
-            possible_ends,
-            key=lambda item: (abs(item[0] - desired_per_shot), item[0] > desired_per_shot),
+        if not windows:
+            raise ValueError(
+                f"Could not find a distinct transcript-aligned shot for angle "
+                f"'{angle.get('title') or 'Untitled'}' within its montage time budget."
+            )
+        # Do not choose a tiny high-keyword snippet when a coherent passage can
+        # fill most of the shot budget. If the transcript truly has no longer
+        # complete window, retain the best available shorter passage and let
+        # editorial QA explain the shortfall.
+        near_target = [w for w in windows if w[1] >= desired_per_shot * 0.70]
+        if near_target:
+            windows = near_target
+        _, duration, shot_start, shot_end, lo, hi = max(
+            windows, key=lambda w: (w[0], -abs(w[1] - desired_per_shot))
         )
         chosen.append({
             "start": round(shot_start, 2),
@@ -294,34 +373,19 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
             "title": (angle.get("title") or "Montage moment")[:80],
             "description": (angle.get("description") or "")[:220],
             "hook": (angle.get("hook") or "")[:120],
+            "custom_prompt": (angle.get("custom_prompt") or "")[:1200],
             "reason": angle.get("reason") or "Selected from whole-video analysis",
-            "story_arc": "Selected angle; transcript-aligned montage segment",
+            "story_arc": angle.get("story_arc") or "Transcript-grounded selected angle",
+            # Override any angle-level estimate: montage clips share one total budget.
+            "target_duration": round(desired_per_shot, 2),
+            "topic_match_score": round(segment_scores[anchor_idx], 3),
+            "_montage_selected": True,
             "_user_selected": True,
         })
 
-    # If fewer than 2 distinct moments were selected, pick non-overlapping fallback segments
-    if len(chosen) < 2 and segments:
-        for seg in segments:
-            s_start, s_end = seg["start"], seg["end"]
-            if s_end - s_start < 3.0:
-                continue
-            if not any(s_start < item["end"] and s_end > item["start"] for item in chosen):
-                chosen.append({
-                    "start": round(s_start, 2),
-                    "end": round(min(s_start + desired_per_shot, s_end), 2),
-                    "title": "Montage moment",
-                    "description": "",
-                    "hook": "",
-                    "reason": "Selected from transcript to fulfill montage moment count",
-                    "story_arc": "Transcript-aligned montage segment",
-                    "_user_selected": False,
-                })
-                if len(chosen) >= 2:
-                    break
-
     chosen.sort(key=lambda item: item["start"])
     if not 2 <= len(chosen) <= 3:
-        raise ValueError("Could not find 2-3 distinct, non-overlapping transcript moments for this montage.")
+        raise ValueError("Could not find 2-3 distinct, topic-grounded montage moments.")
     return chosen
 
 
@@ -438,131 +502,6 @@ def _plan_clip_edits(candidates, transcript, video_dur, target_duration,
     return planned
 
 
-def _apply_ai_narration(clip, plan, output_dir, base_name, voiceover_engine,
-                        voiceover_voice, gemini_key, processing_warnings):
-    """Prepend a clearly labelled, transcript-grounded AI narration card.
-
-    Used only in AI-expanded mode when the source is too short for the
-    requested duration. The card is a frozen frame carrying generated speech
-    built from verbatim transcript quotes; the original speaker's clip and
-    words are untouched. On failure the source-only clip is delivered with an
-    explicit warning.
-    """
-    narration = (plan or {}).get("narration") or {}
-    script = (narration.get("script") or "").strip()
-    if not script or clip.get("is_montage"):
-        return False
-    prior_name = clip.get("file")
-    src = os.path.join(output_dir, prior_name or "")
-    if not _nonempty_file(src):
-        return False
-    try:
-        from .voiceover import build_intro, concat_videos, generate_voiceover, wav_duration
-
-        wav_path = os.path.join(
-            output_dir, f"{base_name}_narration_{clip.get('index', 0)}.wav"
-        )
-        generate_voiceover(
-            script,
-            wav_path,
-            engine=voiceover_engine or "auto",
-            voice=voiceover_voice,
-            gemini_key=gemini_key,
-        )
-        if not _nonempty_file(wav_path):
-            raise RuntimeError("Narration synthesis produced no audio.")
-        actual = wav_duration(wav_path)
-        if actual <= 0:
-            raise RuntimeError("Narration audio duration could not be verified.")
-
-        card_name = prior_name.rsplit(".", 1)[0] + "_narrationcard.mp4"
-        card_path = os.path.join(output_dir, card_name)
-        build_intro(
-            src,
-            wav_path,
-            card_path,
-            hook_text=narration.get("label") or "AI narration",
-            duration=actual,
-        )
-        final_name = prior_name.rsplit(".", 1)[0] + "_ainarr.mp4"
-        final_path = os.path.join(output_dir, final_name)
-        concat_videos(card_path, src, final_path)
-        if not _nonempty_file(final_path):
-            raise RuntimeError("Narration concat produced no output.")
-
-        # Only now that the narrated render exists on disk does the edit plan
-        # adopt the measured narration length (source/edit/rendered timelines
-        # stay consistent with what is actually delivered).
-        finalize_narration_timing(plan, actual)
-
-        # Captions: burned ones ride inside the source segment; the SRT sidecar
-        # is rebased onto the edit timeline (narration card first).
-        if clip.get("srt"):
-            try:
-                from .subtitles import rebase_srt_file
-
-                rebase_srt_file(
-                    os.path.join(output_dir, clip["srt"]),
-                    plan,
-                    clip_source_start=float(clip.get("start", 0.0)),
-                )
-            except Exception as exc:  # noqa: BLE001
-                _add_render_warning(
-                    clip,
-                    f"Caption sidecar could not be rebased onto the final edit "
-                    f"timeline ({type(exc).__name__}); the delivered .srt does "
-                    "not match the final video and should be regenerated from "
-                    "the clip editor.",
-                    processing_warnings,
-                )
-
-        clip.setdefault("_render_fallbacks", []).append(prior_name)
-        clip["file"] = final_name
-        clip["ai_narration"] = {
-            "file": final_name,
-            "script": script[:2000],
-            "label": narration.get("label"),
-            "estimated_duration": narration.get("estimated_duration"),
-            "actual_duration": narration.get("actual_duration"),
-            "position": narration.get("position"),
-            "origin": "ai",
-            "grounding_quotes": list(narration.get("grounding_quotes") or []),
-        }
-        clip["planned_rendered_duration"] = plan.get("estimated_duration")
-        try:
-            if os.path.isfile(card_path):
-                os.remove(card_path)
-        except OSError:
-            pass
-        return True
-    except Exception as exc:  # noqa: BLE001
-        # The delivered clip is the untouched source-only render: restore the
-        # plan's timeline so duration metadata never includes narration that
-        # was planned but never produced.
-        try:
-            drop_narration(plan)
-        except Exception:  # noqa: BLE001
-            pass
-        clip.pop("planned_rendered_duration", None)
-        _add_render_warning(
-            clip,
-            f"AI-expanded narration could not be generated ({type(exc).__name__}); "
-            "delivering the source-only clip. "
-            + str((plan or {}).get("duration_explanation") or ""),
-            processing_warnings,
-        )
-        try:
-            card_path = os.path.join(
-                output_dir, (clip.get("file") or prior_name or "").rsplit(".", 1)[0] + "_narrationcard.mp4"
-            )
-            if os.path.isfile(card_path):
-                os.remove(card_path)
-        except OSError:
-            pass
-        clip["file"] = prior_name
-        return False
-
-
 def run(
     source: str,
     output_dir: str = "output",
@@ -591,11 +530,6 @@ def run(
     add_hook: bool = False,
     montage: bool = False,
     selected_clips: list = None,
-    voiceover_text: str = None,
-    voiceover_engine: str = "auto",
-    voiceover_voice: str = None,
-    background_music_path: str = None,
-    music_volume: float = 0.18,
     cached_transcript_path: str = None,
     on_clip=None,
     on_progress=None,
@@ -613,6 +547,10 @@ def run(
     # Clamp oversized requests and validate count before any ingest/model work.
     target_duration = _normalize_target_duration(target_duration)
     generation_mode = normalize_generation_mode(generation_mode)
+    # The voiceover/narration feature is removed: stale clients requesting the
+    # former ai_expanded mode still receive source-only edits and original audio.
+    if generation_mode == "ai_expanded":
+        generation_mode = "source_only"
     clip_count = _normalize_clip_count(clip_count)
     if montage:
         if not selected_clips or not 2 <= len(selected_clips) <= 3:
@@ -811,13 +749,18 @@ def run(
     # edges, expands with relevant context or trims toward the requested
     # duration when the story allows, and reports any mismatch explicitly
     # instead of silently dropping clips or padding with unrelated material.
-    if montage:
-        if effective_min_clip is not None or effective_max_clip is not None or requested_individual_count:
-            clip_candidates = _enforce_clip_constraints(
-                clip_candidates, effective_min_clip, effective_max_clip,
-                len(clip_candidates), video_dur,
-                trim_long=False, pad_short=False,
-            )
+    if montage and clip_candidates:
+        # Montage shots use their own share of the overall target and must pass
+        # the same standalone-story planner as ordinary clips.
+        clip_candidates = _plan_clip_edits(
+            clip_candidates, transcript, video_dur, None,
+            generation_mode, custom_prompt, candidate_warnings,
+        )
+        clip_candidates = _enforce_clip_constraints(
+            clip_candidates, effective_min_clip, effective_max_clip,
+            len(clip_candidates), video_dur,
+            trim_long=False, pad_short=False,
+        )
     elif clip_candidates:
         clip_candidates = _plan_clip_edits(
             clip_candidates, transcript, video_dur, target_duration,
@@ -959,35 +902,6 @@ def run(
 
         clip["_render_fallbacks"] = list(dict.fromkeys(fallbacks))
 
-        # 6c. AI-expanded mode: when the source story alone cannot reach the
-        #     requested duration, prepend a clearly labelled narration card
-        #     built from verbatim transcript quotes. Source-only mode never
-        #     generates speech; the original speaker's clip is untouched.
-        if (
-            generation_mode == "ai_expanded"
-            and not montage
-            and (clip.get("edit_plan") or {}).get("narration")
-        ):
-            if _apply_ai_narration(
-                clip,
-                clip["edit_plan"],
-                output_dir,
-                base_name,
-                voiceover_engine,
-                voiceover_voice,
-                gemini_key,
-                processing_warnings,
-            ):
-                _emit_progress(
-                    on_progress,
-                    "rendering",
-                    f"Clip {idx + 1}: labelled AI narration card added "
-                    "(transcript-grounded).",
-                    current=idx + 1,
-                    total=total_clips,
-                    candidate_review=candidate_review,
-                )
-
         processed.append(clip)
         _emit_progress(
             on_progress,
@@ -1027,6 +941,18 @@ def run(
                 )
             duration_delta = montage_duration - float(target_duration or 40)
             duration_tolerance = _montage_duration_tolerance(target_duration or 40)
+            if duration_delta > duration_tolerance:
+                try:
+                    if os.path.isfile(montage_path):
+                        os.remove(montage_path)
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"Montage would exceed the requested {float(target_duration or 40):.0f}s "
+                    f"target by {duration_delta:.1f}s (tolerance ±{duration_tolerance:.1f}s); "
+                    "the overlong montage was not delivered. Shorten the target or choose "
+                    "angles with shorter complete passages."
+                )
             if abs(duration_delta) > duration_tolerance:
                 processing_warnings.append(
                     f"Montage actual duration is {montage_duration:.2f}s versus the "
@@ -1083,76 +1009,6 @@ def run(
             processing_warnings.append(f"Montage stitching failed: {exc}")
             logger.exception("Montage stitching failed")
 
-    # Plan C: optional narration and/or background music. For multiple normal clips,
-    # apply the same requested audio treatment to the first clip only and say so.
-    audio_target = None
-    if montage:
-        if processed and processed[-1].get("is_montage"):
-            audio_target = processed[-1]
-        elif voiceover_text or background_music_path:
-            processing_warnings.append(
-                "Voiceover/music was skipped because montage stitching failed."
-            )
-    elif len(processed) == 1:
-        audio_target = processed[0]
-    elif voiceover_text or background_music_path:
-        audio_target = processed[0] if processed else None
-        if len(processed) > 1:
-            processing_warnings.append(
-                "Voiceover/music was applied to the first generated clip only; enable montage to mix one combined output."
-            )
-    if audio_target and (voiceover_text or background_music_path):
-        _emit_progress(on_progress, "audio", "Mixing requested voiceover and/or background music.")
-        try:
-            from .audio_mix import mix_audio_layers
-            voiceover_path = None
-            if voiceover_text and voiceover_text.strip():
-                from .voiceover import generate_voiceover
-                voiceover_path = os.path.join(output_dir, f"{base_name}_voiceover.wav")
-                generate_voiceover(
-                    voiceover_text.strip()[:5000],
-                    voiceover_path,
-                    engine=voiceover_engine or "auto",
-                    voice=voiceover_voice,
-                    gemini_key=gemini_key,
-                )
-            src = os.path.join(output_dir, audio_target["file"])
-            mixed_name = audio_target["file"].rsplit(".", 1)[0] + "_audio.mp4"
-            mixed_path = os.path.join(output_dir, mixed_name)
-            if voiceover_path and os.path.isfile(voiceover_path):
-                voice_duration = probe_duration(voiceover_path)
-                output_duration = probe_duration(src)
-                if voice_duration > 0 and output_duration > 0:
-                    audio_target["voiceover_duration"] = round(voice_duration, 2)
-                    if voice_duration < output_duration - max(2.0, output_duration * 0.05):
-                        warning = (
-                            f"Voiceover is {voice_duration:.1f}s for a {output_duration:.1f}s output. "
-                            "It plays once from the start; it is not stretched or repeated. "
-                            "Extend the script if narration should cover more of the video."
-                        )
-                        processing_warnings.append(warning)
-                        logger.info(warning)
-            mix_audio_layers(
-                src, mixed_path,
-                voiceover_path=voiceover_path,
-                music_path=background_music_path,
-                music_volume=music_volume,
-            )
-            if _nonempty_file(mixed_path):
-                audio_target.setdefault("_render_fallbacks", []).append(audio_target["file"])
-                audio_target["file"] = mixed_name
-                audio_target["audio_mixed"] = True
-            else:
-                raise RuntimeError("Audio mix did not produce a non-empty output file.")
-        except Exception as exc:
-            # The unmixed clip is delivered: clear metadata that only describes
-            # the discarded mix so the clip never claims audio it does not have.
-            audio_target.pop("audio_mixed", None)
-            audio_target.pop("voiceover_duration", None)
-            warning = f"Voiceover/music mixing failed ({type(exc).__name__}); the unmixed clip was retained."
-            processing_warnings.append(warning)
-            logger.exception("Voiceover/music mixing failed")
-
     # 6d. Verify the actual final artifacts. If a late transform is invalid,
     #     try earlier known-good render stages before marking the clip unusable.
     _emit_progress(
@@ -1188,26 +1044,9 @@ def run(
                 )
         except (TypeError, ValueError):
             expected_duration = None
-        # Fallback renders produced before the narration card are source-only.
-        # When QA falls back to one of them, it must be verified against the
-        # source-only edit duration — never the narrated total.
-        try:
-            edit_plan = clip.get("edit_plan") or {}
-            if edit_plan.get("source_duration") is not None:
-                source_only_duration = float(edit_plan["source_duration"])
-            else:
-                source_only_duration = (
-                    float(clip.get("end", 0.0)) - float(clip.get("start", 0.0))
-                )
-        except (TypeError, ValueError):
-            source_only_duration = None
-        narrated_file = os.path.basename(
-            (clip.get("ai_narration") or {}).get("file") or ""
-        )
-        expected_audio = (
-            True if is_montage_clip or clip.get("audio_mixed")
-            else bool(video_info.get("has_audio"))
-        )
+        # A stitched montage always has an audio stream (silence is added if
+        # the source has none); individual clips preserve the source audio state.
+        expected_audio = True if is_montage_clip else bool(video_info.get("has_audio"))
         qa_args = {
             "expected_duration": expected_duration,
             "expected_aspect": target_aspect,
@@ -1234,13 +1073,7 @@ def run(
                 fallback_base = os.path.basename(fallback_name)
                 fallback_path = os.path.join(output_dir, fallback_base)
                 fallback_clip = {**clip, "file": fallback_base}
-                # A render that predates the narration card is source-only:
-                # verify it against the source-only edit duration, not the
-                # narrated total the failed final render was measured against.
-                is_source_only_render = bool(narrated_file) and fallback_base != narrated_file
                 fallback_expected = expected_duration
-                if is_source_only_render and source_only_duration is not None:
-                    fallback_expected = source_only_duration
                 fallback_args = {
                     **qa_args,
                     "clip": fallback_clip,
@@ -1260,31 +1093,6 @@ def run(
                     clip["file"] = fallback_clip["file"]
                     if clip.get("hook_file") != clip["file"]:
                         clip.pop("hook_file", None)
-                    if is_source_only_render and clip.get("ai_narration"):
-                        # The narrated render failed QA and the source-only
-                        # clip is being delivered instead: drop the narration
-                        # metadata too, so duration/plan data describes the
-                        # file that actually ships.
-                        if clip.get("edit_plan"):
-                            drop_narration(clip["edit_plan"])
-                        clip.pop("ai_narration", None)
-                        clip.pop("planned_rendered_duration", None)
-                        fallback_qa.setdefault("warnings", []).append(
-                            "The AI narration card was dropped with the failed "
-                            "final render; delivering the verified source-only "
-                            "clip."
-                        )
-                    if clip.get("audio_mixed"):
-                        # Every earlier render predates the music/voiceover mix
-                        # (the mixed render itself is what failed QA): clear
-                        # the mix-only metadata for whichever fallback ships.
-                        clip.pop("audio_mixed", None)
-                        clip.pop("voiceover_duration", None)
-                        fallback_qa.setdefault("warnings", []).append(
-                            "The music/voiceover mix was dropped with the "
-                            "failed final render; delivering a clip without "
-                            "that audio mix."
-                        )
                     if fallback_qa.get("status") == "fail":
                         tolerated = list(fallback_qa.get("errors") or [])
                         fallback_qa["tolerated_failures"] = tolerated
