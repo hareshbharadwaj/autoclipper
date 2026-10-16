@@ -358,7 +358,7 @@ def test_duration_mismatch_warning_is_actionable_and_silent_within_tolerance():
     warning = duration_mismatch_warning(60, 9)
     assert warning is not None
     assert "60" in warning and "9.0" in warning
-    assert "AI-expanded" in warning or "target duration" in warning
+    assert "original source audio" in warning or "target duration" in warning
     assert duration_mismatch_warning(60, 58) is None
     assert duration_mismatch_warning(60, 62) is None
     assert duration_mismatch_warning(None, 9) is None
