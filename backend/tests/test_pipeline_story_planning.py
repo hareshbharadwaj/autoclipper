@@ -204,6 +204,14 @@ def test_pipeline_never_generates_captions_during_render(tmp_path, monkeypatch):
     transcript = _stub_transcript()
     _patch_common(monkeypatch, tmp_path, transcript, [_short_candidate()])
     monkeypatch.setattr(pipeline, "cut_all", _fake_cut_all_factory(tmp_path))
+    import autoclipper.subtitles as subtitle_module
+    subtitle_calls = []
+
+    def fake_add_subtitles(clips, transcript, output_dir, burn=False, preserve_source=True):
+        subtitle_calls.append({"burn": burn, "preserve_source": preserve_source})
+        return clips
+
+    monkeypatch.setattr(subtitle_module, "add_subtitles", fake_add_subtitles)
 
     def qa_pass(path, **kwargs):
         assert "subtitles_requested" not in kwargs
@@ -220,6 +228,7 @@ def test_pipeline_never_generates_captions_during_render(tmp_path, monkeypatch):
     clip = result["clips"][0]
     assert "srt" not in clip
     assert "subtitled_file" not in clip
+    assert subtitle_calls == [{"burn": False, "preserve_source": True}]
     job_dir = tmp_path / "job"
     assert not list(job_dir.glob("*.srt"))
     assert not [name for name in os.listdir(job_dir) if "sub" in name.lower()]
