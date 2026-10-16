@@ -138,14 +138,15 @@ def test_mix_resamples_mono_voice_and_stereo_music(tmp_path):
 def test_montage_candidate_picker_uses_transcript_boundaries_and_avoids_overlap():
     transcript = {
         "segments": [
-            {"start": float(t), "end": float(t + 2), "text": f"sentence {t}"}
+            {"start": float(t), "end": float(t + 2),
+             "text": f"{'first' if t < 14 else 'second' if t < 34 else 'third'} topic sentence {t}"}
             for t in range(0, 60, 2)
         ]
     }
     angles = [
-        {"title": "First", "start_hint": 0, "end_hint": 12},
-        {"title": "Second", "start_hint": 20, "end_hint": 32},
-        {"title": "Third", "start_hint": 40, "end_hint": 52},
+        {"title": "First topic", "start_hint": 0, "end_hint": 12},
+        {"title": "Second topic", "start_hint": 20, "end_hint": 32},
+        {"title": "Third topic", "start_hint": 40, "end_hint": 52},
     ]
     clips = _fit_montage_candidates(angles, transcript, target_duration=36, total_duration=60)
     assert len(clips) == 3
@@ -158,14 +159,15 @@ def test_montage_candidate_picker_uses_transcript_boundaries_and_avoids_overlap(
 def test_montage_picker_accounts_for_crossfades_and_uses_nearest_full_boundaries():
     transcript = {
         "segments": [
-            {"start": float(t), "end": float(t + 2), "text": f"sentence {t}"}
+            {"start": float(t), "end": float(t + 2),
+             "text": f"{'first' if t < 20 else 'second' if 40 <= t < 60 else 'third' if 80 <= t < 100 else 'other'} topic sentence {t}"}
             for t in range(0, 120, 2)
         ]
     }
     angles = [
-        {"title": "One", "start_hint": 0, "end_hint": 18},
-        {"title": "Two", "start_hint": 40, "end_hint": 58},
-        {"title": "Three", "start_hint": 80, "end_hint": 98},
+        {"title": "First topic", "start_hint": 0, "end_hint": 18},
+        {"title": "Second topic", "start_hint": 40, "end_hint": 58},
+        {"title": "Third topic", "start_hint": 80, "end_hint": 98},
     ]
     clips = _fit_montage_candidates(angles, transcript, target_duration=60, total_duration=120)
     assert len(clips) == 3
@@ -191,9 +193,9 @@ def test_montage_duration_tolerance_is_bounded_and_actual_mismatch_is_visible():
     }
     clips = _fit_montage_candidates(
         [
-            {"title": "One", "start_hint": 0, "end_hint": 17},
-            {"title": "Two", "start_hint": 34, "end_hint": 51},
-            {"title": "Three", "start_hint": 68, "end_hint": 85},
+            {"title": "First sentence", "start_hint": 0, "end_hint": 17},
+            {"title": "Third sentence", "start_hint": 34, "end_hint": 51},
+            {"title": "Fifth sentence", "start_hint": 68, "end_hint": 85},
         ],
         transcript,
         target_duration=60,
