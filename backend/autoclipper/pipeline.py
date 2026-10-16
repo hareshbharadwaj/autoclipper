@@ -314,6 +314,13 @@ def _fit_montage_candidates(candidates, transcript, target_duration, total_durat
                 f"Could not find a distinct transcript-aligned shot for angle "
                 f"'{angle.get('title') or 'Untitled'}' within its montage time budget."
             )
+        # Do not choose a tiny high-keyword snippet when a coherent passage can
+        # fill most of the shot budget. If the transcript truly has no longer
+        # complete window, retain the best available shorter passage and let
+        # editorial QA explain the shortfall.
+        near_target = [w for w in windows if w[1] >= desired_per_shot * 0.70]
+        if near_target:
+            windows = near_target
         _, duration, shot_start, shot_end, lo, hi = max(
             windows, key=lambda w: (w[0], -abs(w[1] - desired_per_shot))
         )
