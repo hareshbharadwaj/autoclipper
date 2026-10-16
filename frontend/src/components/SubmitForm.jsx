@@ -46,7 +46,6 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
     normalizeAnalysisClipCount(settings?.analysisClipCount ?? 3)
   )
   const [targetDuration, setTargetDuration] = useState(40)
-  const [generationMode, setGenerationMode] = useState('source_only')
   const [customPrompt, setCustomPrompt] = useState('')
   const [aspectRatio, setAspectRatio] = useState('9:16')
   const [addHook, setAddHook] = useState(false)
@@ -229,7 +228,7 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
         selectedClip,
         clipCount: montageMode ? selectedClips.length : analysisClipCount,
         targetDuration: Math.min(120, Math.max(10, Number(targetDuration) || 40)),
-        generationMode,
+        generationMode: 'source_only',
         customPrompt: customPrompt.trim() || undefined,
         selectedClips,
         montage: montageMode || undefined,
@@ -783,22 +782,6 @@ export default function SubmitForm({ onSubmit, busy, settings }) {
                   if the source still can&apos;t support the length, it explains the
                   shortfall instead of padding.
                 </p>
-                <div className="mt-3">
-                  <label htmlFor="generationMode" className="block mb-1 text-xs text-zinc-300">Content mode</label>
-                  <select
-                    id="generationMode"
-                    value={generationMode}
-                    onChange={(e) => setGenerationMode(e.target.value)}
-                    className="w-full rounded-lg bg-background border border-border px-3 py-2 text-xs text-white"
-                  >
-                    <option value="source_only">Original content only (default)</option>
-                    <option value="ai_expanded">AI-expanded — adds clearly labelled, transcript-grounded narration when the source is too short</option>
-                  </select>
-                  <p className="mt-1 text-[11px] text-zinc-500">
-                    Voiceover &amp; music (below) are separate and never change which
-                    source moments are selected.
-                  </p>
-                </div>
               </div>
               <div className="space-y-2">
                 <p className="text-xs text-zinc-400">
