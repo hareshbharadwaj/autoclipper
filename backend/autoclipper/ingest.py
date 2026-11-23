@@ -76,8 +76,8 @@ def _finalize_opts(
 ):
     if force_hd:
         fmt = (
-            "bestvideo[height>=720]+bestaudio/"
-            "best[height>=720]/best"
+            "bestvideo[height>=720]+bestaudio/best[height>=720]/"
+            "bestvideo+bestaudio/best"
         )
     else:
         fmt = (
@@ -137,15 +137,16 @@ def _download_youtube(url: str, output_dir: str, force_hd: bool = False, cookies
     has_cookies = bool(cookies_path)
 
     # Sequence of client configurations to try:
-    # 1. Default (let yt-dlp auto-select best client like visionos/default; avoids 403)
-    # 2. Android/mweb fallback without cookies
-    # 3. With cookies (if provided)
-    attempts = [
+    attempts = []
+    if has_cookies:
+        # When cookies are provided, try them first!
+        attempts.append((None, cookies_path, "default client with cookies", None))
+        attempts.append(({"player_client": ["web", "mweb"]}, cookies_path, "web/mweb with cookies", None))
+
+    attempts.extend([
         (None, None, "default client chain (anonymous)", None),
         ({"player_client": ["android", "mweb", "web"]}, None, "android/mweb client chain", None),
-    ]
-    if has_cookies:
-        attempts.append(({"player_client": ["mweb", "web", "ios"]}, cookies_path, "with cookies", None))
+    ])
 
     # If normal requests hit TLS EOFs, retry once with curl-cffi's browser-like
     # TLS handshake. This is only attempted after a transient network failure.
