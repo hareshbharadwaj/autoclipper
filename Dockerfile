@@ -14,9 +14,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install FFmpeg and OpenCV / MediaPipe system dependencies
+# Install FFmpeg, Node.js (required by yt-dlp for JS signature decoding) and OpenCV / MediaPipe system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
+        nodejs \
         libgl1 \
         libgles2 \
         libegl1 \

@@ -3,9 +3,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# FFmpeg and OpenCV/MediaPipe runtime libraries
+# FFmpeg, Node.js (required by yt-dlp for JS signature decoding) and OpenCV/MediaPipe runtime libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
+        nodejs \
         libgl1 \
         libgles2 \
         libegl1 \

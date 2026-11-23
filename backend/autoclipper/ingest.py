@@ -74,15 +74,12 @@ def _finalize_opts(
     extractor_args: dict = None,
     impersonate=None,
 ):
+    # Use a broad, permissive fallback chain so yt-dlp always finds a stream.
+    # "bv*+ba/b" is the yt-dlp recommended flexible selector.
     if force_hd:
-        fmt = (
-            "bestvideo[height>=720]+bestaudio/best[height>=720]/"
-            "bestvideo+bestaudio/best"
-        )
+        fmt = "bv*[height>=720]+ba/b[height>=720]/bv*+ba/b"
     else:
-        fmt = (
-            "bestvideo+bestaudio/best[ext=mp4]/best"
-        )
+        fmt = "bv*+ba/b"
 
     last_pct = {"v": -1}
 
@@ -136,17 +133,18 @@ def _download_youtube(url: str, output_dir: str, force_hd: bool = False, cookies
     cookies_path = _write_cookies(output_dir, cookies_text)
     has_cookies = bool(cookies_path)
 
-    # Sequence of client configurations to try:
+    # Sequence of client configurations to try.
+    # When cookies are present, try default client first (no player_client override)
+    # as overrides suppress formats when cookies are active.
     attempts = []
     if has_cookies:
-        # When cookies are provided, try them first!
-        attempts.append((None, cookies_path, "default client with cookies", None))
-        attempts.append(({"player_client": ["web", "mweb"]}, cookies_path, "web/mweb with cookies", None))
-
-    attempts.extend([
-        (None, None, "default client chain (anonymous)", None),
-        ({"player_client": ["android", "mweb", "web"]}, None, "android/mweb client chain", None),
-    ])
+        attempts.append((None, cookies_path, "default client with cookies (no override)", None))
+    # Anonymous fallbacks without any player_client override (lets yt-dlp + JS runtime pick best)
+    attempts.append((None, None, "default client chain (anonymous)", None))
+    # Only use player_client overrides as a last resort (they can suppress formats)
+    if has_cookies:
+        attempts.append(({"player_client": ["web"]}, cookies_path, "web client with cookies", None))
+    attempts.append(({"player_client": ["android", "mweb"]}, None, "android/mweb fallback", None))
 
     # If normal requests hit TLS EOFs, retry once with curl-cffi's browser-like
     # TLS handshake. This is only attempted after a transient network failure.
