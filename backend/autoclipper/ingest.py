@@ -53,10 +53,24 @@ def _is_transient_network_error(error: Exception) -> bool:
 
 def _write_cookies(output_dir: str, cookies_text: str = None):
     """Materialize YouTube cookies (from request or YOUTUBE_COOKIES env) into a
-    Netscape cookies file. Returns the path or None if no cookies provided."""
+    Netscape cookies file. Accepts both raw Netscape text and base64-encoded text
+    (useful when storing multiline cookies in Railway/Render env variables).
+    Returns the path or None if no cookies provided."""
+    import base64
     text = cookies_text or config.YOUTUBE_COOKIES
     if not text or not text.strip():
         return None
+    # Auto-detect base64: if the value doesn't contain a tab (Netscape format uses tabs)
+    # and looks like a base64 blob, decode it first.
+    stripped = text.strip()
+    if "\t" not in stripped and "\n" not in stripped:
+        try:
+            decoded = base64.b64decode(stripped).decode("utf-8")
+            if "\t" in decoded:
+                logger.info("YOUTUBE_COOKIES detected as base64 — decoded successfully.")
+                text = decoded
+        except Exception:
+            pass  # Not base64, use as-is
     cookies_path = os.path.join(output_dir, "cookies.txt")
     try:
         with open(cookies_path, "w", encoding="utf-8") as f:
